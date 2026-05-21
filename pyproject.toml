@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wtree"
+version = "0.0.1"
+description = "A keyboard-driven TUI file manager in the spirit of XTree Gold and Midnight Commander."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Matthew Carven", email = "matthewcarven@gmail.com" },
+]
+keywords = ["tui", "file-manager", "xtree", "midnight-commander", "textual"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "textual>=0.85",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+wtree = "wtree.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wtree*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,50 @@
+# --- Python bytecode + cache ---------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Build / packaging artifacts -----------------------------------------
+build/
+dist/
+*.egg
+*.egg-info/
+wheels/
+.eggs/
+
+# --- Virtual environments ------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test + coverage -----------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# --- Type checking / linting caches --------------------------------------
+.mypy_cache/
+.pyright/
+.pyre/
+.ruff_cache/
+
+# --- Editors / IDEs ------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS turds ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Textual / runtime logs ----------------------------------------------
+# Textual writes its devtools console log here when running with `textual run --dev`
+.textual.log
+*.log
