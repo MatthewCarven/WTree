@@ -31,6 +31,7 @@ and relative timestamps is parking-lot material.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from textual.coordinate import Coordinate
@@ -258,3 +259,40 @@ class ContentsPane(DataTable):
         if self._row_kinds[row] is not Kind.DIR:
             return  # File / symlink — design says only dirs drill in.
         await self._tree().focus_dir_under_cursor(full_path)
+
+    # ------------------------------------------------------------------
+    # SearchTarget protocol (used by incremental search ``/``)
+    # ------------------------------------------------------------------
+    #
+    # The app's search machinery treats the pane as an opaque "thing
+    # with searchable rows" through these three methods. No abstract
+    # base class - duck typing is enough since the protocol is tiny and
+    # the only two implementers (this pane and TreePane) are sibling
+    # modules. If a third pane joins, formalise via typing.Protocol.
+
+    def iter_searchable(self) -> Iterator[tuple[int, str]]:
+        """Yield ``(row_index, label)`` for each searchable row.
+
+        Error rows (empty ``_row_paths`` entry) are skipped - they have
+        no useful label and can't be navigated to. The label is the
+        entry's basename without the trailing-slash dirs use for
+        display, so a user typing ``rep`` matches both ``report.txt``
+        and ``reports/`` cleanly.
+        """
+        for row, path in enumerate(self._row_paths):
+            if path:
+                yield row, os.path.basename(path)
+
+    def set_search_cursor(self, row: int) -> None:
+        """Move the cursor to ``row``. Out-of-range rows are ignored
+        rather than raising - the app may pass a stale index if the
+        pane refreshed mid-search.
+        """
+        if 0 <= row < self.row_count:
+            self.move_cursor(row=row, column=0)
+
+    def get_search_cursor(self) -> int:
+        """Current cursor row. Pair with :meth:`set_search_cursor` to
+        record a pre-search position the app can restore on Esc.
+        """
+        return self.cursor_row

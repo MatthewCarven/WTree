@@ -30,6 +30,7 @@ class OperationKind(str, Enum):
     MOVE = "move"
     DELETE = "delete"
     RENAME = "rename"
+    MAKE_NEW = "make_new"
 
 
 @dataclass(frozen=True, slots=True)

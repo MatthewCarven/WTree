@@ -1306,3 +1306,844 @@ My recommendation is option 1 (View) - it unlocks a satisfying
 pager widget is the right place to invest before Edit lands (the
 two share scroll/charset/binary-detect concerns). Make-new and
 Edit are smaller in scope but feel more incremental.
+
+---
+
+## 2026-05-21 (later still^6) — View + skeleton-era cleanup
+
+Two landings this session: the **View** (``V`` / F3) built-in pager,
+and the two quick-win Skeleton-era follow-ups (sources re-exports
+and ``python -m wtree``). **179/179 tests green** on mount.
+
+### Part A — Skeleton-era cleanup
+
+**``wtree/sources/__init__.py``** now re-exports ``NativeSource`` and
+``MockSource`` alongside the base types. Callers can now write
+``from wtree.sources import NativeSource, MockSource`` without
+knowing the submodule layout. ``__all__`` updated.
+
+**``wtree/__main__.py``** — new one-line module delegating to
+``wtree.app.main``. Mirror of the ``wtree`` console-script entry.
+Means ``python -m wtree`` works even when the ``wtree`` script isn't
+on PATH (fresh installs, sandboxed envs).
+
+**``tests/test_packaging.py``** — 3 smoke tests catching silent
+regressions in the public import paths: sources re-exports resolve
+to the same classes the submodules expose; ``__all__`` lists the
+concrete sources; ``wtree.__main__`` exposes ``main`` matching
+``wtree.app.main``.
+
+todo.md ticked off two of the three Skeleton-era items. Cross-
+platform owner lookup remains - flagged in the worklog memory as
+"a small project on its own", deferred until there's actual demand.
+
+### Part B — View / F3 pager
+
+**New ``wtree/widgets/viewer.py``** — ``ViewerScreen(ModalScreen[None])``.
+
+Loading model:
+
+* File read happens in ``on_mount`` via ``asyncio.to_thread`` so
+  big-file I/O doesn't block the Textual event loop. The modal
+  frame appears immediately; the body fills in once bytes arrive.
+* ``_load_file_sync`` is the synchronous worker. Never raises -
+  every failure (missing file, unreadable, oversize, binary)
+  becomes a ``_LoadResult.refusal`` string the viewer renders.
+* Charset detection: UTF-8 first; on ``UnicodeDecodeError`` fall
+  back to latin-1. latin-1 has a total decoding (every byte 0-255
+  maps to a code point), so the viewer never crashes on funny
+  encodings.
+* Binary detection: peek first 8 KB, refuse if any NUL byte. Catches
+  ELF, PNG, ZIP, etc. without needing a magic-number table.
+* Size ceiling: ``MAX_BYTES = 10 MB``. Larger files get a refusal
+  with a "use $PAGER externally" nudge. Configurable as a follow-up.
+* Symlinks: followed by the underlying ``open`` call. The action
+  layer admits ``Kind.SYMLINK`` alongside ``Kind.FILE``.
+
+UI:
+
+* Header label (dock top) shows path + size + encoding (or refusal
+  one-liner). Body is a ``Static`` inside a ``VerticalScroll``;
+  scroll handled by Textual for free (arrows, PgUp/PgDn, Home/End).
+* Hint label (dock bottom) lists the close keys: Esc / Q. Bindings
+  are explicit ``Binding`` objects on the screen rather than
+  literal tuples - the literal-tuple form was rejected by Textual
+  for ``Binding`` lookups on the new pattern.
+* Border is thick ``$primary``; refusal text gets a warning colour.
+
+**Action layer** - ``WTreeApp.action_view`` is a sync method (no
+``@work``, no ``push_screen_wait``). It validates the cursor entry
+kind and either pushes the viewer or emits a notify:
+
+* ``Kind.FILE`` / ``Kind.SYMLINK`` -> push ``ViewerScreen(path)``.
+* ``Kind.DIR`` -> notify ("press Enter to navigate into it").
+* ``Kind.OTHER`` -> notify (kind name in the message).
+* No cursor entry -> notify ("nothing under the cursor").
+
+Bindings: ``v``, ``f3``. Both go through the same action.
+
+**KeyBar ``_WIRED``** is now ``{2, 3, 5, 6, 8, 10}``.
+
+### Tests - 17 new, 179 total
+
+- ``tests/test_viewer.py`` (11) - unit + widget mount:
+    * UTF-8 file decodes clean
+    * Unicode (emoji + accents) round-trips
+    * Invalid UTF-8 falls back to latin-1
+    * Binary file (NUL bytes) refusal
+    * Oversize file refusal (monkeypatched MAX_BYTES)
+    * Missing file refusal (stat error)
+    * Unreadable file refusal (open patched to raise)
+    * ViewerScreen renders text body
+    * ViewerScreen renders binary refusal
+    * Esc dismisses
+    * Q dismisses
+- ``tests/test_view_e2e.py`` (5) - action_view pilot:
+    * V on file opens viewer
+    * F3 alias works identically
+    * V on directory doesn't open viewer
+    * V with empty pane doesn't open viewer
+    * Esc returns to underlying screen (no lingering modals)
+- ``tests/test_status_keybar.py`` (1 new, 9 total) - ``_WIRED``
+  contains 2+3+5+6+8+10; F1/F4/F7/F9 still unbound. Older F2
+  test had its stale ``3 not in _WIRED`` assertion dropped.
+
+### Decisions and gotchas
+
+- **``_render`` name clash.** First implementation defined a
+  ``ViewerScreen._render_load_result`` helper as ``_render(self,
+  result)``. Textual's ``Widget`` has its own ``_render(self)``
+  method (no args), so every render attempt blew up with
+  ``TypeError: _render() missing 1 required positional argument:
+  'result'``. Renamed to ``_render_load_result``. Lesson: don't
+  shadow Textual's internal underscore methods - they're not
+  conventional protected, they're load-bearing.
+- **Sync ``action_view``, not ``@work``.** Other action methods are
+  ``@work async def`` because they ``await push_screen_wait`` for a
+  user answer (destination, confirm, new name). View just wants to
+  show a screen and let the user dismiss it; ``push_screen`` is the
+  right primitive and ``@work`` is overhead. Future-Claude: don't
+  copy-paste-with-``@work`` from the file-op actions.
+- **Latin-1 fallback over chardet / ``charset-normalizer``.** Those
+  libraries do proper detection but pull in dependencies and add
+  startup latency. latin-1 is a total decoding - every byte maps to
+  *some* code point - so the viewer never crashes, just sometimes
+  displays mojibake. Acceptable v0 trade.
+- **Binary detection via NUL scan, not magic numbers.** Files
+  starting with ``ELF`` / ``\\x89PNG`` / ``PK\\x03\\x04`` etc. all
+  contain NUL bytes within their first 8 KB. The NUL scan catches
+  them without needing a libmagic-style table. False positives are
+  vanishingly rare (text files rarely contain NUL).
+- **``Binding`` objects in BINDINGS list.** Older actions used
+  literal tuples ``("v", "view", "View")``; ViewerScreen uses
+  explicit ``Binding(...)`` objects. Both work; Binding is more
+  explicit about the description field. Mixing them in a single
+  app is fine.
+- **``MAX_BYTES = 10 MB``** is generous for plain text; pinned to
+  avoid surprise OOMs on accidentally-tagged log files. Made
+  configurable in a future settings-layer pass.
+
+### Mount-write notes
+
+Six files staged (3 new for View, 1 modified app.py, 1 KeyBar
+tweak, 1 modified status_keybar test). Plus the three smaller
+files for Part A (sources/__init__.py rewrite, new __main__.py,
+new test_packaging.py). All byte-identical first try via the
+standard cp+sync+mv-f+sync protocol. Sandbox pytest then mount
+pytest both green.
+
+### Surfaced during implementation (added to follow-ups)
+
+A new **View-era follow-ups** section in todo.md collecting:
+
+- In-viewer ``/`` incremental search (highlight + n/N step).
+- Syntax highlighting via ``TextArea`` (read-only) + Pygments.
+- Line-number gutter (trivial after TextArea swap).
+- Streamed / paged read for huge files (relax the 10 MB ceiling).
+- Hex mode for binary files (opt-in alternative to refusal).
+- ``utf-8-sig`` for BOM detection before latin-1 fallback.
+- Runtime-configurable ``MAX_BYTES``.
+- Friendlier symlink-loop / dangling-target messaging.
+
+### Next session pickup
+
+Five items remain on the main "After the skeleton runs" list:
+
+1. **Bind Edit** (``E`` / F4) - shell out to ``$VISUAL`` / ``$EDITOR``.
+   Subprocess management: suspend Textual rendering during the
+   subprocess (``app.suspend()``), restore on return. Shares
+   "what file is this" logic with View - probably calls into the
+   same kind-validation pattern from action_view.
+2. **Bind Make-new** (``N`` / F7) - dir/file sub-prompt. Smaller
+   than Edit; uses ``PromptDialog`` for the name and a tiny
+   sub-prompt (dir vs file) via ``ConfirmDialog`` with custom
+   labels, or a dedicated 3-option dialog.
+3. **Wire ``/`` incremental search.** Local to the focused pane;
+   reuses the modal-input pattern but inline (cursor + Input
+   below the pane). Bigger UX scope.
+4. **Bind menu bar** (``F9``) - MC-style top menu. Smallest of
+   the new-widget tasks; mostly visual scaffolding.
+
+My recommendation is **Edit (option 1)** - it pairs naturally with
+View (same kind validation; complementary user gesture) and the
+``app.suspend()`` machinery it needs is shared infrastructure for
+any future shell-out (open-with, external diff, etc.). Make-new
+is small enough to bundle in the same session if there's appetite.
+
+---
+
+## 2026-05-22 - Edit (E / F4) lands
+
+**Goal recap.** The View session left exactly four items on the v0
+checklist: incremental search (``/``), Edit (``E`` / F4), Make-new
+(``N`` / F7), and the menu bar (F9). Per the last session's
+recommendation we picked **Edit**: it pairs naturally with View (same
+kind-validation skeleton, complementary user gesture), and the
+``app.suspend()`` plumbing it needs is the reusable infrastructure
+that future shell-outs (open-with, external diff, ``!`` shell prompt)
+will all share.
+
+### Decision: where Edit lives
+
+View put its code in ``wtree/widgets/viewer.py`` because it's a modal
+screen. Edit is *not* a modal - it's a shell-out that takes over the
+real terminal via ``app.suspend()``. So putting the helpers in
+``widgets/`` would mis-classify them. ``wtree/ops/`` was the other
+candidate, but that package is specifically for ``Plan``-producing
+operations that flow through the queue; Edit doesn't fit that shape
+either.
+
+Settled on a new top-level module: ``wtree/editor.py``. Two pure
+helpers:
+
+* ``resolve_editor() -> list[str]`` - applies the design's precedence
+  (``$VISUAL`` -> ``$EDITOR`` -> platform default), ``shlex``-splits
+  the chosen value so ``EDITOR="code --wait"`` survives.
+* ``launch_editor_blocking(argv, path) -> int`` - appends the path to
+  argv, runs ``subprocess.run`` synchronously, returns the exit code.
+  No Textual dependency anywhere in this module, so unit tests are
+  trivial.
+
+Platform defaults: ``notepad`` on Windows; ``nano`` if
+``shutil.which("nano")`` finds it on Unix, ``vi`` otherwise. Matches
+``design.md`` Editing files section verbatim.
+
+### Decision: the suspend seam
+
+``App.suspend()`` is a context manager that hands the terminal over
+to the wrapped block, then re-grabs it on exit. Reading Textual's
+source:
+
+```
+@contextmanager
+def suspend(self) -> Iterator[None]:
+    if self._driver is None:
+        return
+    if self._driver.can_suspend:
+        ...
+        yield
+        ...
+    else:
+        raise SuspendNotSupported(...)
+```
+
+The headless driver used by ``app.run_test()`` inherits
+``can_suspend = False`` from the base ``Driver``, so calling
+``with self.suspend(): ...`` from a pilot-driven test raises.
+
+To keep tests honest we factored the suspend + subprocess into
+``WTreeApp._launch_editor_blocking(argv, path)`` - a single seam that
+tests monkeypatch with a fake. The fake records what was about to be
+launched (argv, path) and can optionally mutate the target so we can
+assert the post-edit pane refresh.
+
+Tests never trigger a real ``app.suspend()``, never spawn a real
+editor, and remain headless-driver clean.
+
+### Decision: scope - tagged set vs cursor
+
+``design.md`` Selection rule says "Commands operate on the tagged set
+if it is non-empty; otherwise on the entry under the cursor. Rename
+is the exception." Strictly, Edit should follow Selection rule.
+
+But sending multiple file arguments to an external editor is
+editor-specific: ``vim file1 file2`` opens tabs, ``code file1 file2``
+opens both in one window, ``nano`` opens them sequentially, etc. The
+contract WTree would be promising users isn't crisp.
+
+View already took the same liberty for the same reason ("Single-entry
+op (no Selection rule - viewing the tagged set makes no sense)").
+Edit mirrors that choice: operate on the cursor entry, ignore the
+tagged set. Documented in the action docstring. If users complain
+that they want to batch-edit a tagged set, post-v0 can revisit -
+likely via ``$EDITOR`` policy detection or a per-editor opt-in.
+
+### The action body
+
+``action_edit`` (in ``wtree/app.py``) is ``@work``-decorated because it
+``await``s ``asyncio.to_thread`` on the blocking spawner. Flow:
+
+1. Pull the cursor entry from ``ContentsPane``.
+2. Reject: ``None`` -> "nothing under the cursor"; ``Kind.DIR`` ->
+   "press Enter to navigate"; ``Kind.OTHER`` -> "cannot edit a {kind}".
+3. ``argv = resolve_editor()``.
+4. ``rc = await asyncio.to_thread(self._launch_editor_blocking, argv, path)``.
+5. Catch ``FileNotFoundError`` -> notify "editor not found, set $VISUAL
+   or $EDITOR". Catch any other ``Exception`` -> generic notify with
+   exception class + message. Don't propagate; the action loop should
+   stay responsive.
+6. Non-zero exit -> warning notify (the editor exited with a status the
+   user might care about) but flow continues.
+7. ``await contents.show_path(contents.current_path)`` to refresh in
+   case the file changed size / mtime / vanished.
+8. ``self._refresh_status()``.
+
+Plus a one-liner ``_launch_editor_blocking`` that wraps
+``with self.suspend(): return launch_editor_blocking(argv, path)``.
+
+### KeyBar update
+
+``_WIRED`` is now ``{2, 3, 4, 5, 6, 8, 10}``. F4 (Edit) is no longer
+dimmed. Module docstring's "Currently wired" line bumped accordingly.
+
+### Tests landed
+
+``tests/test_ops_edit.py`` (12 tests):
+
+* ``resolve_editor`` env-precedence cases: VISUAL wins; empty VISUAL
+  falls through; whitespace-only VISUAL is treated as unset; shlex
+  splits a command with args; shlex respects quoted args.
+* ``resolve_editor`` platform-default cases: Unix prefers nano if
+  ``shutil.which`` finds it; falls back to vi if not; Windows always
+  uses notepad. ``os.name`` is monkeypatched.
+* ``launch_editor_blocking``: path appended to argv as final arg;
+  exit code propagates; real ``/bin/true`` subprocess works
+  end-to-end (skipped on Windows); ``FileNotFoundError`` surfaces
+  when the binary doesn't exist.
+
+``tests/test_edit_e2e.py`` (7 tests):
+
+* E on a file invokes the suspend-and-spawn helper with the right
+  argv + path.
+* F4 alias works identically.
+* E on a directory rejects without invoking.
+* E with empty pane rejects without invoking.
+* Post-edit refresh works (fake editor mutates the file, then we
+  verify the on-disk change is visible).
+* Non-zero exit code surfaces as warning, doesn't raise.
+* ``FileNotFoundError`` from the spawner is caught, doesn't raise.
+
+Plus ``test_keybar_wired_set_includes_f4`` in ``test_status_keybar.py``
+(F4 is in the wired set; F1/F7/F9 still aren't).
+
+The F2/F3 wired-set tests had stale ``4 not in _WIRED`` assertions
+left over from the View session - cleaned up to assert only what was
+true at the time those keys landed (the F4 test asserts the current
+state).
+
+### Numbers
+
+* Pre-Edit: 179/179 green.
+* Edit landing: 199 tests pass, 0 fail. (+12 unit + +7 e2e + +1 keybar.)
+* Real ``/bin/true`` subprocess test exercises the spawner with no
+  Textual involvement at all - confirms the spawn-and-wait surface
+  is correct independent of the action layer.
+
+### Mount caveats hit this session
+
+* First ``Write`` of ``app.py`` succeeded on inspection (size matched)
+  but Python parsing later showed the file was truncated mid-statement
+  at line 547. Heredoc-rewrite to ``outputs/`` then atomic ``mv`` to
+  the mount fixed it; the rewrite verified size before and after.
+* ``Edit`` on ``keybar.py`` initially appeared to write through
+  (``grep`` saw the change on disk, ``wc -c`` matched), but Python
+  loading the same path saw the *old* contents. Final ``pytest`` run
+  caught it - the F4 keybar test failed because ``_WIRED`` was still
+  ``{2, 3, 5, 6, 8, 10}`` in memory. Heredoc-rewrite of the whole
+  file fixed the inconsistency on the second pass.
+* Lesson re-confirmed: after any non-trivial Edit to a file in the
+  mount, **always** verify by reading back through Python (or running
+  the relevant tests) before declaring the change done. The Edit tool
+  and bash filesystem operations have inconsistent views of the
+  mount; only "the bytes Python actually loads" is authoritative.
+
+### Follow-ups identified during the work
+
+Captured in todo.md under a new "Edit-era follow-ups" section. The
+two big ones:
+
+* **Status-line nudge instead of notify toast** - same shape as the
+  Rename-era follow-up. The notify toasts are intrusive for
+  "couldn't spawn editor" cases.
+* **Suspend-friendly TUI re-entry** - after the editor exits we
+  ``show_path()`` once but don't re-focus the pane that had focus
+  before. Verify this feels right; otherwise add focus restoration.
+
+### Next session
+
+Per the v0 checklist three items remain: incremental search (``/``),
+Make-new (``N`` / F7), menu bar (F9). Make-new is the smallest and
+shares the modal-prompt + planner shape with Rename, so that's the
+natural next pick. After that the search and menu bar can be tackled
+in either order.
+
+## 2026-05-22 — Make-new (N / F7)
+
+Picked up the smallest of the three remaining v0 items: ``N`` / F7
+"make new directory or file", which the design.md keymap had already
+committed to. Architecturally the closest cousin to Rename — typed
+input, a planner that emits one PlanItem, no Selection rule consumption
+— but with three new UX shapes to nail down before code.
+
+### Three decisions captured to design.md
+
+Asked at the top of the session:
+
+1. **Sub-prompt shape** — chooser modal then name prompt. Two screens,
+   each unambiguous. The trailing-slash convention (``mydir/`` means
+   directory) was tempting for the one-keystroke saving but loses too
+   much clarity — easy to forget the slash, and the type matters more
+   than the name. A combined radio-plus-input modal would have been a
+   new widget shape; the chooser-then-prompt sequence reuses
+   PromptDialog unchanged and matches XTree's keystroke-driven feel.
+
+2. **Path separators** — lenient. ``foo/bar/baz`` is allowed and
+   creates intermediate directories on apply. This diverges from
+   Rename, which rejects separators because rename-with-path would be
+   move-disguised-as-rename. Make-new starts from "no existing entry",
+   so creating intermediates is the same scope of work the user is
+   asking for. Implementation: planner accepts forward-slash-separated
+   names, walks the segments and rejects ``..``; executor does
+   ``os.makedirs(parent_of_leaf, exist_ok=True)`` before exclusive-
+   creating the leaf.
+
+3. **Parent dir** — ``ContentsPane.current_path`` (the directory the
+   user is *looking at*). Tagged set silently ignored, cursor entry
+   irrelevant. Make-new is a "create here" operation, not a Selection-
+   rule operation. Mirrors View / Edit's stance with the additional
+   twist that there's no per-op destination to wire through.
+
+All three rows landed in the decision log at design.md:215.
+
+### Implementation shape
+
+Three new files plus four edits:
+
+* ``wtree/ops/make_new.py`` — new module. Planner signature is
+  ``plan_make_new(parent_path, name, kind, source_id, registry)``,
+  different from the others which take a tag list. Kind comes in from
+  the chooser modal so the planner doesn't infer it from a trailing
+  slash. Rejections (PlanError causes): ``UnknownSource``,
+  ``InvalidKind`` (kind not in DIR/FILE), ``InvalidName`` (empty,
+  absolute, ``..`` segments, collapses to nothing), ``Exists`` (leaf
+  already there). The leaf-exists check uses ``src.entry_at(leaf)``
+  so it stays source-agnostic.
+
+* ``wtree/widgets/kind_chooser.py`` — new modal. ``KindChooserDialog``
+  is a ``ModalScreen[Kind | None]`` with three bindings: ``d`` →
+  ``Kind.DIR``, ``f`` → ``Kind.FILE``, ``escape`` → ``None``. Looks
+  like a small ConfirmDialog. Title and hint configurable but default
+  to "Make new:" + "D for directory  -  F for file  -  Esc to cancel".
+
+* ``wtree/ops/execute.py`` — new branch. ``_native_make_new`` dispatches
+  to ``_make_new_blocking`` via ``asyncio.to_thread``. The blocking
+  body is two lines per kind: ``os.makedirs(dst, exist_ok=False)`` for
+  DIR, and ``os.makedirs(parent, exist_ok=True) + open(dst, "x")`` for
+  FILE. The "x" mode is open-for-exclusive-create — raises
+  ``FileExistsError`` if the leaf already exists, which the executor
+  catches and converts to a FAILED ItemResult with "already exists"
+  message. Belt-and-braces vs the planner's pre-check: a race between
+  plan and apply surfaces as a clear failure rather than a silent
+  overwrite.
+
+* ``wtree/ops/base.py`` — added ``OperationKind.MAKE_NEW`` enum value.
+
+* ``wtree/ops/__init__.py`` — exported ``plan_make_new``.
+
+* ``wtree/app.py`` — added ``action_make_new`` (an ``@work`` async
+  method that pushes the chooser, then the prompt, then planner, then
+  ``_finalise_plan``). Added ``("n", "make_new", "New")`` and
+  ``("f7", "make_new", "New")`` to BINDINGS. Updated the module
+  docstring to describe Make-new's no-Selection-rule shape.
+
+* ``wtree/widgets/keybar.py`` — bumped ``_WIRED`` from
+  ``{2, 3, 4, 5, 6, 8, 10}`` to ``{2, 3, 4, 5, 6, 7, 8, 10}``.
+
+### PlanItem shape detail
+
+Make-new has no "from" path — the new entry doesn't pre-exist. But the
+executor's dispatch table is keyed on ``(src_source_id, dst_source_id)``
+and reads ``item.kind`` to pick the per-kind branch. Setting
+``src_source_id == dst_source_id == source_id`` and
+``src_path == dst_path == leaf_path`` lets the existing dispatch
+machinery treat Make-new like any other op without introducing a
+"destinationless" sentinel concept. ``size`` is ``0`` — new entries
+are empty at birth.
+
+### Tests landed
+
+46 new tests across two files:
+
+* ``tests/test_ops_make_new.py`` (38 tests):
+  - 9 planner happy-path (simple file, simple dir, lenient subdirs,
+    parent root, trailing-slash trim, whitespace strip, double-slash
+    collapse, ``.`` drop, summary text).
+  - 11 planner rejections (UnknownSource, SYMLINK kind, OTHER kind,
+    empty, whitespace-only, absolute POSIX, Windows drive, ``..``,
+    existing leaf dir, existing leaf file, ``.`` only).
+  - 10 executor real-filesystem tests via ``tmp_path``: dir create,
+    file create, lenient intermediate dirs, clobber refused for dir
+    and file, unsupported-kind defensive, plus four full
+    ``plan_make_new + apply_plan`` round-trip tests (dir, file,
+    lenient, race-clobber).
+  - 8 action-layer pilot tests: chooser then prompt, dir via chooser,
+    chooser Esc cancels, prompt Esc cancels, empty name cancels,
+    existing leaf surfaces Exists, ``..`` surfaces InvalidName,
+    tagged-set silently ignored.
+
+* ``tests/test_make_new_e2e.py`` (7 tests): real Pilot driving the
+  full keystroke flow — dir, file, lenient subdirs, chooser cancel,
+  prompt cancel, clobber refused, subtitle returns to baseline.
+
+* ``tests/test_status_keybar.py``: new ``test_keybar_wired_set_includes_f7``;
+  removed stale ``assert 7 not in _WIRED`` lines from the older
+  per-op snapshots so they reflect current state without
+  contradicting it.
+
+Full suite: **245/245 green** (was 199 before this session, so +46).
+
+### Mount-truncation incidents
+
+Hit the bash-vs-Python disagreement (feedback rule 11) on three files
+during this session — app.py, keybar.py, and test_status_keybar.py.
+The Edit tool reported success and the mount view (grep, cat, sha)
+looked correct, but Python's parser saw truncated content cut off
+mid-statement. The recovery protocol from the feedback memory worked
+exactly as documented: heredoc full content into ``/tmp/wtree-stage/``,
+``cp + sync + mv -f + sync`` into the mount, then verify with a
+Python import / pytest run. After the rewrite, mount and Python both
+saw the same bytes. The same pattern hit design.md and todo.md during
+the documentation pass; same recovery.
+
+The takeaway: any non-trivial Edit on a mount-resident file >3 KB
+needs a Python-side verification, not just a bash-side grep. Bash
+sees a stale mirror more often than I'd expect. Heredoc-stage
++ atomic-mv is the reliable path for anything bigger than a small
+patch.
+
+### Follow-ups parked
+
+A new "Make-new-era follow-ups" section in todo.md:
+
+- Status-line nudge instead of notify toast (same shape as the
+  Rename / Edit follow-ups).
+- Pane auto-refresh after a make (shared post-op refresh hook).
+- Pre-position cursor on the newly-made entry.
+- Initial-name suggestion in the prompt (``New Folder`` / ``untitled.txt``).
+- Symlink creation (rejected as InvalidKind today; needs a target prompt).
+- Tagged-set "copy template" semantics (XTree-ish "duplicate as").
+- Umask vs explicit mode for created entries.
+- Case-only collisions on case-insensitive filesystems.
+
+### Next session
+
+Two v0 items remain: incremental search (``/``) and the menu bar (F9).
+Search is the more interesting of the two — it's a non-modal inline
+input with a new "what does ``/`` look like in the contents pane?"
+design question. F9 is mostly UI plumbing once the menu structure is
+worked out. Either order works.
+
+## 2026-05-22 (late) — Left-on-root ascend
+
+Course correction mid-session. After Make-new landed, Matthew asked how
+hard it would be to bind ascend-and-relog to Left-on-root in the tree
+pane — pressing Left while the cursor is on the root re-roots the tree
+at the parent directory. XTree's "widen the logged window" idiom; a
+clean win because Left-on-root was a dead key (the root has nothing to
+collapse to and no parent in the existing default).
+
+### Three design decisions, captured to design.md
+
+The keystroke shape was already what Matthew proposed. Two follow-up
+options he also wanted but parked for now:
+
+- Backspace on the tree pane as a parallel binding (would mirror the
+  contents pane's "go to parent dir" Backspace).
+- Blank-Enter inside the existing ``L`` "Log new source" prompt — when
+  the user just hits Enter without typing anything, default to the
+  parent of the current root.
+
+Both are on the new Ascend-era follow-ups list. v0 ships Left-on-root
+only.
+
+The other locked decisions:
+
+- **No-parent behaviour.** ``os.path.dirname(root) == root`` is the
+  canonical "at filesystem root" signal — works for ``/`` on POSIX
+  and ``C:\\`` on Windows. UNC server-level paths (``\\\\server\\share``)
+  are noted as a Windows-specific spot to verify; SMB browsing is
+  parking-lot.
+- **Status feedback.** Notify-toast for "Logged: NEW (ascended from
+  OLD)". The eventual ``StatusLine.flash`` API is on the follow-ups
+  list, same as the equivalent Rename / Edit / Make-new notes.
+- **Cursor + contents pane after ascend.** Cursor lands on the row
+  representing the old root (so the user can Right-arrow back in).
+  Contents pane stays on the old root's contents because the cursor-
+  driven NodeHighlighted handler picks the new cursor's path. Net
+  effect: tree widens, working context stable.
+
+### Implementation shape
+
+Three edits and one new test file:
+
+* ``wtree/widgets/tree_pane.py`` — new ``AscendRequested`` Message
+  class on TreePane; new ``on_key`` override that intercepts Left
+  only when ``cursor_node is self.root`` (consumes the event with
+  ``event.stop() + event.prevent_default()``, posts the message); new
+  ``re_root(path)`` method (wipes children, resets root data and
+  label, clears ``_loaded`` memo, re-populates and re-expands); new
+  ``focus_child_of_root(path)`` method (yields once via
+  ``await asyncio.sleep(0)`` so Textual's lazy line indexer rebuilds
+  before reading ``child.line``).
+
+* ``wtree/app.py`` — new ``on_tree_pane_ascend_requested`` handler.
+  Computes ``os.path.dirname(self._root_path)``, no-ops with notify
+  nudge if ``new_root == old_root`` (filesystem root), otherwise
+  re-roots the tree, focuses the old-root child row, and emits the
+  "Logged: NEW (ascended from OLD)" notify. Does NOT explicitly
+  refresh the contents pane — the cursor-driven NodeHighlighted
+  handler does that.
+
+* ``tests/test_ascend.py`` — 8 new tests: basic ascend, cursor lands
+  on old-root row, contents stays on old root + Up moves cursor up to
+  new root (contents follows), filesystem-root no-op, non-root Left
+  still collapses (default Textual behaviour preserved), tagged set
+  survives, two consecutive ascends, trailing-slash root.
+
+### One bug surfaced, two design refinements
+
+First implementation set the cursor with ``cursor_line = child.line``
+and got ``line == -1`` because Textual's line indexer rebuilds
+lazily on the next render — the indexer hadn't seen the freshly-
+populated children yet. Adding ``await asyncio.sleep(0)`` before
+reading ``child.line`` yields once, the render cycle runs, the
+indexer rebuilds, and ``child.line`` returns a valid value. One-line
+fix in ``focus_child_of_root``. Worth documenting as a Notes-for-the-
+next-session entry — it's the kind of thing easy to forget and
+re-hit later.
+
+Second issue caught in the same test pass: the handler explicitly
+called ``contents.show_path(new_root)`` after focusing the old-root
+row. But ``focus_child_of_root`` already fires NodeHighlighted via
+``cursor_line`` reactive, and the app's existing
+``on_tree_node_highlighted`` handler drives the contents pane. So
+two writes raced — the explicit one set ``contents`` to ``new_root``,
+the event-driven one set it to ``old_root``. On reflection the
+event-driven path is the better UX (working context stable), so the
+explicit call was removed. The test for "contents pane after ascend"
+got renamed and updated to assert old-root contents + a follow-up
+"press Up to see new root" step.
+
+### Tests landed
+
+8 new tests in ``tests/test_ascend.py``. Full suite **253/253 green**
+(was 245).
+
+### Mount-truncation: still present, still annoying
+
+Hit truncation on app.py, tree_pane.py, test_ascend.py, design.md,
+and todo.md during this session. Each time the Edit tool reported
+success and the bash view looked correct, but Python's parser saw
+truncated content (rule 11). The heredoc-stage + atomic-mv protocol
+recovered each one without fuss. Two new "Notes for the next
+session" entries:
+
+- Re-rooting needs an ``asyncio.sleep(0)`` yield before
+  ``child.line`` reads.
+- Cursor-driven NodeHighlighted is the right path to update the
+  contents pane after re-root.
+- Tree-pane ``on_key`` lets you intercept individual keys without
+  overriding the whole Tree default.
+
+### Follow-ups parked (Ascend-era)
+
+Eight items on the new Ascend-era follow-ups list:
+
+- Backspace-on-tree-pane parallel binding.
+- Blank-Enter ascend in the ``L`` prompt.
+- Preserve old expansion state under the new root after re-root.
+- ``StatusLine.flash`` API for non-toast status feedback.
+- **Passive folder-change detection with idle debounce** — Matthew's
+  bigger idea: cheap periodic diff of the displayed dir against its
+  cached list, surfaced via status nudge when contents have drifted
+  on disk. Bound the overhead with a size threshold (~1000 entries
+  bails), a min interval (~10 seconds between checks), and only the
+  current contents pane (not the tree). A predecessor to full
+  FS-watching without OS-specific watch APIs.
+- UNC path ascend spot-check on real Windows.
+- Symlink-at-root: realpath or as-is?
+- Status nudge when the old-root row isn't enumerable after the
+  ascend (permission-denied races).
+
+### Next session
+
+Two v0 items remain: incremental search (``/``) and the menu bar
+(F9). Search is the more interesting design question — non-modal
+inline input, focused-pane semantics. Either order works.
+
+## 2026-05-22 (later) — Incremental search (`/`)
+
+Picked this up after Matthew confirmed he wanted to do it next. The
+more interesting of the remaining v0 items because it's the first
+truly modeless input flow — every other typed-input action so far has
+been a modal PromptDialog. `/` had to feel like Vim or ranger or
+fzf's incremental search: type and the cursor moves in real time,
+no Enter-to-commit delay.
+
+### Three design decisions, captured to design.md
+
+- **Substring, case-insensitive matching.** Prefix-only (XTree-strict)
+  too restrictive; regex (Vim-style) too much for v0. Substring is the
+  modern default and easiest to predict. Regex / prefix toggles via
+  syntax prefix (`/^foo` for prefix, `/\foo` for regex) parked on the
+  follow-ups list.
+- **Visible-nodes-only scope in the tree pane.** Auto-expand-to-find
+  would require eager subtree scans on every keystroke and conflicts
+  with sources that refuse `LogAll`. Collapsed subtrees stay
+  uninspected; the user expands first, searches second.
+- **Replace the StatusLine inline.** Modal PromptDialog rejected as
+  too heavy. The SearchBar lives in the StatusLine's screen row;
+  `display: none` / `display: block` toggles which one is visible.
+  No layout shift.
+
+Two implied choices also captured (Esc restores cursor, Enter commits
+and leaves cursor; empty query is a no-op; no-match indicator turns
+the bar text red).
+
+### Implementation shape
+
+One new widget, two pane additions, six handler methods:
+
+* **`wtree/widgets/search_bar.py`** — `SearchBar(Widget)`. Reactive
+  `query`, `match_total`, `match_idx`; custom `on_key` for letters,
+  Backspace, Esc, Enter, Up, Down, Ctrl+G; posts five messages
+  (`QueryChanged`, `NextMatch`, `PrevMatch`, `Committed`,
+  `Cancelled`). Started life as a `Static` subclass; rewrote to
+  `Widget` after Textual 8.x's Visual pipeline blew up on
+  `Static.update()` called from `__init__` (the
+  `'NoneType' object has no attribute 'render_strips'` error - see
+  bugs section).
+
+* **`ContentsPane.iter_searchable() / set_search_cursor() /
+  get_search_cursor()`** — `iter_searchable` yields `(row,
+  basename)` for non-error rows; basename via `os.path.basename` so
+  the user's "rep" matches both `report.txt` and `reports/` (the
+  trailing slash on dir display is purely cosmetic). Cursor get/set
+  delegates to `cursor_row` / `move_cursor`.
+
+* **`TreePane.iter_searchable() / set_search_cursor() /
+  get_search_cursor()`** — depth-first walk of visible nodes via
+  `_walk_visible`. A single-element list serves as a mutable counter
+  threaded through the recursive generators so the yielded
+  `line_index` aligns with Textual's `cursor_line` numbering without
+  any post-walk translation. Collapsed subtrees are skipped (their
+  children aren't visible, so the cursor can't land on them).
+
+* **`WTreeApp.action_search`** — bound to `slash`. Captures the
+  focused pane, records its current cursor as the restore-on-Esc
+  anchor, hides the StatusLine, activates the bar.
+
+* **`on_search_bar_query_changed`** — recomputes matches on every
+  keystroke. Substring case-insensitive against `iter_searchable()`.
+  Picks the first match at-or-after the pre-search cursor (so typing
+  `/rep` from row 5 prefers row 7 over row 2 — feels like a
+  forward-scan); wraps to the first match if none qualify. Empty
+  query leaves the cursor put.
+
+* **`on_search_bar_next_match` / `on_search_bar_prev_match`** —
+  step through `_search_matches` with modulo-wrap.
+
+* **`on_search_bar_committed` / `on_search_bar_cancelled`** — both
+  route to `_exit_search(restore=...)`, which tears down state,
+  re-shows StatusLine, returns focus to the pane.
+
+The pane-side `SearchTarget` protocol is duck-typed (not a
+`typing.Protocol`); only two implementers and they're sibling
+modules. If a third pane joins later it can be formalised.
+
+### Two bugs surfaced
+
+**Bug 1: `'NoneType' object has no attribute 'render_strips'`.**
+First implementation subclassed `Static` and called `self.update("/")`
+from `__init__` to set initial content. Textual 8.x's Visual pipeline
+expects a non-None `_renderable` by the time the widget first
+renders; calling `update` too early apparently leaves it in a state
+where the visual pipeline gets None. Symptom: every test that
+activated the bar crashed with the AttributeError. Fix: subclass
+`Widget` directly and implement `render()` returning a Rich `Text`,
+which bypasses the Static/Visual indirection entirely.
+
+**Bug 2: tests asserted private API.** My initial test file checked
+`bar.renderable` (which isn't a public attribute on Widget) and
+`bar.has_class("-no-match")` (which the rewritten widget doesn't use
+- the no-match state lives in match_total + query). Fixed by
+exposing `bar.no_match` as a property and switching tests to assert
+public state (`bar.query`, `bar.match_total`, `bar.match_idx`,
+`bar.no_match`).
+
+### Tests landed
+
+15 new tests in `tests/test_search.py`:
+
+- Protocol unit tests: iter_searchable on contents (basenames,
+  dense indices) and tree (visible-only, collapsed subtree
+  excluded).
+- SearchBar widget unit tests: activate takes focus; deactivate
+  clears state.
+- Action wiring: `/` activates bar in contents and tree.
+- Typing: cursor jumps to first match; case-insensitive.
+- No-match: cursor stays put, bar reports `no_match`.
+- Down/Up wrap through multiple matches.
+- Esc restores cursor; Enter commits at match.
+- Backspace shrinks query.
+- Tree pane search jumps to matching child.
+
+Full suite: **268/268 green** (was 253, +15). Suite now takes ~45s
+total, hitting the bash timeout when run in one shot; split runs by
+file work fine. `pytest-xdist` is a follow-up.
+
+### Mount-truncation incidents
+
+Hit on app.py, contents_pane.py, tree_pane.py, test_search.py,
+design.md, todo.md - basically every non-trivial Edit. Each one
+recovered via the heredoc + atomic-mv protocol. Three new "Notes for
+the next session" entries capture the patterns:
+
+- Static + update() in `__init__` blows up the Visual pipeline — use
+  Widget + render().
+- Reactive attributes auto-refresh on assignment.
+- Full pytest suite is at the 45s bash-timeout boundary.
+
+### Follow-ups parked (Search-era)
+
+Nine items on the new Search-era follow-ups list:
+
+- Remembered query for Ctrl+G outside search mode.
+- Regex / prefix toggles via syntax prefix.
+- Auto-expand tree subtrees during search.
+- `StatusLine.flash` API (shared with Rename/Edit/Make-new/Ascend).
+- Highlight matched substrings inside row labels.
+- Search across the tagged set.
+- Find-across-tree `Ctrl+F` (already in keymap; reuses this matcher).
+- Empty-query restore semantics.
+- "Other keys cancel and pass through" exit.
+
+### v0 is nearly complete
+
+Only **one item** remains on the v0 list: the F9 menu bar. After this
+session, every Selection-rule operation (Copy, Move, Delete, Rename),
+every shell-out flow (View, Edit), the create flow (Make-new), the
+ascend gesture (Left-on-root), and the search gesture (`/`) are all
+landed. **268/268 tests green.** Next session can either ship F9 and
+call v0 done, or do a round of polish on any of the follow-ups list
+items before the menu bar.

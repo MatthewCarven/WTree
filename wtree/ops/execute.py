@@ -31,6 +31,12 @@ Per-operation dispatch:
 * **Rename items** are always exactly one (single-entry op per design).
   ``dst_path`` is the parent dir joined with the new basename; executor
   uses ``os.rename`` which is atomic on every supported filesystem.
+* **Make-new items** are always exactly one. ``dst_path`` is the
+  intended leaf; ``src_path`` mirrors it (Make-new has no source).
+  Executor uses ``os.makedirs(leaf, exist_ok=False)`` for DIR and
+  ``open(leaf, "x").close()`` (after ensuring the parent exists via
+  ``os.makedirs(..., exist_ok=True)``) for FILE. Lenient mode -
+  intermediate dirs are created as needed; the leaf must not pre-exist.
 """
 
 from __future__ import annotations
@@ -139,6 +145,16 @@ async def _apply_item(
             return await _native_rename(item)
         raise NotImplementedError(
             f"rename on source {item.src_source_id!r} not supported in v0"
+        )
+
+    if kind is OperationKind.MAKE_NEW:
+        # Make-new never crosses sources either; planner sets src and
+        # dst to the same id. Mirror the explicit RENAME branch above
+        # so the v0 native-only constraint stays loud.
+        if item.dst_source_id == "native":
+            return await _native_make_new(item)
+        raise NotImplementedError(
+            f"make_new on source {item.dst_source_id!r} not supported in v0"
         )
 
     pair = (item.src_source_id, item.dst_source_id)
@@ -360,4 +376,85 @@ async def _native_rename(item: PlanItem) -> ItemResult:
         )
 
     await asyncio.to_thread(os.rename, src, dst)
+    return ItemResult(item=item, status=ItemStatus.SUCCESS)
+
+
+# ---------------------------------------------------------------------------
+# Native make-new
+# ---------------------------------------------------------------------------
+
+
+def _make_new_blocking(dst: str, kind: Kind) -> None:
+    """Synchronous body of :func:`_native_make_new`.
+
+    Factored out so the dispatch in ``_native_make_new`` can dispatch
+    one ``asyncio.to_thread`` call rather than two. Keeps the per-kind
+    branching readable and centralises the "ensure parent + create
+    leaf" sequence in one place.
+
+    DIR case: ``os.makedirs(dst, exist_ok=False)`` - the planner has
+    already verified the leaf doesn't exist, but ``exist_ok=False``
+    keeps the per-leaf safety belt fastened so a race between plan and
+    apply surfaces as a clear ``FileExistsError`` rather than silent
+    success.
+
+    FILE case: ensure the parent chain via ``os.makedirs(parent,
+    exist_ok=True)``, then ``open(dst, "x").close()``. ``"x"`` is the
+    exclusive-create mode - identical safety belt to the DIR branch.
+    The empty file lands with the current umask, matching ``touch``.
+    """
+    if kind is Kind.DIR:
+        os.makedirs(dst, exist_ok=False)
+        return
+    if kind is Kind.FILE:
+        parent = os.path.dirname(dst)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # "x" mode is open-for-exclusive-create; raises FileExistsError
+        # if the leaf already exists. Close immediately - the new file
+        # is empty by design.
+        with open(dst, "x"):
+            pass
+        return
+    # Should not reach here - planner enforces _MAKEABLE kinds. Defensive
+    # guard so a future kind doesn't silently fall through to success.
+    raise ValueError(f"_make_new_blocking: unsupported kind {kind!r}")
+
+
+async def _native_make_new(item: PlanItem) -> ItemResult:
+    """Create a new directory or file at ``item.dst_path``.
+
+    Lenient mode (per the 2026-05-22 design conversation):
+    intermediate directories on the path to the leaf are created as
+    needed. The leaf itself must not pre-exist - the planner already
+    checked, but we use ``exist_ok=False`` / ``"x"`` mode at apply
+    time too so a race between plan and apply surfaces as
+    ``FileExistsError`` rather than a silent overwrite.
+
+    No-op on ``Kind.OTHER`` and ``Kind.SYMLINK``: the planner rejects
+    these with ``InvalidKind`` before they reach the executor, but we
+    keep the defensive skip here so a future planner change doesn't
+    accidentally produce an unhandled item.
+    """
+    dst = _normalise_dst(item.dst_path)
+
+    if item.kind not in (Kind.DIR, Kind.FILE):
+        return ItemResult(
+            item=item,
+            status=ItemStatus.SKIPPED,
+            message=f"unhandled kind: {item.kind.value}",
+        )
+
+    try:
+        await asyncio.to_thread(_make_new_blocking, dst, item.kind)
+    except FileExistsError as exc:
+        # Surface the racy-clobber as FAILED rather than letting the
+        # generic Exception branch in apply_plan turn it into a less
+        # specific message. Same shape as Rename's lexists pre-check
+        # failure.
+        return ItemResult(
+            item=item,
+            status=ItemStatus.FAILED,
+            message=f"path already exists: {dst}",
+        )
     return ItemResult(item=item, status=ItemStatus.SUCCESS)

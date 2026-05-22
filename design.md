@@ -144,13 +144,17 @@ An MC-style key bar across the bottom of the screen displays the F-key bindings 
 
 #### Modality
 
-Pane focus determines arrow-key behavior. In the tree pane, ← collapses / → expands the node under cursor. In the contents pane, ← goes to parent dir / → enters the highlighted dir.
+Pane focus determines arrow-key behavior. In the tree pane, ← collapses / → expands the node under cursor — with one exception: **← on the root node ascends**, re-rooting the tree at the parent directory ("log the directory above"). At the filesystem root the action no-ops with a status-line nudge. In the contents pane, ← goes to parent dir / → enters the highlighted dir.
 
 Modal dialogs (typing a destination path, typing into a search prompt) re-bind letter keys to text input. Same principle as `/` putting you in incremental-search mode: while a dialog or search is active, letters are text, not commands. The status line shows the active mode.
+
+**Incremental search (`/`)** is modeless inline, not modal. Pressing `/` swaps the StatusLine row for a SearchBar in the same slot. While the SearchBar holds focus: printable characters extend the query and the focused pane's cursor jumps to the first match (substring, case-insensitive) at or after the original cursor position; Backspace shrinks the query; Down or `Ctrl+G` step to the next match (wrap); Up steps to the previous match. Enter commits — the cursor stays at the current match, search exits. Esc cancels — the cursor restores to the pre-search position, search exits. Empty query is a no-op (cursor doesn't move). No-match is indicated visually (the bar text turns red, shows `(no match)`). Search is local to whichever pane had focus at `/`-press time; the other pane is unaffected.
 
 #### Selection rule
 
 Commands operate on the tagged set if it is non-empty; otherwise on the entry under the cursor. **Rename is the exception**: it is a single-entry operation in v0. If `R` is pressed while the tagged set is non-empty, the operation is rejected with a status-line nudge ("rename works on one entry; clear tags first"). Batch rename is parking-lot material for post-v0.
+
+**Make-new is also exceptional**: it doesn't consume the tagged set or the cursor entry. The parent directory is `ContentsPane.current_path` — whatever the user is *looking at*. Tagged set is silently ignored (mirrors View / Edit). The sub-prompt is two screens: a kind chooser (D/F/Esc) then a name PromptDialog; the typed name may contain forward-slash separators, in which case intermediate directories are created on apply (lenient mode).
 
 #### Cross-platform modifier strategy
 
@@ -208,6 +212,15 @@ Why this works:
 | 2026-05-19 | Rename rejects when tagged set non-empty; batch rename deferred to post-v0 |
 | 2026-05-19 | Menu bar opens on F9; Alt+letter accelerators are optional, never required |
 | 2026-05-19 | Win/Super/Cmd never bound (unavailable to terminal apps); Ctrl is bedrock |
+| 2026-05-22 | Edit (E / F4) is single-entry on cursor, not Selection-rule (mirrors View); multi-file editor semantics vary too much for a v0 contract |
+| 2026-05-22 | Editor helpers live in top-level `wtree/editor.py`, not `ops/` — Edit is a UI shell-out, not a Plan-producing operation |
+| 2026-05-22 | Make-new sub-prompt: two-step (chooser modal D/F/Esc → name PromptDialog). One-step combined modal and trailing-slash convention both rejected — each step is unambiguous and reuses PromptDialog unchanged |
+| 2026-05-22 | Make-new is lenient on path separators: `foo/bar/baz` creates intermediate directories on apply (`os.makedirs(parent, exist_ok=True)` + exclusive-create on the leaf). Differs from Rename (basename-only) because Make-new starts from "no existing entry" |
+| 2026-05-22 | Make-new parent is `ContentsPane.current_path` (the pane's displayed dir); tagged set and cursor entry are silently ignored. Make-new is a "create here" op, not Selection-rule |
+| 2026-05-22 | Left-on-root in the tree pane ascends and re-roots at the parent dir (XTree "widen the logged window" idiom). Left on any non-root node keeps Textual's default collapse-or-cursor-to-parent behaviour. At the filesystem root the action no-ops with a status nudge. Tags survive (absolute paths). After ascend the tree cursor lands on the old-root row, contents pane stays on the old root's contents (working context stable); user presses Up to see the new parent's contents |
+| 2026-05-22 | Incremental search (`/`) is **substring, case-insensitive**, matched against the entry basename in the contents pane and the visible node label in the tree pane. Prefix-only (XTree-strict) and regex (Vim-style) both rejected for v0 — substring is the modern default and easier to predict. Regex / prefix toggles can layer on later behind explicit syntax (e.g. `/^foo` for prefix, `/\foo` for regex) |
+| 2026-05-22 | Search is **local to the focused pane**. Tree-pane scope is **visible nodes only** — collapsed subtrees are NOT walked. Auto-expand-to-find is rejected for v0: would require eager subtree scans during typing and conflicts with sources that refuse `LogAll`. Find-across-tree is what `Ctrl+F` is reserved for (post-v0) |
+| 2026-05-22 | Search UI replaces the StatusLine inline while active — same row, no layout shift. SearchBar shows `/<query> (idx/total)` or `/<query> (no match)` in red. Modal PromptDialog explicitly rejected: would break the modeless "type and the cursor moves" feel that defines incremental search |
 
 ## Open questions
 

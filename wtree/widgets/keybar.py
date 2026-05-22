@@ -9,7 +9,7 @@ bar is *documentation*, not "what's available right now". Users learn
 the F-key cheat sheet by seeing it always; we just gray the unwired
 entries so expectations are calibrated.
 
-Currently wired: F2 (Ren), F5 (Copy), F6 (Move), F8 (Del), F10 (Quit). Everything else renders dimmed.
+Currently wired: F2 (Ren), F3 (View), F4 (Edit), F5 (Copy), F6 (Move), F7 (New), F8 (Del), F10 (Quit). Everything else renders dimmed.
 Implementations land one at a time; this widget stays unchanged - the
 ``_WIRED`` set below gets updated as bindings appear in ``WTreeApp``.
 """
@@ -39,7 +39,7 @@ _LABELS: tuple[tuple[int, str], ...] = (
 
 # Which F-keys actually do something in the current app. Drives the
 # dim/bold styling. Update as bindings are wired.
-_WIRED: frozenset[int] = frozenset({2, 5, 6, 8, 10})
+_WIRED: frozenset[int] = frozenset({2, 3, 4, 5, 6, 7, 8, 10})
 
 
 class KeyBar(Static):
