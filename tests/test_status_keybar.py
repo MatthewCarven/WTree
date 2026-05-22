@@ -190,7 +190,6 @@ async def test_keybar_wired_set_includes_f2(tmp_path: Path) -> None:
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written.
     assert 1 not in _WIRED
-    assert 9 not in _WIRED
 
 
 async def test_keybar_wired_set_includes_f3(tmp_path: Path) -> None:
@@ -204,7 +203,6 @@ async def test_keybar_wired_set_includes_f3(tmp_path: Path) -> None:
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written.
     assert 1 not in _WIRED
-    assert 9 not in _WIRED
 
 
 async def test_keybar_wired_set_includes_f4(tmp_path: Path) -> None:
@@ -221,7 +219,6 @@ async def test_keybar_wired_set_includes_f4(tmp_path: Path) -> None:
     # F7 was un-bound when Edit landed; it joined the set later - see
     # the F7 test below.
     assert 1 not in _WIRED
-    assert 9 not in _WIRED
 
 
 async def test_keybar_wired_set_includes_f7(tmp_path: Path) -> None:
@@ -238,4 +235,18 @@ async def test_keybar_wired_set_includes_f7(tmp_path: Path) -> None:
     # F-keys still un-bound at the time Make-new landed: F1 (Help),
     # F9 (Menu).
     assert 1 not in _WIRED
-    assert 9 not in _WIRED
+
+async def test_keybar_wired_set_includes_f9(tmp_path: Path) -> None:
+    """After binding F9 menu, F9 joins the wired set."""
+    from wtree.widgets.keybar import _WIRED
+    assert 2 in _WIRED   # Rename
+    assert 3 in _WIRED   # View
+    assert 4 in _WIRED   # Edit
+    assert 5 in _WIRED   # Copy
+    assert 6 in _WIRED   # Move
+    assert 7 in _WIRED   # Make-new
+    assert 8 in _WIRED   # Delete
+    assert 9 in _WIRED   # Menu (newly landed)
+    assert 10 in _WIRED  # Quit
+    # F1 (Help) remains the only un-bound F-key at v0 completion.
+    assert 1 not in _WIRED

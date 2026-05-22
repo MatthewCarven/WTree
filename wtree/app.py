@@ -9,10 +9,11 @@ Layout section.
 Bottom of the screen (per ``design.md``): an MC-style F-key cheat-sheet
 bar (:class:`~wtree.widgets.keybar.KeyBar`) above a one-line transient
 status display (:class:`~wtree.widgets.status_line.StatusLine`).
-StatusLine reflects whichever state is most volatile right now - the
-running operation if one's in flight, otherwise the cursor entry's path
-+ size + mtime. While incremental search (``/``) is active the
-StatusLine is hidden and the :class:`SearchBar` takes the same row.
+Top of the screen: :class:`~wtree.widgets.menu_bar.MenuBar` (always
+visible, MC-style chrome row). F9 pushes
+:class:`~wtree.widgets.menu_screen.MenuScreen`, which owns the
+interactive menu navigation while it's open. While search (``/``) is
+active the SearchBar replaces the StatusLine row.
 
 User-immediate feedback ("X rejected", "X cancelled", "Logged: ...")
 goes through :meth:`flash`, which routes to
@@ -22,63 +23,18 @@ Queue-completion notifications stay as toast notifies via
 away. The split is "did the user just press a key and want a reply" =
 flash, "did something complete on its own time" = toast.
 
-The app owns the central state objects:
+Pane auto-refresh (2026-05-22): ``_on_plan_complete`` schedules
+``asyncio.create_task(self._refresh_panes_after_op())`` to re-show
+the contents pane's current path so on-disk changes are visible
+without the user pressing anything. Tree-pane auto-refresh is parked.
 
-* :class:`~wtree.tagged_set.TaggedSet` - the per-session set of tagged
-  entries (``design.md`` Tagged set scope).
-* ``sources: dict[source_id, EntrySource]`` - the registry the ops
-  layer uses to look up sources by id.
-* :class:`~wtree.ops.OperationQueue` - serial FIFO of plans being
-  executed in the background.
-
-Action helpers (kept private, called from action_* methods):
-
-* :meth:`_plan_modal_enqueue` - destination-typed ops (Copy, Move).
-  Opens a ``PromptDialog`` for a destination path.
-* :meth:`_plan_confirm_enqueue` - destinationless ops (Delete). Opens
-  a ``ConfirmDialog`` for a yes/no gate.
-* :meth:`_finalise_plan` - shared post-planner tail used by both
-  helpers above and by action_rename: record last_plan, enqueue, clear
-  tagged set, notify, refresh status.
-
-Rename does not use the two helpers: it's single-entry only per
-``design.md`` Selection rule, the input is a basename (not a path),
-and the dialog default is the current basename. The action body
-inlines the Selection rule + PromptDialog + plan_rename and then
-calls :meth:`_finalise_plan` for the tail.
-
-View (V / F3) and Edit (E / F4) both bypass the planner machinery
-entirely: they are read-only or shell-out UI flows, not plan-producing
-operations. View pushes :class:`ViewerScreen`; Edit suspends Textual
-and runs ``$VISUAL`` / ``$EDITOR`` via :mod:`wtree.editor`.
-
-Make-new (N / F7) is its own shape: a chooser modal asks dir-or-file,
-then a PromptDialog asks for the name; the planner takes the displayed
-parent dir plus the chosen kind plus the typed name and emits a single
-PlanItem. Tagged set is silently ignored - Make-new is "create here",
-not Selection-rule. See :meth:`action_make_new`.
-
-Left-on-root ascend (2026-05-22): when the tree pane's cursor is on
-the root node and the user presses Left, ``TreePane`` posts an
-:class:`~wtree.widgets.tree_pane.TreePane.AscendRequested` message.
-The app handles it by re-rooting the tree at the parent path - XTree's
-"widen the logged window upward" idiom. At the filesystem root (no
-parent) the action emits a status nudge and stays put. See
-:meth:`on_tree_pane_ascend_requested`.
-
-Incremental search (``/``, 2026-05-22): activates an inline SearchBar
-that takes the StatusLine row. Substring case-insensitive matching
-against the focused pane's labels (basename in the contents pane,
-visible-node label in the tree pane). See :meth:`action_search` and
-the ``on_search_bar_*`` handlers.
-
-Pane auto-refresh (2026-05-22): when an operation completes (Copy,
-Move, Delete, Rename, Make-new), the contents pane re-shows its
-current path so the on-disk change is visible without the user
-pressing anything. Wired in :meth:`_on_plan_complete` via
-``asyncio.create_task(self._refresh_panes_after_op())``. Tree-pane
-auto-refresh is parked - the lazy-loaded ``_loaded`` memo makes that
-non-trivial.
+Menu bar (2026-05-22, F9): the MC-style menu bar at the top is
+always visible. Pressing F9 pushes :class:`MenuScreen`; the user
+navigates with arrows + letter accelerators + Enter, then the modal
+dismisses with an action name which the app dispatches via
+``getattr(self, f"action_{name}")()``. Menu items map 1:1 to the
+keyboard shortcuts the user could've pressed directly - the menu is
+discoverability chrome, not a parallel control path.
 """
 
 from __future__ import annotations
@@ -114,6 +70,8 @@ from wtree.widgets.confirm import ConfirmDialog
 from wtree.widgets.contents_pane import ContentsPane
 from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
+from wtree.widgets.menu_bar import MenuBar
+from wtree.widgets.menu_screen import MenuScreen
 from wtree.widgets.prompt import PromptDialog
 from wtree.widgets.search_bar import SearchBar
 from wtree.widgets.status_line import StatusLine
@@ -175,6 +133,7 @@ class WTreeApp(App):
         ("n", "make_new", "New"),
         ("f7", "make_new", "New"),
         ("slash", "search", "Search"),
+        ("f9", "menu_bar", "Menu"),
     ]
 
     TITLE = "WTree"
@@ -205,6 +164,7 @@ class WTreeApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield MenuBar()
         with Horizontal():
             yield TreePane(self._source, self._root_path, id="tree-pane")
             yield ContentsPane(
@@ -274,19 +234,7 @@ class WTreeApp(App):
     # ------------------------------------------------------------------
 
     def flash(self, message: str, *, timeout: float = 3.0) -> None:
-        """Show a transient status-line message ("X rejected", "Logged: Y").
-
-        Convenience over ``self.query_one(StatusLine).flash(...)`` with
-        an early-mount defensive try/except so callers don't have to
-        worry about firing before compose has placed the widget.
-        Replaces any active flash (the previous timer is cancelled).
-
-        Use this for user-immediate feedback that the user is expected
-        to be looking at right now. Reserve :meth:`notify` for queue
-        completion and other things that may fire async after the user
-        has moved on - the toast layer queues them visibly even when
-        the user has stopped watching the status line.
-        """
+        """Show a transient status-line message ("X rejected", "Logged: Y")."""
         try:
             status = self.query_one(StatusLine)
         except Exception:  # noqa: BLE001 - early-mount safety
@@ -318,20 +266,7 @@ class WTreeApp(App):
 
     @work
     async def action_rename(self) -> None:
-        """R / F2 - rename the cursor entry to a typed new basename.
-
-        Single-entry only per ``design.md`` Selection rule. If the
-        tagged set is non-empty when R is pressed, the operation is
-        rejected with a status-line flash ("rename works on one entry;
-        clear tags first") and no dialog opens. This is the *only*
-        v0 op that doesn't follow the standard Selection rule.
-
-        The modal prompts for a new basename (not a destination path).
-        The default is the current basename so the user can tweak it
-        instead of retyping. If the typed name contains a path
-        separator, ``plan_rename`` rejects it with an ``InvalidName``
-        error - rename is basename-only.
-        """
+        """R / F2 - rename the cursor entry to a typed new basename."""
         assert self.op_queue is not None, "op_queue constructed in on_mount"
 
         if self.tagged_set:
@@ -366,9 +301,6 @@ class WTreeApp(App):
             return
 
         plan = await plan_rename(tag, typed, self.sources)
-        # If the planner rejected (NoChange / InvalidName / etc.) we
-        # surface the cause and don't enqueue. Errors are in-band data;
-        # no exception was raised.
         if plan.is_empty:
             self.flash("Rename: planner produced no items.")
             return
@@ -381,14 +313,7 @@ class WTreeApp(App):
         self._finalise_plan(plan, [tag], "Rename", destination_path=None)
 
     def action_view(self) -> None:
-        """V / F3 - open the cursor entry in the built-in pager.
-
-        Single-entry op (no Selection rule - viewing the tagged set
-        makes no sense). The action validates the cursor entry's kind
-        and either pushes :class:`ViewerScreen` (FILE / SYMLINK) or
-        emits a status flash with a hint about what to press instead
-        (DIR -> Enter to navigate; OTHER -> kind name).
-        """
+        """V / F3 - open the cursor entry in the built-in pager."""
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
@@ -406,24 +331,11 @@ class WTreeApp(App):
             self.flash(f"View: cannot view a {kind.value}.")
             return
 
-        # FILE or SYMLINK - push the viewer. Symlinks are followed by
-        # the underlying open() call inside ViewerScreen's load.
         self.push_screen(ViewerScreen(path))
 
     @work
     async def action_edit(self) -> None:
-        """E / F4 - shell out to ``$VISUAL`` / ``$EDITOR`` / platform default.
-
-        Single-entry op operating on the cursor entry, mirroring
-        ``action_view``. Kind validation: DIR/OTHER flash a status
-        nudge and bail without touching the terminal. After the
-        editor returns, the contents pane re-shows the current dir so
-        any on-disk change is reflected.
-
-        ``with self.suspend()`` is factored into
-        :meth:`_launch_editor_blocking` so tests can monkeypatch it -
-        the headless driver doesn't support suspend.
-        """
+        """E / F4 - shell out to ``$VISUAL`` / ``$EDITOR`` / platform default."""
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
@@ -459,8 +371,6 @@ class WTreeApp(App):
         if rc != 0:
             self.flash(f"Edit: {argv[0]} exited with status {rc}.")
 
-        # Refresh the contents pane in case the file's metadata changed
-        # (mtime, size).
         if contents.current_path is not None:
             await contents.show_path(contents.current_path)
         self._refresh_status()
@@ -468,23 +378,13 @@ class WTreeApp(App):
     def _launch_editor_blocking(
         self, argv: Sequence[str], path: str
     ) -> int:
-        """Suspend Textual, run the editor, resume; return the exit code.
-
-        Carved out so tests can monkeypatch it and skip the
-        ``app.suspend()`` call - the headless driver raises
-        :class:`SuspendNotSupported`.
-        """
+        """Suspend Textual, run the editor, resume; return the exit code."""
         with self.suspend():
             return launch_editor_blocking(argv, path)
 
     @work
     async def action_make_new(self) -> None:
-        """N / F7 - create a new dir or file in the pane's current dir.
-
-        See :class:`KindChooserDialog` + :func:`plan_make_new`. Parent
-        dir is :attr:`ContentsPane.current_path`. Tagged set silently
-        ignored - Make-new is "create here", not Selection-rule.
-        """
+        """N / F7 - create a new dir or file in the pane's current dir."""
         assert self.op_queue is not None, "op_queue constructed in on_mount"
 
         contents = self.query_one(ContentsPane)
@@ -621,14 +521,7 @@ class WTreeApp(App):
         *,
         destination_path: str | None,
     ) -> None:
-        """Common tail: record last_plan, enqueue, clear tagged set, notify.
-
-        The "X (queued)" message stays as a toast notify - it carries
-        non-trivial info (plan summary + sources + destination) that's
-        worth queuing in Textual's notification stack even if the user
-        looks away. The "X: planner produced no items" rejection,
-        however, is an immediate user-action result -> flash.
-        """
+        """Common tail: record last_plan, enqueue, clear tagged set, notify."""
         assert self.op_queue is not None
         self.last_plan = plan
 
@@ -674,13 +567,7 @@ class WTreeApp(App):
     async def on_tree_pane_ascend_requested(
         self, event: TreePane.AscendRequested
     ) -> None:
-        """Re-root the tree at the parent of the current root.
-
-        Posted by :class:`TreePane` when the user presses Left while
-        the cursor is on the root node. ``os.path.dirname(root) ==
-        root`` flashes a "no parent" nudge; otherwise re-roots and
-        lands the cursor on the old-root row.
-        """
+        """Re-root the tree at the parent of the current root."""
         event.stop()
         old_root = self._root_path
         new_root = os.path.dirname(old_root)
@@ -802,6 +689,42 @@ class WTreeApp(App):
         target.focus()
         self._refresh_status()
 
+    # ------------------------------------------------------------------
+    # Menu bar (F9) - see design.md § Keymap
+    # ------------------------------------------------------------------
+
+    @work
+    async def action_menu_bar(self) -> None:
+        """F9 - open the menu modal and dispatch the chosen action.
+
+        Push :class:`MenuScreen`; await its dismiss. ``None`` =
+        cancelled (Esc); otherwise dispatch ``action_<name>`` to
+        execute the chosen menu item. Menu items map 1:1 to
+        keyboard shortcuts the user could've pressed directly - the
+        menu is a discoverability surface, not a parallel control
+        path.
+
+        Unknown action names (which shouldn't happen if MENUS in
+        ``menu_bar.py`` stays in sync with the action methods) flash
+        a diagnostic. The dispatch is via ``getattr`` so adding a
+        new menu item is as simple as adding a ``MenuItem`` with
+        the right ``action`` string.
+        """
+        chosen = await self.push_screen_wait(MenuScreen())
+        if chosen is None:
+            return
+        method = getattr(self, f"action_{chosen}", None)
+        if method is None:
+            self.flash(f"Menu: unknown action {chosen!r}.")
+            return
+        result = method()
+        # Some actions are sync (action_view, action_untag_all);
+        # others are @work-decorated coroutines (action_copy, etc).
+        # @work returns None synchronously after spawning a worker,
+        # so we only await if the method returned an actual coroutine.
+        if asyncio.iscoroutine(result):
+            await result
+
     def action_noop(self) -> None:
         """Placeholder action so the cheat sheet stays honest."""
 
@@ -821,20 +744,7 @@ class WTreeApp(App):
     def _on_plan_complete(
         self, result: OperationResult, queue: OperationQueue
     ) -> None:
-        """Toast the result and schedule a pane auto-refresh.
-
-        The completion toast stays as ``notify()`` - it may fire async
-        long after the user's looked away (a multi-GB copy completing
-        ten minutes later). The notification stack in Textual will
-        queue it visibly so they catch it on their next return to the
-        terminal.
-
-        Pane auto-refresh fires unconditionally on completion (even on
-        partial-success / failure), because *some* items may have
-        touched disk and the user should see the new state. The
-        refresh is an async task so we don't block the queue worker;
-        it's wrapped so a refresh failure doesn't propagate back.
-        """
+        """Toast the result and schedule a pane auto-refresh."""
         self.last_result = result
         verb = result.plan.kind.value.capitalize()
         if result.all_succeeded:
@@ -847,21 +757,12 @@ class WTreeApp(App):
             )
         self._update_subtitle()
         self._refresh_status()
-        # Schedule pane auto-refresh outside this sync callback so the
-        # queue worker can move on to the next plan without waiting.
+        # Schedule pane auto-refresh outside this sync callback.
         asyncio.create_task(self._refresh_panes_after_op())
 
     async def _refresh_panes_after_op(self) -> None:
         """Re-show the contents pane's current path so on-disk changes
-        appear without the user pressing anything.
-
-        Tree-pane auto-refresh is parked for v0 - the lazy-loaded
-        ``_loaded`` memo makes invalidation non-trivial, and most ops
-        affect entries within the displayed directory rather than the
-        tree's expansion structure. When tree-pane refresh lands it
-        will likely need a "which paths changed" signal from the
-        planner / executor pair.
-        """
+        appear without the user pressing anything."""
         try:
             contents = self.query_one(ContentsPane)
             if contents.current_path is not None:

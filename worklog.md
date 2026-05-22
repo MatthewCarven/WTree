@@ -2284,3 +2284,125 @@ F9 menu bar, then v0 ships. After v0, the "passive folder-change
 detection with idle debounce" idea (from the Ascend-era follow-ups)
 is the most interesting parked thread — it's a small but visible UX
 win that doesn't require touching the planner machinery.
+
+## 2026-05-22 (v0 complete) — F9 menu bar
+
+Last v0 item, now landed. **v0 is functionally complete.**
+
+### Design decisions
+
+Matthew confirmed all three recommended options at the start:
+**always-visible MC-style bar at top**, **only show implemented
+items**, **first-letter accelerators highlighted**.
+
+Two top-level menus:
+
+- **File**: New, View, Edit, Copy, Move, Rename, Delete, ---, Quit
+- **Commands**: Search, Untag all
+
+Help menu deferred — no About modal yet. Parked as a follow-up.
+F1 (Help) is the only F-key still unbound on the cheat sheet.
+
+### Implementation shape
+
+Two widgets + one screen + one action:
+
+* **`wtree/widgets/menu_bar.py`** — `MenuBar(Widget)` is the
+  always-visible passive top row. Renders the menu names with
+  accelerator letters underlined. Doesn't own focus; never
+  receives input. Also defines `MENUS` as a module-global tuple
+  of `Menu` dataclasses (each with a tuple of `MenuItem`
+  dataclasses), plus `render_menu_row(active_idx)` which both
+  the passive bar and the active modal use so they paint
+  visually-identically.
+
+* **`wtree/widgets/menu_screen.py`** — `MenuScreen(ModalScreen[str
+  | None])` is the interactive surface pushed on F9. Renders a
+  top row that mirrors the passive `MenuBar` (with one menu
+  highlighted as active) plus a `_DropdownPanel` Widget child
+  showing the active menu's items + shortcuts. Owns `on_key`:
+  Up/Down navigate dropdown (skipping separators), Left/Right
+  rotate top-level menus with wrap, Enter dismisses with the
+  selected item's `action` string, Esc dismisses with `None`,
+  letter accelerators jump to + activate the matching item.
+
+* **`wtree/app.py` `action_menu_bar`** — `@work`-decorated
+  async; pushes `MenuScreen`, awaits dismiss, dispatches via
+  `getattr(self, f"action_{name}")()`. Handles both sync and
+  `@work` action methods (the latter return None synchronously
+  after spawning a worker; the former may return a coroutine
+  that we await).
+
+* **MenuBar in `compose()`** — yielded right after `Header()`,
+  so the layout from top to bottom is: Header (Textual built-in
+  title), MenuBar (passive menu row), Horizontal (panes),
+  StatusLine, SearchBar (hidden default), KeyBar.
+
+* **`f9` binding + `_WIRED` bump** — F9 wired in `WTreeApp.BINDINGS`;
+  KeyBar `_WIRED` bumped from `{2,3,4,5,6,7,8,10}` to
+  `{2,3,4,5,6,7,8,9,10}`. F1 remains unwired.
+
+### Tests landed
+
+14 new tests:
+
+- `tests/test_menu.py` (13 tests): MenuBar renders both menus;
+  MENUS definition shape; row-renderer accepts active_idx; F9
+  opens MenuScreen; Esc closes; Right/Left rotate (with wrap);
+  Down moves cursor; Down skips separator (File menu's
+  separator at index 7 -> next is Quit at 8); letter
+  accelerator activates Copy directly; Enter activates current
+  item; Commands -> Search dispatches search; Commands -> Untag
+  all clears the tagged set.
+
+- `tests/test_status_keybar.py` (1 new test): F9 wired-bit
+  assertion; the four stale "F9 still unbound" snapshots in
+  earlier per-op tests also updated to drop the now-incorrect
+  `9 not in _WIRED` lines.
+
+Full suite: **294/294 green** (was 280, +14).
+
+### Lessons captured
+
+Three new "Notes for the next session" entries:
+
+- Module-global definitions are the right shape for shared
+  state between a passive widget and a modal screen.
+- `@work`-decorated actions return None synchronously; only
+  naked `async def` actions return coroutines worth awaiting.
+- Reactive children + `_sync_children()` is the pattern for
+  modal screens with internal state.
+
+### Mount-truncation incidents
+
+Hit on app.py (~28 KB final), keybar.py, test_status_keybar.py,
+design.md, todo.md. The heredoc-stage + atomic-mv protocol
+recovered each. No new "Notes for the next session" entries —
+these are all already documented patterns.
+
+### v0 status: COMPLETE
+
+Every operation in design.md's canonical keymap that has an
+implementation is now wired and tested. The only unwired thing
+on the F-key bar is F1 (Help). v0 ships now.
+
+The repo has a single initial commit; everything since has been
+on the working tree. Matthew's plan: commit + push in chunks.
+Three commits so far covered the Make-new + ascend, search, and
+flash + auto-refresh slices. F9 menu bar is the fourth commit —
+the "v0 complete" milestone commit.
+
+### Next session
+
+Per the follow-ups list, the most interesting parked threads
+are:
+
+- Help menu + About modal + F1 binding (small, completes the
+  chrome).
+- Passive folder-change detection with idle debounce (Matthew's
+  idea from the Ascend session).
+- Tree-pane auto-refresh (the unfinished half of the post-op
+  refresh).
+- `StatusLine.flash` severity styling (yellow / red).
+
+But v0 is shippable as-is.
