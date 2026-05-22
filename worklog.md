@@ -2147,3 +2147,140 @@ ascend gesture (Left-on-root), and the search gesture (`/`) are all
 landed. **268/268 tests green.** Next session can either ship F9 and
 call v0 done, or do a round of polish on any of the follow-ups list
 items before the menu bar.
+
+## 2026-05-22 (last) — `StatusLine.flash` + pane auto-refresh
+
+Two cross-cutting features that had been on the follow-ups list since
+the Rename work (the flash API) and the Move work (pane auto-refresh).
+Both touch most of the app handlers and shipped together because they
+share the same "post-op user feedback" feel.
+
+### Two-tier feedback design
+
+Locked the split: `StatusLine.flash(msg, timeout=3.0)` for user-
+immediate nudges, `App.notify()` retained for queue-completion toasts.
+Rationale: a completion may fire async ten minutes later when the user
+has looked away, and Textual's notification stack queues those visibly
+on next return; the status line would silently overwrite. Immediate
+nudges, by contrast, are seen right now and shouldn't pile up - the
+status line is the right surface.
+
+Three sub-decisions captured to the design log:
+
+- **3 second default timeout.** Long enough to read a sentence,
+  short enough to feel transient. Matches Vim-ish status messages.
+- **Replace, don't queue.** A new flash() cancels the previous
+  timer and immediately shows the new message. Easier reasoning;
+  rapid-fire flash queuing parked as a follow-up.
+- **Flash holds through `refresh_from()`.** Cursor moves and queue
+  ticks call `refresh_from(app)` constantly; without the guard,
+  the ascend flash would be overwritten the moment the user's next
+  keypress fired NodeHighlighted. The `refresh_from` body now bails
+  out early if `_flash_message is not None`.
+
+### Implementation shape
+
+* **`wtree/widgets/status_line.py`** — added `_flash_message` /
+  `_flash_timer` state, `flash(message, timeout=3.0)` method,
+  `_clear_flash` timer callback (reverts via `refresh_from(self.app)`).
+  `refresh_from()` now respects the active flash.
+
+* **`wtree/app.py`** — added `WTreeApp.flash(message, timeout=3.0)`
+  convenience that looks up the StatusLine and calls its flash with
+  early-mount defensive try/except.
+
+* **`_on_plan_complete` auto-refresh hook** — fires
+  `asyncio.create_task(self._refresh_panes_after_op())` after the
+  existing notify + status update. The async helper is `try/except`-
+  wrapped so a refresh failure doesn't propagate back to the queue
+  worker. Fires unconditionally - even on partial-success - because
+  some items may have touched disk.
+
+* **Routed ~20 notify warnings through flash:** action_rename's
+  rejection + cancellation + planner-error nudges; action_view's
+  kind validation nudges; action_edit's editor-not-found / non-zero-
+  exit / spawn-error nudges; action_make_new's cancellation +
+  planner-error nudges; `_plan_modal_enqueue` /
+  `_plan_confirm_enqueue` / `_finalise_plan` cancellation +
+  empty-plan nudges; `on_tree_pane_ascend_requested`'s "Already
+  at filesystem root" and "Logged: NEW (ascended)" nudges;
+  action_search's "focus a pane first" nudge.
+
+  **Kept as notify:** `_finalise_plan`'s "X (queued)" message
+  (carries non-trivial info worth queuing through the toast
+  stack), and `_on_plan_complete`'s "X (done)" / "X (done with
+  errors)" completion message (async, may fire when user has
+  moved on).
+
+### Bug surfaced: `status.renderable` isn't public on Static
+
+First pass of the tests asserted `str(status.renderable)` to
+inspect the displayed text. Textual 8.x's Static doesn't expose
+`renderable` publicly; the public surface is `status.render()`
+which returns the current Rich renderable. Fixed by adding a
+`_status_text(status)` helper that calls `str(status.render())`.
+
+### Tests landed
+
+12 new tests in `tests/test_flash_and_refresh.py`:
+
+- **Flash unit:** shows the message; clears after timeout; replaces
+  active flash; holds through `refresh_from()`; default timeout is 3s.
+- **App convenience:** `app.flash()` routes to StatusLine.
+- **Flash integration:** Rename-with-tags rejection flashes;
+  Ascend at FS root flashes; Ascend success flashes "Logged: NEW
+  (ascended from OLD)".
+- **Auto-refresh e2e:** Make-new entry appears in pane without the
+  user pressing anything; Delete row vanishes; refresh survives
+  current_path being deleted under it.
+
+Full suite: **280/280 green** (was 268, +12). Suite split into four
+runs again because the 45s bash timeout still bites.
+
+### Notify-to-flash conversion was test-safe
+
+None of the existing 268 tests asserted on notify content; they
+assert on `app.last_plan`, file existence, cursor position, etc.
+The conversion was a clean swap.
+
+### Mount-truncation incidents
+
+Hit on app.py (~36 KB final size), status_line.py, design.md,
+todo.md, test_flash_and_refresh.py during this session. Each one
+recovered via the heredoc-stage + atomic-mv protocol. Three new
+"Notes for the next session" entries capture lessons:
+
+- Static's `renderable` is private; use `str(widget.render())`.
+- `asyncio.create_task` is the right pattern for firing async work
+  from a sync queue callback.
+- `set_timer(timeout, callback)` is Textual's one-shot deferred-
+  work primitive; keep the Timer reference for cancel-and-replace.
+
+### Follow-ups parked (Flash + auto-refresh)
+
+Five items on a new "Flash + auto-refresh follow-ups" section:
+
+- Severity-styled flash (yellow/red coloring).
+- **Tree-pane auto-refresh** — the bigger missing piece. The
+  contents pane refreshes automatically; the tree doesn't.
+  Solution requires a "touched paths" signal from
+  planner/executor + `_loaded` memo invalidation per node.
+- Preserve cursor position across auto-refresh (currently resets
+  to row 0).
+- Flash queue for rapid-fire messages.
+- Flash from inside async ops on refresh failure.
+
+### v0 status
+
+Two flash-list items completed this session. One v0 item remains:
+**F9 menu bar**. After that, v0 is done. Memory + worklog + design.md
++ todo.md all in sync. The current commit on the branch is the
+initial scaffold; everything since is uncommitted (per Matthew's
+plan to commit the whole batch).
+
+### Next session
+
+F9 menu bar, then v0 ships. After v0, the "passive folder-change
+detection with idle debounce" idea (from the Ascend-era follow-ups)
+is the most interesting parked thread — it's a small but visible UX
+win that doesn't require touching the planner machinery.

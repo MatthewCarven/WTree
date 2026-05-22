@@ -7,23 +7,31 @@ the F-key cheat sheet.
 
 Priority order of what we show (highest first):
 
-1. **Queue running** - "Copying: 3/5 items, 1 queued" - because that's
+1. **Active flash** - a transient message scheduled via :meth:`flash`
+   (e.g. "Rename rejected", "Already at filesystem root"). Holds for
+   the configured timeout, even through cursor moves. Auto-clears
+   when the timer fires.
+2. **Queue running** - "Copying: 3/5 items, 1 queued" - because that's
    the most volatile state and the thing the user wants to know NOW.
-2. **Cursor entry** - "/path/to/file  1.4 KB  2026-05-21 12:00" - when
+3. **Cursor entry** - "/path/to/file  1.4 KB  2026-05-21 12:00" - when
    idle, surface what's selected (per design "the active mode" is
    nothing-special, so we surface what the user is pointing at).
-3. **Fallback** - blank.
+4. **Fallback** - blank.
 
-Transient messages (errors, cancellations) go through Textual's
-notify() rather than this line - keeping the status line consistent
-means the user can rely on it always reflecting current state, not
-something stale.
+Two kinds of transient feedback live in the codebase. **Status flashes**
+(this widget's :meth:`flash`) are user-immediate nudges: "X rejected",
+"X cancelled", "Already at root". They go through here so the status
+line is the single place to look. **Toast notifications**
+(:meth:`textual.app.App.notify`) are kept for things that may fire
+async when the user isn't looking - queue completion most importantly,
+where a copy might finish minutes later in the background.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from textual.timer import Timer
 from textual.widgets import Static
 
 from wtree.ops.base import _human_bytes
@@ -31,6 +39,13 @@ from wtree.sources.base import Kind
 
 if TYPE_CHECKING:
     from wtree.app import WTreeApp
+
+
+# Default flash timeout. Long enough to read a typical "X rejected"
+# sentence at a glance, short enough to feel transient and not crowd
+# the next status update. 3 seconds matches the typical Vim status
+# message duration.
+DEFAULT_FLASH_TIMEOUT = 3.0
 
 
 class StatusLine(Static):
@@ -48,6 +63,65 @@ class StatusLine(Static):
 
     def __init__(self) -> None:
         super().__init__("", markup=True)
+        # Flash state. ``_flash_message`` is the text currently being
+        # displayed (None when no flash is active). ``_flash_timer`` is
+        # the Textual timer that will clear the flash; we keep the
+        # reference so a new flash() call can cancel and replace it.
+        self._flash_message: str | None = None
+        self._flash_timer: Timer | None = None
+
+    # ------------------------------------------------------------------
+    # Flash API - transient status messages
+    # ------------------------------------------------------------------
+
+    def flash(
+        self,
+        message: str,
+        *,
+        timeout: float = DEFAULT_FLASH_TIMEOUT,
+    ) -> None:
+        """Show ``message`` for ``timeout`` seconds, then revert.
+
+        Replaces any currently-active flash (the previous timer is
+        cancelled). The flash holds through cursor moves and other
+        ``refresh_from`` calls until its timer fires, then the status
+        line reverts to its normal app-state render via
+        :meth:`refresh_from`.
+
+        Markup is supported via Rich tags (``[b]X[/b]``, ``[dim]Y[/dim]``)
+        because the underlying ``Static`` was constructed with
+        ``markup=True``.
+        """
+        # Cancel any in-flight timer so the new flash gets its full
+        # timeout window, not whatever was left on the old one.
+        if self._flash_timer is not None:
+            self._flash_timer.stop()
+        self._flash_message = message
+        self._flash_timer = self.set_timer(timeout, self._clear_flash)
+        # Show immediately - don't wait for the next refresh_from.
+        self.update(message)
+
+    def _clear_flash(self) -> None:
+        """Timer callback - clear flash state and revert to app render.
+
+        ``refresh_from`` needs the app to rebuild the normal status
+        text. ``self.app`` is the mounted Textual app, which is the
+        :class:`WTreeApp` instance we want.
+        """
+        self._flash_message = None
+        self._flash_timer = None
+        # Best-effort revert. If the app isn't a WTreeApp for some
+        # reason (e.g. a stripped-down test harness), fall back to a
+        # blank line rather than crashing the timer callback.
+        try:
+            from wtree.app import WTreeApp
+
+            if isinstance(self.app, WTreeApp):
+                self.refresh_from(self.app)
+                return
+        except Exception:  # noqa: BLE001 - defensive in a timer callback
+            pass
+        self.update("")
 
     def refresh_from(self, app: "WTreeApp") -> None:
         """Re-render from the app's current state.
@@ -55,7 +129,17 @@ class StatusLine(Static):
         Called from any handler that mutates queue state, cursor
         position, or the tagged set. Cheap enough to call generously
         - the work is a few attribute reads and an f-string.
+
+        **Flash precedence:** if a flash is currently active, this is
+        a no-op. The flash holds the line until its timer fires; the
+        timer's ``_clear_flash`` then calls back into this method to
+        revert. Without this guard, the cursor move that happens
+        immediately after (say) an ascend would overwrite the
+        "Logged: NEW (ascended from OLD)" flash before the user could
+        read it.
         """
+        if self._flash_message is not None:
+            return
         self.update(self._build_text(app))
 
     # ------------------------------------------------------------------
