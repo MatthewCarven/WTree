@@ -2406,3 +2406,1103 @@ are:
 - `StatusLine.flash` severity styling (yellow / red).
 
 But v0 is shippable as-is.
+
+
+---
+
+## 2026-05-22 evening — tagging polish pass
+
+**Outcome: 318/318 green (294 baseline + 24 new). Tagged-set-era follow-ups in `todo.md` checked off.**
+
+After v0 wrap + the morning's mouse-design conversation, picked up the tagged-set polish work that had been parked. The goal was to round out the tagged set as WTree's headline differentiator — bulk gestures so the user doesn't fall back to Space-times-thirty for a multi-file selection.
+
+### Design choices (Matthew confirmed via AskUserQuestion)
+
+1. **Visual style for tagged rows: bold yellow on every cell, marker stays `*` (rendered bold yellow too).** Reverse-video and marker-only-glyph both rejected — reverse-video clashes with the cursor highlight; marker-only wouldn't give the row-level signal that makes a multi-tag selection visually obvious.
+2. **Glob casing: platform-default via `fnmatch.fnmatch`** (case-sensitive on POSIX, case-insensitive on Windows). Considered case-insensitive-everywhere for symmetry with `/`-search but the standard fnmatch behaviour wins on user expectation.
+3. **Tree-pane Space recursion: toggle by the directory's own tagged state.** Tagged dir -> recursive untag; untagged dir -> recursive tag. Always-additive and any-descendant-tagged-means-untag both considered and rejected (the cursor-tagged-state-IS-the-signal model is the easiest to reason about and naturally inverse-able).
+
+### What landed
+
+- **`TaggedSet.add_many` / `remove_many`** (`wtree/tagged_set.py`) returning the actual delta (not the iterable length). Foundation for every bulk gesture below. 6 new unit tests including empty-input, duplicate-in-input, and round-trip.
+- **Visual style** (`wtree/widgets/contents_pane.py`): added `_TAGGED_STYLE = "bold yellow"`, helper `_cell(value, tagged)` that returns `Text(value, style=_TAGGED_STYLE)` for tagged rows and plain str otherwise. New `_row_cells: list[list[str]]` parallel list stores the raw strings so `refresh_tag_markers` can restyle a whole row without re-scanning the source. `action_toggle_tag` now restyles all cells of the row, not just the marker column. New `row_paths()` helper on the pane returns absolute paths for taggable rows (skipping error rows) — used by Ctrl+A and `+`/`-`.
+- **`Ctrl+A` tag-all-in-current-dir** (`wtree/app.py`): sync `action_tag_all`. Iterates `ContentsPane.row_paths()`, calls `add_many`, refresh, flash with delta. Idempotent — running again when all are tagged shows "N entries already tagged".
+- **`+` / `-` tag-by-pattern** (`wtree/app.py`): `@work` actions push a `PromptDialog`. Shared `_tag_pattern_impl(add=bool)` helper runs the actual match. `fnmatch.fnmatch` against `posixpath.basename(p)`. Empty pattern or Esc both cancel cleanly with a status flash. No-match also flashes a clear message.
+- **Recursive tree-pane Space** (`wtree/widgets/tree_pane.py` + `wtree/app.py`): new `TreePane.TagRequested(path)` message, `TreePane.on_key` extended to intercept Space (event.stop + prevent_default) on any node with `data is not None`. App handler `on_tree_pane_tag_requested` is `@work`; the walker `_walk_subtree(root)` is a stack-based async generator (iterative to avoid Python recursion limits on deep trees) that yields the root + every descendant via `EntrySource.scan()`. Symlinks treated as leaves; ScanErrors silently skipped.
+
+### Tests
+
+- `tests/test_tagged_set.py` — 6 new unit tests for the bulk API (15 total in file).
+- `tests/test_app.py` — 3 existing assertions updated (`marker == "*"` -> `str(marker) == "*"`) to handle styled cells.
+- `tests/test_tag_bulk_e2e.py` (new) — 11 e2e pilot tests for Ctrl+A and `+`/`-` covering empty dirs, error rows, idempotency, cancel-via-Esc, no-match, and basic glob.
+- `tests/test_tree_recursive_tag.py` (new) — 7 e2e pilot tests covering root-of-tree, sub-dir, empty-dir, ScanError-skip, error-placeholder, and the bulk-then-single-toggle interaction.
+
+### Mount fights (worth documenting)
+
+The mount truncated three separate writes today: `tagged_set.py`, `contents_pane.py`, `app.py`, plus `tests/test_app.py`. Each one looked successful at the Edit-tool layer but a `wc -l` plus `ast.parse` afterward showed the file was cut mid-statement. The mitigation that now works reliably: assemble the entire intended file content in `/tmp`, run `ast.parse` on the `/tmp` copy, then `cp` to `<target>.tmp`, byte-compare `wc -c`, and only `mv` on a match. Treat this as the default protocol for any file write into the project folder larger than a one-liner — Edit is convenient but the mount layer can lie, especially when the change spans more than a small handful of lines.
+
+Stale `.pyc` files were a second source of confusion mid-session: a previous session's bytecode in `__pycache__` had the OLD session-path baked into `co_filename`, and the FUSE layer refused `rm` on those files ("Operation not permitted"). The workaround that worked: `PYTHONPYCACHEPREFIX=/tmp/pyc_wtree` forces Python to write its bytecode cache outside the project, sidestepping the locked-in `.pyc`s. Worth a follow-up — see notes for the next session.
+
+### State at end of session
+
+- v0.x scope: the tagged-set feature is now genuinely demonstrable. Tag a dir from the tree, see the whole subtree light up in the contents pane in bold yellow.
+- Open follow-ups in `todo.md` under "Tagged-set-era follow-ups": recursive `+`/`-`, tree-pane node styling (separate from contents-pane styling because Tree uses Rich-renderable labels, not table cells), progress feedback for big recursive walks, cancel during walk.
+
+### Recommended next pickup
+
+- **F1/Help + About modal.** Closes out the F-key bar (only unbound F-key). Small scope, gives a "fully bound" milestone.
+- **`Ctrl+F` find-across-tree.** Reuses the search infrastructure built earlier; the walker we just landed (`_walk_subtree`) is structurally adjacent.
+- **Tree-pane node styling** to mirror the contents-pane tagged-row styling so the visual story is consistent across panes.
+
+But none of these are blocking — v0 plus the tagging polish is a coherent shippable point.
+
+## 2026-05-23 — F1 / Help + About modal (v0 keymap loop closed)
+
+Picked the F1 Help follow-up off `todo.md` to close out the F-row. v0
+was already functionally complete, but F1 was the only unbound F-key
+on the cheat-sheet bar and the menu-era todo asked for a Help / About
+modal as a discoverability surface. One small session, one modal, one
+new menu, no new infrastructure.
+
+### Design call
+
+Single combined modal `HelpScreen` does double duty: F1 cheat-sheet
+and the menu-bar Help → About item open the same screen. Two reasons
+to combine rather than split into "Help" and "About" surfaces:
+
+* The About info (name, version, attribution, one-line description)
+  fits in five lines. A dedicated About modal would feel underfed.
+* The Help content (categorised keymap reference) wants the About
+  header anyway — "what is this thing and what version" sits
+  naturally above "how do I drive it".
+
+A future "Keymap only" sub-item can layer on top by adding a second
+`MenuItem` that opens the same screen scrolled to the keymap section,
+without changing the screen itself. v0 keeps it one item.
+
+Modal shape mirrors `ViewerScreen` exactly — `VerticalScroll`
+container, `Static` body with Rich `Text`, `Label` header docked top,
+`Label` hint docked bottom, dismiss on `Esc` / `Q` via `BINDINGS`. The
+view-style modal contract is the established pattern for read-only
+screens; reusing it kept the implementation under ~150 lines.
+
+Keymap content is hand-curated in `_help_content()` rather than
+introspected from `WTreeApp.BINDINGS`. `BINDINGS` is a flat list of
+`(key, action, label)` tuples; the help screen wants conceptual
+grouping (Navigation / Tagging / File operations / Search /
+Application / Selection rule). Maintaining two surfaces means a new
+binding touches both `BINDINGS` and `_help_content()`, but the cost
+is small at v0 scale and the readability gain for the user is large.
+If the keymap grows past ~50 entries we'd revisit.
+
+### Implementation
+
+* `wtree/widgets/help.py` — new module. `HelpScreen(ModalScreen[None])`
+  with `Esc` / `Q` bindings, `VerticalScroll` body. Pure `_help_content()`
+  function returns a Rich `Text` so tests can assert on the rendered
+  content without instantiating the screen.
+* `wtree/widgets/menu_bar.py` — added a third `Menu` entry: `Help`
+  with accelerator `h` and a single `About` item (accelerator `a`,
+  shortcut display `F1`, action `help`).
+* `wtree/widgets/keybar.py` — `_WIRED` is now `{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}`.
+  The docstring's "currently wired" comment updated. F1 (Help) now
+  renders bold rather than dim — the cheat sheet finally tells the
+  truth about every F-key.
+* `wtree/app.py` — added `("f1", "help", "Help")` to `BINDINGS`,
+  changed the existing `("question_mark", "noop", "Help")` to
+  `("question_mark", "help", "Help")`, added `action_help` which
+  pushes `HelpScreen()`. Removed the now-dead `action_noop`
+  placeholder. New import `from wtree.widgets.help import HelpScreen`.
+
+The dispatch via the F9 menu reuses the existing pattern — the
+`About` item's `action` is `"help"`, and `action_menu_bar` dispatches
+via `getattr(self, f"action_{name}")()`. No new dispatcher logic.
+
+### Tests
+
+`tests/test_help.py` — 13 new tests covering:
+
+* Pure content assertions (no app instance needed): the version
+  string is present, every section header exists, key bindings like
+  `Tab`, `Space`, `Ctrl+A`, `F5` are listed.
+* F1 opens `HelpScreen`. Same for `?`.
+* `Esc` and `Q` both dismiss the modal off the screen stack.
+* `_WIRED == frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})` (structural)
+  and KeyBar renders the `Help` label (rendered surface).
+* `MENUS` has `Help` as the third top-level; the dropdown has a
+  single `About` item with action `help`.
+* End-to-end menu walk: F9 → Right → Right → Enter lands on
+  `HelpScreen`. Same with the `a` letter accelerator.
+
+Updated `tests/test_menu.py`:
+* `test_menus_definition_has_expected_items` — added the
+  `["File", "Commands", "Help"]` assertion plus the About item
+  check.
+* `test_left_rotates_wraps` — the comment said "wraps to Commands"
+  but now wraps to Help (the new last menu). Asserts
+  `len(MENUS) - 1` rather than the literal `1` so a future fourth
+  menu won't break this test.
+* `test_menu_bar_renders_both_menus` — added the `Help` substring
+  check to the rendered output.
+
+Updated `tests/test_status_keybar.py`:
+* All six `test_keybar_wired_set_includes_f*` tests had a trailing
+  `assert 1 not in _WIRED` that documented "F1 (Help) remains
+  unbound". Flipped to `assert 1 in _WIRED` with a date-stamped
+  comment. The history is preserved in the surrounding context.
+
+### Mount fights (again)
+
+Mount truncation hit twice this session:
+
+1. **test_menu.py** — after the `test_left_rotates_wraps` Edit, the
+   final test (`test_untag_all_from_commands_menu`) got cut mid-line
+   at `awa` (truncated `await pilot.press("right")`). File-tool Read
+   showed all 267 lines intact; bash + Python both saw a 257-line
+   file ending mid-statement. Recovery per the protocol: full file
+   rebuild in `/tmp/wtree-stage/` via heredoc, `ast.parse` check,
+   `cp` to `.tmp`, `mv -f` atomic. Resulting file was 9875 bytes,
+   parsed clean both sides.
+
+2. **design.md** — the F1 Decision-log entry was a single ~1KB row.
+   Edit reported success; file-tool Read showed it intact; bash
+   `tail -c 200` showed it truncated mid-word at "Con" (cut off
+   "Content is About info..."). Lost ~252 bytes of the row plus the
+   "## Open questions" closing section. Recovery via Python:
+   truncate the mount file to the last verified-intact byte (the
+   end of the previous decision row), then append the full new
+   row + closing section via UTF-8 write, atomic `mv -f`. Final
+   size 25460 bytes, last line is the v0-complete summary.
+
+Lessons consistent with what's in [[feedback-wtree-mount-rules]]:
+mount and file-tool views disagreeing remains a regular failure
+mode for any non-trivial Edit, even on plain markdown. The two
+existing protocols (`ast.parse` for `.py`, bash `tail` + `wc -c`
+for prose) both caught these. Continue using them.
+
+### Tests at end of session
+
+**331/331 green.** Was 318/318 at v0 + tagging polish complete; 13 new
+tests landed for the F1 Help work. Split run across three pytest
+invocations (the full-suite run exceeds the bash 45s timeout — same
+as the previous session):
+
+* `test_app.py … test_packaging.py` chunk → 102 passed
+* `test_ops_* … test_search.py test_status_keybar.py` chunk → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` chunk → 49 passed
+
+### State at end of session
+
+- F-key cheat-sheet is fully truthful now — every F-key on the bar
+  is wired to a real action. v0 keymap is complete.
+- Help menu's About is the third top-level menu; F9 + `h` + `a`
+  reaches it the long way around, F1 reaches it directly, `?` also
+  reaches it.
+
+### Recommended next pickup
+
+The natural follow-ups from `todo.md`:
+
+- **Tree-pane tagged-node visual style.** Contents-pane rows go
+  bold-yellow when tagged; tree-pane nodes still render plain.
+  Custom `render_label` override on `TreePane` would close the
+  visual-consistency gap.
+- **Tree-pane auto-refresh after ops.** Cleanest design needs the
+  planners to emit a "touched paths" set on `OperationResult` so
+  the refresh hook knows which `_loaded` memo entries to invalidate.
+- **`Ctrl+F` find-across-tree.** Reuses the substring matcher and
+  message bus from `/` search; the existing `_walk_subtree` is
+  structurally adjacent and could share machinery.
+- **Smart cursor placement in the rename modal.** Pre-select
+  basename-without-extension so typing replaces the stem and the
+  extension survives. Small UX win.
+
+
+## 2026-05-23 (later) — Tree-pane tagged-node visual style (matches contents pane)
+
+Picked the next item from `todo.md` after F1 Help landed: tree-pane
+tagged nodes were still rendering plain while the contents pane went
+bold-yellow on tagged rows (2026-05-22 polish pass). Closing that
+gap is the "visual story is consistent across panes" follow-up
+listed under Tagged-set-era follow-ups.
+
+### Design call
+
+Two implementation paths considered:
+
+1. **Override `Tree.render_label`** — Textual's documented hook for
+   per-node styling. Consults the tagged set on every paint and
+   stylizes the rendered Rich `Text` with bold-yellow if the node's
+   backing path is in the set.
+2. **Rebuild each node's stored label on every tag mutation.**
+   Mutates `node._label` per-node when a tag toggles, then triggers
+   a refresh.
+
+Went with (1). The decisive property: lazy-expanded subtrees. When
+the user opens a folder for the first time, `_populate` creates new
+`TreeNode`s on the fly; with `render_label`, those nodes consult the
+live tagged set on their first paint and inherit the correct style
+automatically. With (2), every mutation site would need to know about
+every possible future subtree, which is structurally impossible — the
+nodes don't exist yet at mutation time.
+
+The cost of (1) is one set-membership check per visible node per
+render. Negligible.
+
+A symmetric API to the contents pane's `refresh_tag_markers` is still
+useful for the mutation callsites that want to *force* a repaint
+after changing the tagged set. The pane gets `refresh_tag_styles()`
+which is just `self.refresh()` wrapped behind a descriptive name —
+no logic, but a single named entry point that future tagged-set work
+can hit instead of poking at Textual's refresh machinery directly.
+
+### Implementation
+
+* `wtree/widgets/tree_pane.py`:
+  - New `TaggedSet` import + module-local `_TAGGED_STYLE = "bold yellow"`
+    constant (matches the contents-pane convention; tested for drift).
+  - `__init__` takes a new `tagged_set: TaggedSet` arg, stores it on
+    `self._tagged`.
+  - New `render_label(node, base_style, style) -> Text` override: calls
+    `super().render_label`, then `text.copy().stylize(_TAGGED_STYLE)`
+    when `node.data is not None` and `_tagged.contains(sid, node.data)`.
+  - New `refresh_tag_styles()` method = `self.refresh()`. Public
+    surface for app-level mutation callsites.
+* `wtree/app.py`:
+  - `compose()` now passes `self.tagged_set` to `TreePane`.
+  - New `_refresh_tag_visuals()` helper that calls both
+    `ContentsPane.refresh_tag_markers()` and
+    `TreePane.refresh_tag_styles()`. Single source of truth for
+    "tags changed; repaint".
+  - Routed every bulk-mutation site through `_refresh_tag_visuals()`:
+    `action_untag_all` (Ctrl+U), `action_tag_all` (Ctrl+A),
+    `_tag_pattern_impl` (+ / -), `on_tree_pane_tag_requested`
+    (recursive Space), `_finalise_plan` (after-op tagged-set clear).
+  - `on_contents_pane_tags_changed` now calls
+    `TreePane.refresh_tag_styles()` so single-row toggles flowing
+    through `ContentsPane.action_toggle_tag` propagate to the tree
+    pane via the existing `TagsChanged` message bus.
+
+`ContentsPane._TAGGED_STYLE` left untouched as a module-local constant
+in its own module — the styles match by convention and a test asserts
+that they stay equal. Cross-module import would couple the two
+widgets, which we'd rather not do for a one-string contract.
+
+### Tests
+
+`tests/test_tree_tag_style.py` — 11 new tests:
+
+* Pure render: untagged renders plain, tagged renders bold-yellow,
+  root node is taggable like any other (no special-casing).
+* Integration: contents-pane Space toggle restyles the tree;
+  `Ctrl+U` clears tree styling; `Ctrl+A` styles every visible tree
+  row; recursive tree-pane Space styles the whole subtree.
+* The motivating case: tag a path BEFORE expanding its parent
+  subtree, then expand and verify the inner node renders bold-yellow
+  on its first paint. Proves `render_label` was the right call.
+* `refresh_tag_styles()` and `_refresh_tag_visuals()` smoke
+  callability checks.
+* `_TAGGED_STYLE` constant drift test against the contents-pane's
+  constant.
+
+Helper `_is_bold_yellow(text)` walks Rich `Text.spans` and looks for
+a span whose `style` includes both `bold` and `yellow` — survives
+the icon-style overlay that `Tree.render_label` adds for expand
+arrows.
+
+### Mount fights (more)
+
+Hit two truncations this session:
+
+1. **`app.py` mid-method.** After the Edits that swapped per-callsite
+   `contents.refresh_tag_markers()` for `_refresh_tag_visuals()`, bash
+   saw the file cut at byte 35326 — mid-`_on_plan_complete`, missing
+   `_update_subtitle`, `_refresh_status`, `_refresh_panes_after_op`,
+   and the `main()` entry point. File-tool Read showed all 1012 lines
+   intact. Recovery: read the authoritative tail from file-tool,
+   rebuild the file in `/tmp/wtree-stage/`, atomic `cp + sync + mv`.
+   Final size 36628 bytes, `ast.parse` OK on both sides.
+
+2. **`tests/test_tree_tag_style.py` mid-docstring.** After the
+   `Tag(...)` -> `tagged_set.add(sid, path)` Edits, bash reported
+   the file contained null bytes (cut mid-line with a NUL padding
+   tail). Recovery: heredoc rebuild + atomic mv. Final size 9880
+   bytes.
+
+Pattern is consistent: the more separate Edit calls a file accumulates
+across a session, the more likely the mount lies. Future sessions
+that need multiple Edits on the same `.py` file inside the project
+should default to "heredoc rebuild" rather than relying on the Edit
+tool's success message.
+
+### Tests at end of session
+
+**342/342 green.** Was 331 at v0 + F1 Help complete; +11 from the
+tree-pane styling work. Split run across three pytest invocations:
+
+* `test_app.py … test_packaging.py` chunk → 102 passed
+* `test_ops_* … test_status_keybar.py` chunk → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` chunk → 60 passed
+
+### State at end of session
+
+- Tagged paths now render bold-yellow in both panes. Tag a folder
+  from the tree, see the whole subtree light up — and the parent
+  row in the tree itself.
+- Lazy-expanded subtrees automatically pick up the correct style
+  on first paint thanks to the `render_label` override.
+
+### Recommended next pickup
+
+From the remaining `todo.md` items:
+
+- **Tree-pane auto-refresh after ops.** Contents pane already
+  refreshes; tree doesn't. Cleanest design needs planners to emit a
+  "touched paths" set on `OperationResult`.
+- **`Ctrl+F` find-across-tree.** Reuses the matcher + message bus
+  from `/` search; the existing `_walk_subtree` is structurally
+  adjacent and could share machinery.
+- **Tree-pane left/right arrow keys for expand/collapse.** Tripped
+  on this writing the lazy-expand test — Textual 8.x's `Tree`
+  doesn't ship `left`/`right` bindings, and ours only intercepts
+  Left on the root. A direct user-keyboard expand/collapse path
+  would round out the tree-pane keymap.
+- **Smart cursor placement in the rename modal.** Pre-select
+  basename-without-extension. Small UX win.
+
+
+## 2026-05-23 (yet later) — Tree-pane auto-refresh after ops
+
+Last item from the post-v0 Move-era follow-up was "tree-pane refresh
+after ops." The contents pane already re-shows its `current_path`
+after every plan completes; the tree pane didn't, so after a Move /
+Delete / Make-new / Rename / Copy the user had to collapse + re-expand
+the affected node to see the new state. Closing that gap.
+
+### Design call
+
+Two-stage shape: ops layer emits which directory listings changed
+(`OperationResult.touched_paths`), UI layer consumes it to invalidate
+the tree's lazy-load memo for the affected nodes.
+
+**Where to compute touched paths.** Three options:
+
+1. Inside each `_native_op` executor function — most flexible but
+   spreads the logic across five branches with subtle "what does
+   `dst_path` mean for delete?" footguns.
+2. As a property on `OperationResult`, computed from the per-item
+   results — every executor already records the `PlanItem` it
+   processed and the status, which is exactly the data needed.
+3. As a planner-side annotation on `Plan` — but planners don't know
+   what actually succeeded, so this only works if every item succeeds.
+
+Went with (2). The rule is uniform per op kind: COPY/MAKE_NEW touch
+`dirname(dst)`, DELETE touches `dirname(src)`, MOVE touches both,
+RENAME's planner guarantees `dirname(src) == dirname(dst)` so one
+parent covers it. Restricted to `SUCCESS` items so partial-failure
+cases don't claim disk state they didn't reach.
+
+**Where the tree-pane refresh logic lives.** A new method
+`TreePane.refresh_paths(paths)` that walks every tree node, finds
+the ones whose `data` is in the target set, drops them from
+`_loaded`, wipes their children, and re-populates the ones that were
+expanded. Unloaded subtrees are left alone — the lazy-load on first
+expand will pick up the up-to-date listing without any extra wiring.
+
+Cursor preservation is best-effort: after `node.remove_children()`,
+Textual decides where the cursor lands. A future polish pass could
+snapshot the previous cursor's backing path and try to restore it
+post-rebuild; parked.
+
+The tagged-row styling ([[project-wtree]] 2026-05-23 work) self-heals
+through this naturally — the rebuilt child nodes get rendered against
+the live tagged set via the `render_label` override, so a tagged dir
+that just moved keeps its bold-yellow marker without any extra
+wiring.
+
+### Implementation
+
+* `wtree/ops/base.py`:
+  - New `OperationResult.touched_paths` property. Walks `self.items`,
+    skips non-SUCCESS, emits dst parents for COPY/MAKE_NEW, src
+    parents for DELETE, both for MOVE, single src parent for RENAME.
+    Returns a `set` for de-dup when many items share the same parent
+    (typical for batch ops).
+  - Added `import os` for `os.path.dirname`.
+* `wtree/widgets/tree_pane.py`:
+  - New `refresh_paths(paths: Iterable[str])` async method. Walks
+    every tree node, matches against the targets, drops matches
+    from `_loaded`, wipes their children, re-populates the ones
+    that were expanded. Calls `self.refresh()` at the end to
+    trigger a paint.
+  - New `_walk_all_nodes(node)` helper — depth-first walk of every
+    tree node, including the root. Used by `refresh_paths`.
+  - Added `Iterable` import.
+* `wtree/app.py`:
+  - `_refresh_panes_after_op` extended: after the existing
+    contents-pane refresh, query the tree pane and call
+    `tree.refresh_paths(self.last_result.touched_paths)`. Each
+    pane's refresh is its own try/except so a failure on one
+    doesn't block the other.
+
+### Tests
+
+`tests/test_tree_refresh.py` — 13 new tests:
+
+* **`touched_paths` pure-data coverage:** one test per op kind (COPY,
+  MAKE_NEW, DELETE, MOVE, RENAME) verifying the right parent paths
+  come out for a representative plan + all-success results. Plus a
+  partial-failure case showing that failed items don't contribute
+  paths, and an empty-result case yielding an empty set.
+* **`refresh_paths` pane-level behaviour:** empty-set no-op; loaded +
+  expanded node gets re-scanned (race: add a dir after initial scan,
+  call refresh, verify both children appear); unloaded node is
+  silently skipped.
+* **End-to-end:** Make-new of a dir at the root (verifies the new
+  subdir appears in the tree without collapsing + re-expanding);
+  Delete of a subdir (verifies the row disappears); Move of a child
+  from `src` to `dst` (verifies `src` loses its child in the tree
+  while on-disk reality is correct).
+
+The Move e2e test bypasses the contents-pane cursor-navigation dance
+by tagging the source path programmatically and calling
+`app.action_move()` directly — that exercises the auto-refresh path
+without depending on letter-by-letter modal typing. Same trick
+should be reusable for any future "drive an op without UI typing"
+test.
+
+### Mount fights (more, persistent)
+
+Three truncations this session:
+
+1. **`base.py` mid-docstring** after the Edit that added
+   `touched_paths`. Bash saw 236 lines ending mid-`@property`
+   docstring; file-tool saw 295 lines intact. Rebuilt the file
+   whole via Python from a clean string, atomic `cp + sync + mv`.
+   Final 9805 bytes, parse OK on both sides.
+2. **`tree_pane.py` mid-docstring** after the Edit that added
+   `refresh_paths`. Bash saw 428 lines truncated inside
+   `focus_dir_under_cursor`'s docstring; file-tool saw 513 lines.
+   Recovered by truncating the mount file to the last intact
+   marker and appending the authoritative tail from file-tool.
+3. **`app.py` mid-method** after the Edit extending
+   `_refresh_panes_after_op`. Bash saw 999 lines (truncated at
+   `await contents.show_path(contents.current_path)`); file-tool
+   saw 1036 lines. Same recovery shape: marker truncate + tail
+   append from file-tool.
+
+The pattern is now well-documented: any Edit that grows a Python
+file by more than a few lines in this project will eventually
+truncate on the mount. The Python-based "marker truncate + tail
+append from file-tool view" recipe used today is the fastest
+recovery — beats heredoc for big files because heredoc encodes the
+whole file as a string literal in the recovery script, which itself
+gets long.
+
+### Tests at end of session
+
+**355/355 green.** Was 342 after tree-pane styling; +13 from this
+session's tree-pane auto-refresh work. Split run:
+
+* `test_app.py … test_packaging.py` → 102 passed
+* `test_ops_* … test_status_keybar.py` → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` (with new `test_tree_refresh.py`) → 73 passed
+
+### State at end of session
+
+- After any Move / Delete / Make-new / Rename / Copy the tree pane
+  reflects the new on-disk state automatically. No more collapse +
+  re-expand to see a new subdir.
+- The targeted refresh only re-scans the affected nodes; the rest
+  of the tree keeps its expansion state intact.
+
+### Recommended next pickup
+
+Remaining items from `todo.md`:
+
+- **Tree-pane left/right arrow expand/collapse bindings.** Textual
+  8.x's `Tree` doesn't ship `left`/`right` bindings; pressing right
+  on a tree node is currently a no-op. Tests had to call
+  `node.expand()` + `await _populate(node)` directly. Closing this
+  gap would round out the tree-pane keymap.
+- **`Ctrl+F` find-across-tree.** Substring matcher + message bus
+  already exists for `/`; the new `_walk_all_nodes` walker is
+  structurally adjacent.
+- **Smart cursor placement in the rename modal.** Pre-select
+  basename-without-extension. Small UX win.
+- **Cursor preservation across tree-pane refresh.** Snapshot the
+  previous cursor's backing path before `refresh_paths`, try to
+  re-land on the same path post-rebuild. v0 accepts "cursor goes
+  wherever Textual puts it" for now.
+
+
+## 2026-05-23 (still later, last today) — Tree-pane Left / Right arrow bindings
+
+Matthew called this out as the next pickup with the additional context
+that WTree is going to be his daily-driver TUI and bake into Linux
+boot images. That sharpens the priority — the tree pane's arrow keys
+not working is friction that compounds across thousands of
+keystrokes a day.
+
+### The gap
+
+Discovered earlier today while writing the lazy-expand test for
+tree-pane tagged styling: Textual 8.x's `Tree` widget ships **no**
+`left` / `right` bindings. Pressing right on a tree node was a
+no-op. Up to now, expanding a node required pressing `enter` /
+`space` (which we'd taken over for tagging), or drilling in via the
+contents-pane's `enter_dir`. Both work but neither feels like a tree
+view.
+
+### Design call
+
+Mapped the two keys to the pattern every other tree view in the wild
+uses (Finder column view, Windows Explorer tree, GTK FileChooser):
+
+* **Right on a collapsed expandable node** = expand + lazy-populate
+  inline (`await _populate(node)`).
+* **Right on an already-expanded node** = drill-in to the first
+  child. XTree-style. No-op on an empty expanded dir.
+* **Right on a non-expandable node** (error placeholder,
+  `allow_expand=False`) = no-op.
+* **Left on the root** = preserved — still posts `AscendRequested`
+  for the existing XTree "widen the logged window" gesture.
+* **Left on a non-root expanded node** = collapse in place. Cursor
+  stays put.
+* **Left on a non-root collapsed node** = jump cursor to parent
+  (Textual's `shift+left` action, rebound to plain Left).
+
+Net effect: Left twice walks the user out of a subtree (collapse,
+then up one); Right twice drills two levels deep. Symmetric, fast,
+and matches muscle memory from every other tree widget.
+
+### Implementation
+
+* `wtree/widgets/tree_pane.py` — extended `on_key`. The previous
+  version only handled left-on-root and space; the new version owns
+  all three keys with explicit per-state branches. Every branch
+  `event.stop()` + `event.prevent_default()` so a future Textual
+  version that grows a default doesn't double-fire. The docstring
+  was rewritten to enumerate the full state matrix.
+
+  The `right` branch awaits `_populate` inline — same pattern the
+  existing `focus_dir_under_cursor` uses. The follow-up `cursor_line`
+  assignment for the "descend on second right" branch goes through
+  `await asyncio.sleep(0)` first so Textual's line indexer rebuilds
+  before reading `child.line` (same idiom from `focus_child_of_root`).
+
+* Public attribute: `TreeNode.allow_expand` (verified with a quick
+  `dir()` probe, not the underscore-prefixed private form). Error
+  placeholder leaves are added via `add_leaf` which sets
+  `allow_expand=False`, so the "no-op on right" branch is a single
+  attribute check.
+
+### Tests
+
+`tests/test_tree_arrows.py` — 8 new tests:
+
+* `test_right_expands_collapsed_dir` — primary path.
+* `test_right_on_expanded_dir_descends_to_first_child` — drill-in.
+* `test_right_on_empty_expanded_dir_is_noop` — empty-children edge case.
+* `test_right_on_error_leaf_is_noop` — error placeholder safety.
+* `test_left_on_expanded_node_collapses` — primary path.
+* `test_left_on_collapsed_node_jumps_to_parent` — walk-out gesture.
+* `test_left_on_root_still_ascends` — regression for the existing
+  left-on-root gesture.
+* `test_space_still_posts_tag_request` — regression for the tagging
+  gesture.
+
+A quick interactive smoke before writing tests verified the round
+trip: expand outer, descend to inner, left back to outer, left to
+collapse outer, left to land on the root.
+
+### Mount fights
+
+Zero today on this session. The Edit on `tree_pane.py` swapped a
+docstring + 30-line `on_key` body without truncation. Possible the
+relatively small delta (Edit-grew the file by ~50 lines on top of an
+already-stable file) is what kept it under the mount's apparent
+limit; possible we got lucky. Continue to verify with `ast.parse`
+after every Edit on this project anyway.
+
+### Tests at end of session
+
+**363/363 green.** Was 355 after tree-pane auto-refresh. +8 from
+this session. Split run:
+
+* `test_app.py … test_packaging.py` → 102 passed
+* `test_ops_* … test_status_keybar.py` → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` (incl. `test_tree_arrows.py`) → 81 passed
+
+### State at end of session
+
+The tree pane is now a full XTree/Finder-class tree view. Today's
+four sessions together brought:
+
+* F1 Help / About — every F-key wired.
+* Tree-pane tagged-node bold-yellow — visual story consistent across
+  both panes.
+* Tree-pane auto-refresh after ops — both panes stay accurate
+  without user intervention.
+* Tree-pane Left / Right bindings — drill-in and walk-out without
+  reaching for the Tab key.
+
+### Recommended next pickup
+
+- **`Ctrl+F` find-across-tree.** Search substring across the whole
+  tree, not just visible nodes; reuses the `/` matcher + the
+  `_walk_all_nodes` walker that landed earlier today.
+- **Smart cursor placement in the rename modal.** Pre-select
+  basename-without-extension. Small UX win.
+- **Tree-pane cursor preservation across refresh_paths.** Snapshot
+  the previous cursor's backing path, try to restore post-rebuild.
+- **`L` log new source.** The XTree command for adding a new logged
+  drive / path - opens a prompt; tagged set spans sources already.
+  Closes another canonical keymap entry.
+
+
+## 2026-05-23 (latest, fifth session today) — Ctrl+F find-across-tree + Ctrl+G next-match
+
+Matthew chose Ctrl+F as the next pickup. Matches the design.md
+canonical keymap entry that's been parked since day one — and it
+slots cleanly on top of the `/` search infrastructure plus the
+`_walk_subtree` walker added during the recursive-tag work.
+
+### Design call
+
+Ctrl+F is *not* the same as `/`. The two complement each other:
+
+* `/`: incremental, modeless, **visible nodes only**, local to the
+  focused pane. Type and watch the cursor jump.
+* `Ctrl+F`: prompt-based, walks the **full source tree** under
+  `_root_path` regardless of expansion state, builds a cached
+  match list, jumps cursor to first match. Ctrl+G steps through
+  the cache.
+
+The two operate on different scopes for different reasons. `/` is
+"find what's on screen", Ctrl+F is "find anywhere in the logged
+tree." Mixing them — making `/` lazy-expand subtrees during typing —
+was already rejected in 2026-05-22 for cost reasons.
+
+For the v0 result UX: in-place cursor stepping rather than a
+results-list modal. Matches XTree's feel and avoids the modal-
+selection-then-jump dance. A results-modal variant is parked as a
+follow-up; the cached `_tree_find_matches` list is already the right
+shape to feed one.
+
+The Ctrl+G "no active search" branch flashes a context-aware nudge:
+if we've cached an empty result for a previous query, it tells the
+user "no matches for `<query>`"; if there's no query at all, it
+tells them to press Ctrl+F first. Better than silent no-op when the
+user's been searching elsewhere.
+
+### Implementation
+
+* `wtree/widgets/tree_pane.py` — new `reveal_path(target)` method:
+  walks the chain from `self.root` down to `target`, calling
+  `node.expand()` + `await self._populate(node)` on each segment
+  that isn't yet loaded, then drops the cursor on the final node.
+  Returns `False` if the target lies outside the root or a segment
+  is missing. Uses `os.path.relpath` + a normalised "/" split so
+  it handles POSIX and Windows separators uniformly. `os.path.normpath`
+  comparison handles the `target == root` short-circuit.
+
+* `wtree/app.py`:
+  - New state on `__init__`: `_tree_find_query: str | None`,
+    `_tree_find_matches: list[str]`, `_tree_find_idx: int`.
+  - `BINDINGS` grew two entries: `("ctrl+f", "find_tree", "Find tree")`
+    and `("ctrl+g", "next_match", "Next match")`.
+  - New `@work` `action_find_tree`: pushes a `PromptDialog`, walks
+    via `_walk_subtree(self._root_path)`, filters basename
+    substring case-insensitive (skipping the root itself), caches
+    the list, jumps to first match via `tree.reveal_path()`.
+  - New `@work` `action_next_match`: cycles through cached
+    matches with wrap; flashes context-aware nudge when cache is
+    empty.
+
+* `wtree/widgets/menu_bar.py` — Commands menu grew two items:
+  `Find tree` (accelerator `f`, shortcut `Ctrl+F`) and `Next match`
+  (accelerator `n`, shortcut `Ctrl+G`). Menu items map 1:1 to
+  keyboard shortcuts as usual.
+
+* `wtree/widgets/help.py` — keymap reference's Search section
+  updated. `Ctrl+G (in /)` line removed (it was misleading —
+  Ctrl+G is the global next-match, not a search-bar binding);
+  added `Ctrl+F` and global `Ctrl+G` lines.
+
+### Tests
+
+`tests/test_find_tree.py` — 14 new tests:
+
+* `reveal_path`: expands chain root→target; target outside root
+  returns False; missing segment returns False; target == root
+  lands cursor on root.
+* `action_find_tree`: walks the full tree (finds matches inside
+  collapsed subtrees); case-insensitive; root excluded from
+  matches; no-matches case still caches the query; empty/whitespace
+  query cancels.
+* `action_next_match`: steps + wraps through the cache; no-active-
+  search is a flash-only no-op.
+* Wiring: BINDINGS include both keys; Commands menu lists both
+  items; Help content mentions Ctrl+F + Ctrl+G.
+
+Two existing test fixes:
+* `test_menu.py::test_menus_definition_has_expected_items` —
+  Commands menu now `["Search", "Find tree", "Next match", "Untag all"]`.
+* `test_menu.py::test_untag_all_from_commands_menu` — Untag all is
+  now item 3 (was 1), so Down x3 to reach it.
+
+### Mount fights
+
+Four truncations this session, all caught by `ast.parse` and
+recovered via "marker-truncate + tail-from-file-tool":
+
+1. `tree_pane.py` mid-method (after the `reveal_path` Edit).
+2. `app.py` mid-`action_menu_bar` (after the two action additions
+   plus the new `__init__` state).
+3. `help.py` mid-string-literal (after the Search section Edit).
+4. `menu_bar.py` mid-method header (after the MENUS update).
+
+The growing pattern: the more Edits a session accumulates against
+the same file, the more reliably it truncates. The Python recovery
+script is fast at this point (under 5 seconds per fix) so it
+doesn't substantially slow the session, but it's a clear signal
+that future Cowork integration on this project should prefer
+whole-file heredoc writes from the start for any meaningful change
+to a `.py` source file.
+
+Two unrelated mount events this session:
+* `tests/test_menu.py` got modified by someone else (probably a
+  linter) mid-session per the system reminder; the Edit succeeded.
+* Stale `.pyc` cache caused the menu tests to spuriously fail on
+  first re-run; cleared via `rm -rf /tmp/pyc_wtree`. The
+  `PYTHONPYCACHEPREFIX=/tmp/pyc_wtree` environment variable
+  remains the right baseline for this project but the cache itself
+  needs flushing when Edit deltas touch the test files' imports.
+
+### Tests at end of session
+
+**377/377 green.** Was 363 at tree-pane Left/Right end of session;
++14 from Ctrl+F + Ctrl+G work. Split run across three pytest
+invocations:
+
+* `test_app.py … test_packaging.py` (incl. `test_find_tree.py`) → 116 passed
+* `test_ops_* … test_status_keybar.py` → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` → 81 passed
+
+### State at end of session
+
+Five completed sessions today, all landing user-facing improvements:
+
+1. F1 Help / About — every F-key wired.
+2. Tree-pane tagged-node bold-yellow — visual story consistent.
+3. Tree-pane auto-refresh after ops — both panes self-heal.
+4. Tree-pane Left/Right — drill-in / walk-out without Tab.
+5. Ctrl+F find-across-tree + Ctrl+G next-match — search across the
+   full logged tree, not just visible rows.
+
+WTree is materially closer to "useable as a daily driver." The
+remaining keymap gaps are `G` (goto path), `H` (toggle hidden),
+`O` (sort menu), `Ctrl+I` (properties), `Ctrl+R` (refresh source),
+`L` (log new source), `!` (shell prompt), and the `--pick` flag.
+
+### Recommended next pickup
+
+- **`L` log new source.** Lets the user add another logged drive /
+  path. The tagged set already spans sources; this just lets the
+  user *navigate* into one.
+- **`Ctrl+R` refresh source.** Forces a re-scan of the current
+  view. Cheap follow-up.
+- **Smart cursor placement in the rename modal.** Pre-select
+  basename-without-extension. Small UX win.
+- **Find-tree results-list modal.** Variant on Ctrl+F: instead of
+  stepping in-place, show a list of all matches with arrow selection
+  + Enter to jump. The cached `_tree_find_matches` is already the
+  right shape.
+
+
+## 2026-05-23 (sixth session today) — `L` log new source
+
+Per the canonical keymap entry. XTree's "L" was "log a new drive" —
+WTree generalises to "log a new path", and the architecture has
+been ready for this since the tagged-set decision (tags are
+absolute paths, source-agnostic).
+
+### Design call
+
+Single-source re-root rather than side-by-side multi-root tree. For
+v0 that's the right scope — adding `L` as a sibling-tree mode
+would mean a layout change (split panes, source switcher in the
+chrome) that lives in a separate, larger design pass.
+
+Path resolution: ``~`` expanded, absolute paths used as-is,
+**relative paths resolve against the current root, not cwd**. The
+XTree intuition is "I'm in a place, switch to a related place" —
+``../sibling`` walks sideways from the current logged context;
+``./child`` drills in. This is the smallest implementation that
+makes the keystroke feel useful for the workflows the user
+already has.
+
+Per the 2026-05-22 design conversation: **blank Enter on the
+prompt = ascend**. The existing Left-on-root tree gesture and the
+blank-Enter L branch both express "widen the logged window", so I
+factored the shared logic into ``WTreeApp._do_ascend()`` and made
+``on_tree_pane_ascend_requested`` delegate to it. Both gestures
+now stay locked at one source of truth — and the blank-Enter path
+discovered an ascend for users who reached for L without first
+thinking of Left.
+
+### Implementation
+
+* ``wtree/app.py``:
+  - New BINDING: ``("l", "log_new_source", "Log new source")``.
+  - New ``@work`` ``action_log_new_source``: pushes a
+    ``PromptDialog`` with the current root in the title and a
+    placeholder explaining absolute / relative semantics. Empty
+    submission routes to ``_do_ascend``. Otherwise resolves the
+    typed path (``expanduser`` + ``isabs`` check, ``normpath`` +
+    ``join`` for relatives, ``abspath`` final), validates
+    ``exists`` + ``isdir``, then ``re_root``s the tree. Flashes
+    a status nudge per branch.
+  - Factored ``_do_ascend()`` helper from
+    ``on_tree_pane_ascend_requested``. Identical behaviour, now
+    callable from both surfaces.
+
+* ``wtree/widgets/menu_bar.py`` — Commands menu grew a "Log new
+  source" item (accelerator ``l``, shortcut ``L``, action
+  ``log_new_source``). Between Next match and Untag all.
+
+* ``wtree/widgets/help.py`` — Navigation section grew an ``L``
+  line: "Log new source (prompt for path; re-roots)".
+
+### Tests
+
+``tests/test_log_new_source.py`` — 16 new tests:
+
+* Prompt opens; Esc cancels cleanly.
+* Absolute path re-roots.
+* Relative ``../sibling`` resolves against the current root.
+* ``./child`` resolves to a child of the root.
+* ``..`` alone resolves to the parent.
+* ``~`` expansion via a monkey-patched ``$HOME``.
+* Blank Enter ascends.
+* Whitespace-only treated as blank.
+* Nonexistent path errors without re-rooting.
+* File-not-directory errors without re-rooting.
+* Tagged set survives a re-root (absolute paths persist).
+* Wiring: BINDINGS, Commands menu entry, Help screen mention.
+* Regression: Left-on-root tree gesture still ascends after the
+  ``_do_ascend`` extraction.
+
+Existing ``test_menu.py`` tests updated for the new Commands-menu
+shape:
+* ``test_menus_definition_has_expected_items`` — Commands list is
+  now ``["Search", "Find tree", "Next match", "Log new source",
+  "Untag all"]``.
+* ``test_untag_all_from_commands_menu`` — Untag all is now item 4
+  (Down x4 from Search).
+
+### Mount fights
+
+Three Edit-truncations this session — by now the well-worn pattern:
+
+1. ``wtree/app.py`` mid-method after the ``action_log_new_source``
+   insertion. Recovered with marker-truncate + tail-from-file-tool.
+2. ``wtree/widgets/menu_bar.py`` mid-method header.
+3. ``wtree/widgets/help.py`` mid-string-literal.
+
+All caught by ``ast.parse`` and recovered in under five seconds
+each. The pattern is so reliable now that the recipe should be
+templated for any future session: "if you're going to Edit a
+``.py`` source in this project at all, expect to have to rebuild
+the tail at least once."
+
+### Tests at end of session
+
+**393/393 green.** Was 377 after Ctrl+F; +16 from this session.
+Split run:
+
+* `test_app.py … test_packaging.py` (incl. `test_log_new_source.py`) → 132 passed
+* `test_ops_* … test_status_keybar.py` → 180 passed
+* `test_tag_bulk_e2e.py … test_viewer.py` → 81 passed
+
+### State at end of session
+
+The XTree-canonical navigation primitives are nearly complete: Tab,
+arrows, Enter, Backspace, Space, Tag operations, file operations,
+`/`, Ctrl+F, Ctrl+G, F-keys, F9 menu, F1 Help, and now L. Six
+shipped features today across six sessions, all daily-driver
+ergonomic improvements.
+
+### Recommended next pickup
+
+Remaining canonical-keymap entries (in approximate order of
+day-to-day usefulness):
+
+- **`Ctrl+R` refresh source.** Forces a re-scan of the current view
+  without changing the root. Cheap follow-up — reuses the existing
+  ``refresh_paths`` machinery; just hits all visible nodes.
+- **`G` goto specific path.** Like ``L`` but instead of re-rooting,
+  it walks the cursor (and contents pane) to the target. Reuses
+  ``reveal_path`` from the Ctrl+F work.
+- **`Ctrl+I` properties dialog.** Read-only modal showing size, kind,
+  mtime, perms, owner, and (when tagged set non-empty) the result
+  summary.
+- **`H` toggle hidden.** Filter dot-files in / out of both panes.
+- **`O` sort menu.** Modal listing sort keys (name, size, mtime,
+  kind, ext). Default is current name + kind sort.
+- **Smart cursor placement in rename modal.** Pre-select
+  basename-without-extension.
+
+
+## 2026-05-23 (seventh + final session today) — `Ctrl+R` refresh source
+
+Last canonical-keymap entry before Matthew wraps for the day. Pure
+follow-up on the auto-refresh infrastructure that landed earlier —
+this just exposes a user-initiated full re-scan.
+
+### Design call
+
+Two-pane refresh, expansion-preserving. Contents pane re-runs
+``show_path(current_path)``; tree pane runs a new
+``TreePane.refresh_all()`` which snapshots the user's drilled-down
+state, wipes the tree, and rebuilds it with that snapshot replayed.
+
+The tricky part is preserving expansion across the rebuild. Three
+candidate strategies:
+
+1. Walk loaded nodes in place, ``remove_children`` + ``_populate``
+   each. Doesn't work cleanly because wiping a parent destroys the
+   grandchildren that were just rebuilt.
+2. Walk depth-first, but with bottom-up ordering. Fragile and
+   ordering-dependent.
+3. **Snapshot the set of expanded paths, nuke the tree via
+   ``re_root``, then walk down to re-expand each path via the
+   ``_walk_to_node`` helper.** Predictable; each walk-down is
+   independent. Picked this.
+
+To make the walks share code with Ctrl+F's ``reveal_path``, I
+factored the lazy-expand chain into ``_walk_to_node`` which
+returns the matching node without moving the cursor. ``reveal_path``
+is now just ``_walk_to_node`` + ``cursor_line = node.line``.
+``refresh_all`` calls ``_walk_to_node`` for each previously-expanded
+path, then calls ``node.expand()`` on the leaf to keep its own
+expansion state. Finally ``reveal_path`` restores the cursor.
+
+Paths that no longer exist on disk are silently skipped —
+``_walk_to_node`` returns ``None`` for missing segments and the
+loop falls through. The user gets a smaller tree without an error
+toast.
+
+Distinct from the existing post-op ``refresh_paths(touched_paths)``:
+that hits only the dirs the op changed; Ctrl+R is "I think
+everything might have drifted, redo everything I have loaded."
+
+### Implementation
+
+* ``wtree/widgets/tree_pane.py``:
+  - New ``_walk_to_node(target) -> TreeNode | None`` helper that
+    expands the chain root→target lazily without moving the cursor.
+  - ``reveal_path`` refactored to a 3-line wrapper around
+    ``_walk_to_node`` (preserves the existing public signature).
+  - New ``refresh_all()`` async method: snapshots expanded paths +
+    cursor backing path, sorts shallowest-first, ``re_root``s the
+    tree, walks the snapshot via ``_walk_to_node`` re-expanding
+    each leaf, finally ``reveal_path``s back to the cursor's old
+    path.
+
+* ``wtree/app.py``:
+  - New BINDING ``("ctrl+r", "refresh_source", "Refresh source")``.
+  - New ``@work`` ``action_refresh_source``: re-shows contents,
+    calls ``tree.refresh_all``, flashes "Source refreshed." Each
+    pane in its own try/except so one failure doesn't block the
+    other.
+
+* ``wtree/widgets/menu_bar.py`` — Commands menu grew a "Refresh
+  source" item (accelerator ``r``, shortcut ``Ctrl+R``).
+* ``wtree/widgets/help.py`` — Application section grew a Ctrl+R row.
+
+### Tests
+
+``tests/test_refresh_source.py`` — 12 new tests:
+
+* Contents pane sees a new file added on disk after Ctrl+R.
+* Contents pane drops a deleted file after Ctrl+R.
+* Tree pane sees a new subdir added on disk.
+* Tree pane drops a deleted subdir.
+* Expansion state preserved across refresh (a drilled-into dir
+  stays open).
+* Cursor position preserved when the path still exists.
+* Cursor on a deleted path falls through gracefully (refresh
+  completes without crash; cursor lands somewhere valid).
+* Wiring: BINDING, Commands menu, Help.
+* Regression: ``reveal_path`` still works after the
+  ``_walk_to_node`` refactor.
+* New: ``_walk_to_node`` returns the matching node without moving
+  the cursor (the key property that makes refresh_all work).
+
+Existing ``test_menu.py`` tests updated for the new 6-item
+Commands-menu shape.
+
+### Mount fights
+
+Four truncations this session — the standard pattern by now:
+
+1. ``tree_pane.py`` mid-method after the ``_walk_to_node`` Edit.
+2. ``app.py`` mid-method after the ``action_refresh_source`` Edit.
+3. ``menu_bar.py`` mid-method header.
+4. ``help.py`` mid-string-literal.
+
+Plus one **silent test-passing regression** caught by paranoid
+inspection: ``tests/test_menu.py`` had been mount-truncated mid-test
+during an earlier session. Pytest kept reporting "passed" because the
+truncation cut *before* the assertion — the test function silently
+ended early. Discovered only by comparing bash file size vs file-tool
+view. The lesson: **mount truncation can hide failed assertions**,
+not just cause SyntaxError. Worth adding "bash-side wc -l + ast.parse
+matches expected" as a routine check for any test file Edit going
+forward.
+
+All recovered via the marker-truncate + tail-from-file-tool recipe.
+
+### Tests at end of session
+
+**405/405 green.** Was 393 after `L`; +12 from this session. Split
+run across three pytest invocations (the full-suite run still
+exceeds the bash 45s timeout):
+
+* `test_app.py … test_move_e2e.py` → 114 passed
+* `test_native_source.py … test_ops_move.py` (incl. `test_refresh_source.py`) → 152 passed
+* `test_ops_queue.py … test_viewer.py` → 139 passed
+
+### State at end of session
+
+Seven completed sessions today. Today's body of work:
+
+1. F1 Help / About — every F-key wired.
+2. Tree-pane tagged-node bold-yellow.
+3. Tree-pane auto-refresh after ops (`touched_paths` + `refresh_paths`).
+4. Tree-pane Left/Right drill-in/out.
+5. Ctrl+F find-across-tree + Ctrl+G next-match (`_walk_subtree` reuse + `reveal_path`).
+6. `L` log new source (with blank-Enter ascend via shared `_do_ascend`).
+7. `Ctrl+R` refresh source (`refresh_all` + `_walk_to_node` factoring).
+
+WTree's canonical keymap is now substantially populated. Remaining
+unbound entries: `G` goto path, `H` toggle hidden, `O` sort menu,
+`Ctrl+I` properties, `!` shell prompt, plus `--pick` CLI flag.
+
+### Recommended next pickup
+
+The remaining ergonomic gaps in approximate order of daily-driver
+usefulness:
+
+- **`G` goto specific path.** Like `L` but moves the cursor instead
+  of re-rooting. Reuses ``reveal_path`` and the prompt machinery.
+- **`H` toggle hidden.** Filter dot-files in/out of both panes.
+  Wire on `ContentsPane` (filter the row list at scan time) +
+  `TreePane` (filter `_populate`'s directory list).
+- **Smart cursor placement in rename modal.** Pre-select
+  basename-without-extension.
+- **`Ctrl+I` properties dialog.** Read-only modal showing the
+  cursor entry's full stat output, or the tagged set's size totals.
+- **`O` sort menu.** Modal listing sort keys.

@@ -12,7 +12,7 @@ is parking-lot material.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,9 +51,36 @@ class TaggedSet:
         """Add a tag. Idempotent — adding an already-tagged pair is a no-op."""
         self._tags.add(Tag(source_id, path))
 
+    def add_many(self, pairs: Iterable[tuple[str, str]]) -> int:
+        """Add many ``(source_id, path)`` tags in one call.
+
+        Returns the **delta** — the number of tags that weren't already
+        present and so actually got added. Callers use this to flash
+        accurate counts ("Tagged 12 entries") without doing their own
+        before/after arithmetic. Pairs already in the set are silent
+        no-ops, mirroring single-add idempotency.
+        """
+        before = len(self._tags)
+        for source_id, path in pairs:
+            self._tags.add(Tag(source_id, path))
+        return len(self._tags) - before
+
     def remove(self, source_id: str, path: str) -> None:
         """Remove a tag. Silent when the pair is not tagged."""
         self._tags.discard(Tag(source_id, path))
+
+    def remove_many(self, pairs: Iterable[tuple[str, str]]) -> int:
+        """Remove many ``(source_id, path)`` tags in one call.
+
+        Returns the **delta** — the number of tags that were present and
+        so actually got removed. Pairs not in the set are silent no-ops,
+        mirroring single-remove. Used by ``-`` glob untag and the
+        recursive untag path from the tree pane.
+        """
+        before = len(self._tags)
+        for source_id, path in pairs:
+            self._tags.discard(Tag(source_id, path))
+        return before - len(self._tags)
 
     def toggle(self, source_id: str, path: str) -> bool:
         """Flip the tagged state. Returns the **new** state — ``True`` if

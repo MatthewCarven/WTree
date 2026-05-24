@@ -166,7 +166,8 @@ async def test_keybar_wired_set_includes_f6(tmp_path: Path) -> None:
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written: F1 (Help)
     # and F9 (Menu). F7 (New) is also wired now - see the F7 test below.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 
 async def test_keybar_wired_set_includes_f8(tmp_path: Path) -> None:
@@ -177,7 +178,8 @@ async def test_keybar_wired_set_includes_f8(tmp_path: Path) -> None:
     assert 8 in _WIRED   # Delete (newly landed)
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written: F1, F9.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 
 async def test_keybar_wired_set_includes_f2(tmp_path: Path) -> None:
@@ -189,7 +191,8 @@ async def test_keybar_wired_set_includes_f2(tmp_path: Path) -> None:
     assert 8 in _WIRED   # Delete
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 
 async def test_keybar_wired_set_includes_f3(tmp_path: Path) -> None:
@@ -202,7 +205,8 @@ async def test_keybar_wired_set_includes_f3(tmp_path: Path) -> None:
     assert 8 in _WIRED   # Delete
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time this test was written.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 
 async def test_keybar_wired_set_includes_f4(tmp_path: Path) -> None:
@@ -218,7 +222,8 @@ async def test_keybar_wired_set_includes_f4(tmp_path: Path) -> None:
     # F-keys still un-bound at the time Edit landed: F1 (Help), F9 (Menu).
     # F7 was un-bound when Edit landed; it joined the set later - see
     # the F7 test below.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 
 async def test_keybar_wired_set_includes_f7(tmp_path: Path) -> None:
@@ -234,7 +239,8 @@ async def test_keybar_wired_set_includes_f7(tmp_path: Path) -> None:
     assert 10 in _WIRED  # Quit
     # F-keys still un-bound at the time Make-new landed: F1 (Help),
     # F9 (Menu).
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED
 
 async def test_keybar_wired_set_includes_f9(tmp_path: Path) -> None:
     """After binding F9 menu, F9 joins the wired set."""
@@ -249,4 +255,5 @@ async def test_keybar_wired_set_includes_f9(tmp_path: Path) -> None:
     assert 9 in _WIRED   # Menu (newly landed)
     assert 10 in _WIRED  # Quit
     # F1 (Help) remains the only un-bound F-key at v0 completion.
-    assert 1 not in _WIRED
+    # F1 (Help) was wired 2026-05-23; the full F-row is now bound.
+    assert 1 in _WIRED

@@ -5,8 +5,9 @@ Per ``design.md`` § Layout: the panes are coupled. When the tree's cursor
 moves, ``WTreeApp`` calls :meth:`show_path` to refresh this pane. Unlike
 ``TreePane`` (directories only), this pane shows entries of every ``Kind``.
 
-Tagged entries display a ``*`` in the leading ``T`` column. Space and ``T``
-toggle the tag on the row under the cursor; the state lives in the
+Tagged entries display a ``*`` in the leading ``T`` column **and** the
+whole row renders in bold yellow (2026-05-22, Matthew's pick). Space and
+``T`` toggle the tag on the row under the cursor; the state lives in the
 :class:`~wtree.tagged_set.TaggedSet` owned by ``WTreeApp`` so it persists
 across pane refreshes. Error rows are non-taggable.
 
@@ -34,6 +35,7 @@ import os
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual.coordinate import Coordinate
 from textual.message import Message
 from textual.widgets import DataTable
@@ -59,14 +61,35 @@ _KIND_SORT_ORDER: dict[Kind, int] = {
 # refresh_tag_markers, so we only have to remember one number.
 _TAG_COL = 0
 
+# Rich style applied to every cell of a tagged row. Bold yellow is the
+# WTree convention (Matthew, 2026-05-22) — visually unmistakable without
+# clashing with the DataTable cursor highlight, which Textual paints over
+# the top via its own row styling.
+_TAGGED_STYLE = "bold yellow"
+
+
+def _cell(value: str, tagged: bool) -> Text | str:
+    """Render one raw cell value as plain str or styled Rich ``Text``.
+
+    Untagged rows stay as plain strings — this keeps the cell's ``str`` /
+    equality semantics simple for everything that doesn't care about
+    style. Tagged cells become ``Text(value, style=_TAGGED_STYLE)``;
+    tests that need to read the underlying string should use
+    ``str(cell)`` or ``cell.plain``.
+    """
+    if tagged:
+        return Text(value, style=_TAGGED_STYLE)
+    return value
+
 
 class ContentsPane(DataTable):
     """A table of one directory's entries with per-row tagging.
 
     Public API:
       - :meth:`show_path` — repopulate from a new directory.
-      - :meth:`refresh_tag_markers` — refresh markers without re-scanning
-        (used by ``Ctrl+U`` and similar bulk mutations).
+      - :meth:`refresh_tag_markers` — refresh markers + row styling
+        without re-scanning (used by ``Ctrl+U``, ``Ctrl+A``, and other
+        bulk mutations).
       - :attr:`current_path` — read-only, the path currently displayed.
     """
 
@@ -113,6 +136,11 @@ class ContentsPane(DataTable):
         # directory row from a file row without re-scanning the source.
         # ``None`` for error rows (they have neither a path nor a kind).
         self._row_kinds: list[Kind | None] = []
+        # Raw (un-styled) cell strings per row, parallel to ``_row_paths``.
+        # Lets ``refresh_tag_markers`` restyle a row without re-scanning
+        # the source: it walks ``_row_cells[row]`` and pushes each value
+        # back through ``_cell()`` with the current tagged state.
+        self._row_cells: list[list[str]] = []
 
     def on_mount(self) -> None:
         # Order must match _TAG_COL above.
@@ -140,6 +168,15 @@ class ContentsPane(DataTable):
             return None
         return path, kind
 
+    def row_paths(self) -> list[str]:
+        """Return absolute paths for every taggable row, in display order.
+
+        Skips error rows (empty path strings). Used by ``Ctrl+A``
+        tag-all-in-current-dir and ``+`` / ``-`` glob tagging to enumerate
+        what's visible without exposing the internal list.
+        """
+        return [p for p in self._row_paths if p]
+
     async def show_path(self, path: str | None) -> None:
         """Replace the table contents with the entries at ``path``.
 
@@ -149,6 +186,7 @@ class ContentsPane(DataTable):
         self.clear()
         self._row_paths.clear()
         self._row_kinds.clear()
+        self._row_cells.clear()
         self._current_path = path
         if path is None:
             return
@@ -166,21 +204,27 @@ class ContentsPane(DataTable):
         sid = self._source.source_id
 
         for err in errors:
-            self.add_row("", f"⚠ {err.message}", "", "", "")
+            cells = ["", f"⚠ {err.message}", "", "", ""]
+            # Error rows are never tagged — render plain.
+            self.add_row(*cells)
+            self._row_cells.append(cells)
             # Empty string = "this row is not taggable" — the only sentinel
             # value used in ``_row_paths`` (real paths are never empty).
             self._row_paths.append("")
             self._row_kinds.append(None)
         for entry in entries:
             full_path = os.path.join(path, entry.name)
-            marker = "*" if self._tagged.contains(sid, full_path) else ""
+            tagged = self._tagged.contains(sid, full_path)
+            marker = "*" if tagged else ""
             size = "<DIR>" if entry.kind is Kind.DIR else str(entry.size)
             mtime = entry.mtime_iso or ""
             perms = entry.permissions or ""
             # Trailing slash on directory names is XTree-style and reads
             # cleanly without needing a separate "kind" column.
             name = f"{entry.name}/" if entry.kind is Kind.DIR else entry.name
-            self.add_row(marker, name, size, mtime, perms)
+            cells = [marker, name, size, mtime, perms]
+            self.add_row(*(_cell(v, tagged) for v in cells))
+            self._row_cells.append(cells)
             self._row_paths.append(full_path)
             self._row_kinds.append(entry.kind)
 
@@ -191,24 +235,39 @@ class ContentsPane(DataTable):
             self.move_cursor(row=0, column=0)
 
     def refresh_tag_markers(self) -> None:
-        """Refresh just the leading "T" column from the tagged set.
+        """Refresh the leading "T" column **and** the row's style from
+        the tagged set.
 
-        Cheaper than ``show_path``: doesn't re-scan from the source. Use
-        after a bulk tagged-set mutation (e.g., ``Ctrl+U`` clear) where the
-        underlying entries haven't changed.
+        Cheaper than ``show_path``: doesn't re-scan from the source.
+        Walks the stored raw cell values in ``_row_cells`` and pushes
+        each through ``_cell()`` so a tagged row gets bold-yellow style
+        on every column, untagged stays plain. Use after any bulk
+        tagged-set mutation (``Ctrl+U`` clear, ``Ctrl+A`` tag-all, ``+``
+        / ``-`` glob, recursive tree-pane Space) where the underlying
+        entries haven't changed.
         """
         sid = self._source.source_id
         for row, full_path in enumerate(self._row_paths):
             if not full_path:
                 continue
-            marker = "*" if self._tagged.contains(sid, full_path) else ""
-            self.update_cell_at(Coordinate(row, _TAG_COL), marker)
+            tagged = self._tagged.contains(sid, full_path)
+            cells = self._row_cells[row]
+            # Marker tracks tagged state directly; the raw value lives in
+            # cells[0] so subsequent refreshes don't compound stale "*"s.
+            cells[0] = "*" if tagged else ""
+            for col, value in enumerate(cells):
+                self.update_cell_at(
+                    Coordinate(row, col), _cell(value, tagged)
+                )
 
     def action_toggle_tag(self) -> None:
         """Toggle the tagged state of the entry under the cursor.
 
         Posts :class:`TagsChanged` so the app can update its subtitle. A
         no-op when the cursor is on an error row or the table is empty.
+        Restyles every cell of the row, not just the marker column, so
+        the bold-yellow tagged-row style appears or disappears in one
+        gesture.
         """
         row = self.cursor_row
         if row < 0 or row >= len(self._row_paths):
@@ -218,8 +277,12 @@ class ContentsPane(DataTable):
             return  # Error row — non-taggable by design.
         sid = self._source.source_id
         is_tagged = self._tagged.toggle(sid, full_path)
-        marker = "*" if is_tagged else ""
-        self.update_cell_at(Coordinate(row, _TAG_COL), marker)
+        cells = self._row_cells[row]
+        cells[0] = "*" if is_tagged else ""
+        for col, value in enumerate(cells):
+            self.update_cell_at(
+                Coordinate(row, col), _cell(value, is_tagged)
+            )
         self.post_message(self.TagsChanged())
 
     # ------------------------------------------------------------------

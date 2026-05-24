@@ -73,6 +73,11 @@ class Menu:
 # Per the 2026-05-22 design call: show only implemented items.
 # Unimplemented operations (Toggle hidden, Sort, Find-across-tree,
 # Properties, etc.) are deliberately absent until they land.
+#
+# Help menu added 2026-05-23 alongside the F1 binding. v0 ships one
+# combined "About" entry that opens :class:`HelpScreen` (which serves
+# both the version/attribution and the keymap reference); a separate
+# "Keymap" item can layer on top later without changing the screen.
 MENUS: tuple[Menu, ...] = (
     Menu(
         name="File",
@@ -94,7 +99,18 @@ MENUS: tuple[Menu, ...] = (
         accelerator="c",
         items=(
             MenuItem("Search", "s", "/", "search"),
+            MenuItem("Find tree", "f", "Ctrl+F", "find_tree"),
+            MenuItem("Next match", "n", "Ctrl+G", "next_match"),
+            MenuItem("Log new source", "l", "L", "log_new_source"),
+            MenuItem("Refresh source", "r", "Ctrl+R", "refresh_source"),
             MenuItem("Untag all", "u", "Ctrl+U", "untag_all"),
+        ),
+    ),
+    Menu(
+        name="Help",
+        accelerator="h",
+        items=(
+            MenuItem("About", "a", "F1", "help"),
         ),
     ),
 )

@@ -83,3 +83,63 @@ def test_iteration_yields_tag_dataclasses() -> None:
     assert isinstance(items[0], Tag)
     assert items[0].source_id == "native"
     assert items[0].path == "/foo"
+
+
+# ---------------------------------------------------------------------------
+# Bulk API — add_many / remove_many — added 2026-05-22 for the tagging polish
+# pass. Used by Ctrl+A, +/- glob, and the recursive tree-pane Space toggle.
+# ---------------------------------------------------------------------------
+
+
+def test_add_many_returns_delta_count() -> None:
+    """The delta is the number of *new* tags, not the iterable length."""
+    ts = TaggedSet()
+    ts.add("native", "/already")
+    delta = ts.add_many(
+        [("native", "/already"), ("native", "/new1"), ("native", "/new2")]
+    )
+    assert delta == 2
+    assert len(ts) == 3
+
+
+def test_add_many_on_empty_iterable_is_zero() -> None:
+    ts = TaggedSet()
+    assert ts.add_many([]) == 0
+    assert len(ts) == 0
+
+
+def test_add_many_is_idempotent_on_duplicate_pairs_in_input() -> None:
+    """A pair appearing twice in the input adds once."""
+    ts = TaggedSet()
+    delta = ts.add_many([("native", "/foo"), ("native", "/foo")])
+    assert delta == 1
+    assert len(ts) == 1
+
+
+def test_remove_many_returns_delta_count() -> None:
+    ts = TaggedSet()
+    ts.add("native", "/a")
+    ts.add("native", "/b")
+    ts.add("native", "/c")
+    delta = ts.remove_many(
+        [("native", "/a"), ("native", "/missing"), ("native", "/c")]
+    )
+    assert delta == 2
+    assert len(ts) == 1
+    assert ts.contains("native", "/b")
+
+
+def test_remove_many_on_empty_set_is_zero() -> None:
+    ts = TaggedSet()
+    assert ts.remove_many([("native", "/never-was")]) == 0
+
+
+def test_add_many_and_remove_many_round_trip() -> None:
+    """add_many then remove_many on the same pairs returns to empty."""
+    pairs = [("native", "/x"), ("native", "/y"), ("native", "/z")]
+    ts = TaggedSet()
+    ts.add_many(pairs)
+    assert len(ts) == 3
+    delta = ts.remove_many(pairs)
+    assert delta == 3
+    assert len(ts) == 0

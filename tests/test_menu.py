@@ -29,7 +29,7 @@ from wtree.widgets.prompt import PromptDialog
 
 
 async def test_menu_bar_renders_both_menus(tmp_path: Path) -> None:
-    """The always-visible bar shows File + Commands with accelerators."""
+    """The always-visible bar shows File + Commands + Help with accelerators."""
     app = WTreeApp(root_path=str(tmp_path))
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -37,12 +37,21 @@ async def test_menu_bar_renders_both_menus(tmp_path: Path) -> None:
         rendered = str(bar.render())
         assert "File" in rendered
         assert "Commands" in rendered
+        assert "Help" in rendered
 
 
 async def test_menus_definition_has_expected_items() -> None:
-    """MENUS module-global has the v0 shape: File (8 items + separator
-    + Quit) and Commands (Search, Untag all)."""
-    assert [m.name for m in MENUS] == ["File", "Commands"]
+    """MENUS module-global: File, Commands, Help.
+
+    File: New, View, Edit, Copy, Move, Rename, Delete, separator, Quit.
+    Commands: Search, Find tree, Next match, Log new source, Refresh
+              source, Untag all.
+    Help: About.
+
+    Items grew over 2026-05-23 sessions: Help (F1), Find tree + Next
+    match (Ctrl+F), Log new source (L), Refresh source (Ctrl+R).
+    """
+    assert [m.name for m in MENUS] == ["File", "Commands", "Help"]
     file_items = [i.label for i in MENUS[0].items]
     assert "New" in file_items
     assert "Copy" in file_items
@@ -50,7 +59,16 @@ async def test_menus_definition_has_expected_items() -> None:
     # Separator is an empty-label item with separator=True.
     assert any(i.separator for i in MENUS[0].items)
     commands_items = [i.label for i in MENUS[1].items]
-    assert commands_items == ["Search", "Untag all"]
+    assert commands_items == [
+        "Search",
+        "Find tree",
+        "Next match",
+        "Log new source",
+        "Refresh source",
+        "Untag all",
+    ]
+    help_items = [i.label for i in MENUS[2].items]
+    assert help_items == ["About"]
 
 
 async def test_menu_row_renderer_active_idx_highlights() -> None:
@@ -116,7 +134,7 @@ async def test_right_rotates_to_next_menu(tmp_path: Path) -> None:
 
 
 async def test_left_rotates_wraps(tmp_path: Path) -> None:
-    """Left from File wraps to Commands."""
+    """Left from File wraps to the last menu (Help, since 2026-05-23)."""
     app = WTreeApp(root_path=str(tmp_path))
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -127,7 +145,8 @@ async def test_left_rotates_wraps(tmp_path: Path) -> None:
         assert screen.active_menu == 0
         await pilot.press("left")
         await pilot.pause()
-        assert screen.active_menu == 1  # wrapped
+        # Wraps to the last menu - Help (index 2) since 2026-05-23.
+        assert screen.active_menu == len(MENUS) - 1
 
 
 async def test_down_moves_cursor_in_dropdown(tmp_path: Path) -> None:
@@ -251,8 +270,13 @@ async def test_untag_all_from_commands_menu(tmp_path: Path) -> None:
         await pilot.pause()
         await pilot.press("right")  # Commands
         await pilot.pause()
-        await pilot.press("down")   # Untag all
-        await pilot.pause()
+        # Commands menu items: Search (0), Find tree (1), Next match (2),
+        # Log new source (3), Refresh source (4), Untag all (5). The
+        # cursor starts on Search; press Down five times to reach
+        # Untag all.
+        for _ in range(5):
+            await pilot.press("down")
+            await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()

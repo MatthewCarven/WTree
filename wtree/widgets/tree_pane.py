@@ -22,20 +22,51 @@ message. The app handles it by re-rooting the tree at the parent path —
 widening the "logged disk" window upward, XTree-style. Left on any
 non-root node keeps Textual's default collapse-or-cursor-to-parent
 behaviour by letting the event bubble.
+
+Tagged-node visual style (2026-05-23): tree-pane nodes whose backing
+path is in the :class:`~wtree.tagged_set.TaggedSet` render with the same
+bold-yellow style used for tagged rows in the contents pane. Implemented
+via :meth:`render_label` override — Textual's documented extension hook
+for per-node styling. The tagged-set lookup happens on every render, which
+is cheap (set membership). The alternative — rebuild each node's stored
+label on every mutation — was rejected because lazy-expanded subtrees
+would silently miss the tagged style until they were re-rebuilt. With
+``render_label`` the rule is simply "ask the tagged set when painting",
+so nodes that pop in via lazy load inherit the correct style on first
+paint.
+
+The pane re-renders on tag mutations via :meth:`refresh_tag_styles`,
+which is just ``self.refresh()`` wrapped behind a descriptive name. The
+app's bulk-mutation paths (``Ctrl+A``, ``Ctrl+U``, ``+`` / ``-``,
+recursive tree-pane Space) call it alongside the existing
+``ContentsPane.refresh_tag_markers``. Single-row toggles flowing through
+``ContentsPane.action_toggle_tag`` reach this pane via the
+``TagsChanged`` message handler in the app.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
+from rich.style import Style
+from rich.text import Text
 from textual import events
 from textual.message import Message
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
+from wtree.tagged_set import TaggedSet
+
+
+# Rich style applied to the rendered label of a tagged tree node.
+# Matches the contents pane's ``_TAGGED_STYLE`` so a tagged path looks
+# the same in both panes. Kept module-local rather than imported from
+# ``contents_pane`` to avoid a cross-widget import — the string is the
+# entire shared contract.
+_TAGGED_STYLE = "bold yellow"
 
 
 class TreePane(Tree[str]):
@@ -62,10 +93,30 @@ class TreePane(Tree[str]):
         new one.
         """
 
+    class TagRequested(Message):
+        """Posted when Space is pressed on a tree node with a backing path.
+
+        Carries the absolute path of the node under the cursor. The
+        app's handler kicks off a recursive walk of the subtree and
+        toggles the whole subtree's tagged state based on whether the
+        node itself is currently tagged (Matthew's pick 2026-05-22):
+        if the dir entry is already tagged -> recursive untag, else
+        recursive tag.
+
+        Error-placeholder nodes (``data is None``) don't post this
+        message — they're non-taggable for the same reason error rows
+        are non-taggable in the contents pane.
+        """
+
+        def __init__(self, path: str) -> None:
+            super().__init__()
+            self.path = path
+
     def __init__(
         self,
         source: EntrySource,
         root_path: str,
+        tagged_set: TaggedSet,
         *,
         id: str | None = None,  # noqa: A002 — Textual API uses ``id``
     ) -> None:
@@ -74,6 +125,11 @@ class TreePane(Tree[str]):
         # absolute path so the user can see where they are at a glance.
         super().__init__(label=root_path, data=root_path, id=id)
         self._source = source
+        # The pane borrows a reference to the tagged set; ownership lives
+        # on ``WTreeApp`` so it outlives any pane mount/unmount cycle.
+        # Used by :meth:`render_label` for the bold-yellow tagged-node
+        # visual style.
+        self._tagged = tagged_set
         # Node IDs we've already scanned. Cheap idempotency for re-expand /
         # re-collapse cycles.
         self._loaded: set[int] = set()
@@ -89,20 +145,85 @@ class TreePane(Tree[str]):
         self.root.expand()
 
     async def on_key(self, event: events.Key) -> None:
-        """Intercept Left-on-root only; let every other key fall through.
+        """Own the four navigation keys on the tree pane: Left, Right, Space.
 
-        Textual's ``Tree`` default Left handler does the right thing on
-        deeper nodes (collapse if expanded, else cursor-to-parent). The
-        root node has no parent and is meaningless to collapse — the
-        Left keystroke is a free affordance to overload for "log the
-        directory above". We consume the event only in that specific
-        case so the default Left behaviour on every other row remains
-        unchanged.
+        The design's pane-modal arrow semantics give the tree explicit
+        expand/collapse and drill-in behaviour rather than relying on
+        Textual's ``Tree`` defaults (which in 8.x ship no ``left`` /
+        ``right`` bindings at all). Mapping:
+
+        * **Left on the root** posts :class:`AscendRequested` so the app
+          re-roots at the parent dir — XTree "widen the logged window".
+        * **Left on a non-root expanded node** collapses it. Same gesture
+          twice in a row from a leaf row therefore "walks the user out"
+          of the current subtree: first press collapses the parent,
+          second press jumps to the grandparent.
+        * **Left on a non-root collapsed node** moves the cursor to the
+          parent. Equivalent to Textual's ``shift+left`` (cursor_parent),
+          but rebound here so plain Left does what most file managers
+          do.
+        * **Right on a collapsed expandable node** expands it. Because
+          ``_populate`` is awaited inline, the children land before the
+          next paint — the user sees the subtree appear immediately
+          rather than after a perceptible flicker.
+        * **Right on an already-expanded node** descends to the first
+          child (XTree drill-in). On an empty expanded dir this is a
+          no-op.
+        * **Right on a non-expandable node** (error placeholder, leaf)
+          is a no-op — no-op intentionally rather than fall through to
+          a Textual default, since Textual 8.x has none anyway.
+        * **Space** on any node with a backing path posts
+          :class:`TagRequested` so the app can run a recursive subtree
+          toggle. Error placeholders (``data is None``) fall through.
+
+        Each branch ``event.stop()`` + ``event.prevent_default()`` so a
+        future Textual version that adds a default left/right doesn't
+        double-fire.
         """
-        if event.key == "left" and self.cursor_node is self.root:
+        node = self.cursor_node
+
+        if event.key == "left":
+            if node is self.root:
+                event.stop()
+                event.prevent_default()
+                self.post_message(self.AscendRequested())
+                return
+            if node is not None:
+                event.stop()
+                event.prevent_default()
+                if node.is_expanded:
+                    node.collapse()
+                elif node.parent is not None:
+                    self.cursor_line = node.parent.line
+                return
+
+        if event.key == "right":
+            if node is None:
+                return
             event.stop()
             event.prevent_default()
-            self.post_message(self.AscendRequested())
+            if not node.is_expanded:
+                # Only expandable nodes have ``allow_expand=True`` (set
+                # in ``_populate``); error placeholders are added as
+                # leaves and silently no-op here.
+                if node.allow_expand:
+                    node.expand()
+                    await self._populate(node)
+                return
+            # Already expanded: drill into the first child if there is
+            # one. ``asyncio.sleep(0)`` yields once so the line indexer
+            # rebuilds after any pending mutation — same trick used by
+            # ``focus_child_of_root``.
+            if node.children:
+                await asyncio.sleep(0)
+                self.cursor_line = node.children[0].line
+            return
+
+        if event.key == "space":
+            if node is not None and node.data is not None:
+                event.stop()
+                event.prevent_default()
+                self.post_message(self.TagRequested(node.data))
 
     async def on_tree_node_expanded(self, event: Tree.NodeExpanded[str]) -> None:
         # Lazy populate. ``_populate`` is itself idempotent, but checking
@@ -148,6 +269,300 @@ class TreePane(Tree[str]):
         for entry in directories:
             child_path = os.path.join(path, entry.name)
             node.add(entry.name, data=child_path, allow_expand=True)
+
+    # ------------------------------------------------------------------
+    # Tagged-node visual style (2026-05-23)
+    # ------------------------------------------------------------------
+
+    def render_label(
+        self,
+        node: TreeNode[str],
+        base_style: Style,
+        style: Style,
+    ) -> Text:
+        """Render a node's label, applying bold-yellow if its path is tagged.
+
+        Override of :meth:`textual.widgets.Tree.render_label` — Textual's
+        documented hook for per-node styling. The default implementation
+        builds ``[icon][label]`` text with the expand-arrow icon styled
+        independently of the label; we let it do that, then stylize
+        bold-yellow over the whole thing when the node's backing path is
+        in the tagged set.
+
+        Three cases:
+
+        * ``node.data is None`` — error placeholder leaf, non-taggable,
+          render plain.
+        * Path in the tagged set — stylize bold-yellow over the default
+          render (preserves icon position, just changes colour).
+        * Otherwise — return the default render unmodified.
+
+        The tagged-set lookup runs once per render per node, which is a
+        single Python set membership check. Negligible overhead even for
+        deep trees.
+        """
+        text = super().render_label(node, base_style, style)
+        if node.data is None:
+            return text
+        if self._tagged.contains(self._source.source_id, node.data):
+            # ``stylize`` overlays the given style on top of any existing
+            # styles in the text — the icon's TOGGLE_STYLE survives in
+            # principle but the bold-yellow colour wins where they
+            # overlap. Visually, the whole row reads as tagged.
+            text = text.copy()
+            text.stylize(_TAGGED_STYLE)
+        return text
+
+    def refresh_tag_styles(self) -> None:
+        """Trigger a re-render so :meth:`render_label` re-evaluates every
+        node against the current tagged-set state.
+
+        Cheap: this is just ``self.refresh()`` behind a descriptive
+        name. Called by the app after every bulk tag mutation
+        (``Ctrl+A``, ``Ctrl+U``, ``+`` / ``-``, recursive subtree
+        toggle) plus the single-row contents-pane toggle. Lazy
+        expansion of a previously-unseen subtree does not need a
+        special-case call — ``render_label`` runs against the live
+        tagged set on first paint, so newly-added nodes already
+        pick up the correct style.
+        """
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Post-op refresh: targeted lazy-load invalidation (2026-05-23)
+    # ------------------------------------------------------------------
+
+    async def refresh_paths(self, paths: Iterable[str]) -> None:
+        """Re-scan tree nodes whose backing path is in ``paths``.
+
+        Called by the app after a Plan completes
+        (:meth:`WTreeApp._refresh_panes_after_op`) with
+        ``OperationResult.touched_paths`` — the directories whose
+        listings changed. For each tree node whose ``data`` matches
+        one of those paths:
+
+        * If the node hasn't been loaded yet, skip it — when (and if)
+          the user expands it later, ``_populate`` will scan fresh.
+        * If the node *has* been loaded, drop it from ``_loaded``,
+          wipe its children, and if it was expanded re-populate it
+          so the user sees the new state immediately.
+
+        Tagged-row styling self-heals via :meth:`render_label` — the
+        replacement child nodes get rendered against the live tagged
+        set, so a tagged dir that just moved keeps its bold-yellow
+        marker without any extra wiring.
+
+        Cursor preservation is best-effort: Textual decides where the
+        cursor lands when a node's children are wiped + repopulated,
+        and for v0 we accept "cursor goes wherever Textual puts it"
+        rather than snapshotting line numbers. A future polish pass
+        could remember the previous cursor's backing path and try to
+        restore it.
+
+        ``paths`` is an iterable rather than a set so callers don't
+        need to materialise one — typically
+        ``OperationResult.touched_paths`` flows in directly.
+        """
+        targets = set(paths)
+        if not targets:
+            return
+
+        # Collect matching nodes in a single pass so the mutation below
+        # doesn't interfere with iteration. ``self.root`` itself is
+        # checked too — make-new at the displayed root, for instance,
+        # touches the root's listing.
+        matches: list[TreeNode[str]] = []
+        for node in self._walk_all_nodes(self.root):
+            if node.data is not None and node.data in targets:
+                matches.append(node)
+
+        for node in matches:
+            # If the node was never expanded / scanned, ``_loaded``
+            # doesn't track it and there are no children to wipe.
+            # Leave it alone — the lazy-load on first expand will see
+            # the up-to-date listing.
+            if node.id not in self._loaded:
+                continue
+            was_expanded = node.is_expanded
+            node.remove_children()
+            self._loaded.discard(node.id)
+            if was_expanded:
+                # Re-populate inline so the new children land before
+                # the next paint. ``_populate`` re-adds the node to
+                # ``_loaded`` and seeds the children.
+                await self._populate(node)
+
+        # Trigger a re-render so the new tag styling, if any, takes
+        # effect against the rebuilt subtree.
+        self.refresh()
+
+    def _walk_all_nodes(self, node: TreeNode[str]) -> Iterator[TreeNode[str]]:
+        """Yield ``node`` then every descendant, depth-first.
+
+        Includes the root + every tree node Textual currently holds,
+        whether visible (expanded ancestors) or not. Used by
+        :meth:`refresh_paths` to find nodes whose backing path matches
+        a touched directory.
+        """
+        yield node
+        for child in node.children:
+            yield from self._walk_all_nodes(child)
+
+    # ------------------------------------------------------------------
+    # reveal_path: walk + expand the chain root -> target (2026-05-23)
+    # ------------------------------------------------------------------
+
+    async def reveal_path(self, target: str) -> bool:
+        """Expand the chain of ancestors from the root to ``target``,
+        lazy-populating each segment, then move the cursor onto the
+        matching node. Returns ``True`` on success, ``False`` if any
+        segment can't be resolved (target outside root, missing entry).
+
+        Used by Ctrl+F find-across-tree to jump to arbitrary descendants
+        whose tree nodes may not exist yet — segments that haven't been
+        scanned get populated on the way down, so the user can land on
+        a deeply nested match without manually drilling first.
+
+        ``target`` is an absolute path. It must lie under
+        ``self.root.data`` (typically the app's ``_root_path``) — if
+        not, the method returns ``False`` rather than re-rooting; the
+        caller should `re_root` first if cross-root jumps are needed.
+
+        Cursor placement uses the same ``await asyncio.sleep(0)`` yield
+        that ``focus_child_of_root`` does so Textual's line indexer
+        rebuilds before ``cursor_line`` is read.
+
+        Factored on top of :meth:`_walk_to_node` so the walk-down
+        logic is shared with the refresh-all flow.
+        """
+        node = await self._walk_to_node(target)
+        if node is None:
+            return False
+        self.cursor_line = node.line
+        return True
+
+    async def _walk_to_node(self, target: str) -> TreeNode[str] | None:
+        """Walk root → target, lazy-expanding + populating each segment.
+
+        Returns the matching :class:`TreeNode` on success, ``None`` if
+        ``target`` lies outside the root or a segment can't be
+        resolved. Does NOT move the cursor — callers do that if they
+        want; this lets :meth:`refresh_all` re-walk paths without
+        clobbering the user's cursor position.
+
+        Internal helper shared by :meth:`reveal_path` and
+        :meth:`refresh_all`. The behaviour mirrors what
+        ``reveal_path`` did before the refactor — the only change is
+        that the cursor-line assignment moved up to the caller.
+        """
+        root_path = self.root.data
+        if root_path is None or not target.startswith(root_path):
+            return None
+        if os.path.normpath(target) == os.path.normpath(root_path):
+            return self.root
+
+        relative = os.path.relpath(target, root_path)
+        parts = [p for p in relative.replace("\\", "/").split("/") if p]
+        if not parts:
+            return None
+
+        current = self.root
+        current_path = root_path
+        for part in parts:
+            if not current.is_expanded:
+                current.expand()
+            await self._populate(current)
+            await asyncio.sleep(0)
+            next_path = os.path.join(current_path, part)
+            child_found = None
+            for child in current.children:
+                if child.data == next_path:
+                    child_found = child
+                    break
+            if child_found is None:
+                return None
+            current = child_found
+            current_path = next_path
+        return current
+
+    async def refresh_all(self) -> None:
+        """Re-scan every loaded subtree against the live source state.
+
+        Used by ``Ctrl+R`` when the user thinks the on-disk state has
+        drifted from what's displayed. Unlike :meth:`refresh_paths`
+        (targeted at a known set of paths from
+        ``OperationResult.touched_paths``) this nukes the whole tree
+        and rebuilds it — then walks the snapshot of previously-
+        expanded paths to re-expand each one, preserving the user's
+        drilled-down context across the refresh.
+
+        Strategy:
+
+        1. Snapshot the set of currently-expanded paths (excluding
+           the root, which always stays expanded) and the cursor's
+           backing path.
+        2. ``re_root(current_root)`` wipes the tree and re-populates
+           one level deep.
+        3. For each previously-expanded path, walk down via
+           ``_walk_to_node`` (lazy-expanding ancestors along the way),
+           then expand that node itself.
+        4. Restore the cursor by ``reveal_path``-ing to its old
+           backing path.
+
+        Paths that no longer exist on disk are silently skipped —
+        ``_walk_to_node`` returns ``None`` for missing segments and
+        the loop falls through. The user gets a smaller tree without
+        an error toast; the "what changed" story is the on-disk
+        state, not a diff.
+
+        Sorted shallowest-first so a child's expand happens after
+        its parent's expand has populated the intermediate nodes.
+        """
+        root_path = self.root.data
+        if root_path is None:
+            return
+
+        # Snapshot expansion state.
+        expanded_paths: list[str] = []
+        for node in self._walk_all_nodes(self.root):
+            if (
+                node is not self.root
+                and node.is_expanded
+                and node.data is not None
+            ):
+                expanded_paths.append(node.data)
+        # Sort shallowest-first by path-separator count so /a is
+        # processed before /a/b.
+        expanded_paths.sort(key=lambda p: p.count(os.sep))
+
+        # Snapshot cursor's backing path.
+        cursor_node = self.cursor_node
+        cursor_path: str | None = (
+            cursor_node.data if cursor_node is not None else None
+        )
+
+        # Nuke and rebuild from the root.
+        await self.re_root(root_path)
+
+        # Re-expand each previously-expanded path. ``_walk_to_node``
+        # walks down + expands ancestors; we then expand the leaf
+        # itself.
+        for path in expanded_paths:
+            node = await self._walk_to_node(path)
+            if node is None:
+                continue
+            if not node.is_expanded and node.allow_expand:
+                node.expand()
+                await self._populate(node)
+
+        # Restore cursor. ``reveal_path`` handles "target == root" by
+        # landing on the root, and returns False silently if the
+        # cursor's old path no longer exists — in which case the
+        # cursor stays on whatever ``re_root`` put it on.
+        if cursor_path is not None and cursor_path != root_path:
+            await self.reveal_path(cursor_path)
+
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Re-root API used by Left-on-root ascend

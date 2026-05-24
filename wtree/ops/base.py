@@ -14,6 +14,7 @@ methods on it.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -223,6 +224,57 @@ class OperationResult:
         if self.failed_count:
             parts.append(f"{self.failed_count} failed")
         return " ".join(parts)
+
+    @property
+    def touched_paths(self) -> set[str]:
+        """Absolute directory paths whose listings the op changed.
+
+        Computed lazily from the per-item results, restricted to
+        ``SUCCESS`` items so partial-failure cases only report what
+        actually landed on disk. The UI layer feeds this into
+        :meth:`wtree.widgets.tree_pane.TreePane.refresh_paths` to
+        invalidate the lazy-load memo for affected subtrees so tree
+        nodes whose contents just changed get re-scanned on the next
+        paint.
+
+        Per-kind rules:
+
+        * **COPY / MAKE_NEW** - parent of ``dst_path`` (the dir that
+          gained a new entry).
+        * **DELETE** - parent of ``src_path`` (the dir that lost an
+          entry).
+        * **MOVE** - both parents (source dir loses, destination dir
+          gains).
+        * **RENAME** - parent of ``src_path``. Planner guarantees the
+          rename stays in the same parent, so ``dirname(src) ==
+          dirname(dst)`` and one parent covers both ends.
+
+        Returned as a ``set`` for de-duplication when many items share
+        the same parent (typical for batch ops). Empty for empty plans
+        or all-failed plans.
+        """
+        paths: set[str] = set()
+        kind = self.plan.kind
+        for r in self.items:
+            if r.status is not ItemStatus.SUCCESS:
+                continue
+            item = r.item
+            if kind is OperationKind.COPY or kind is OperationKind.MAKE_NEW:
+                paths.add(os.path.dirname(item.dst_path))
+            elif kind is OperationKind.DELETE:
+                paths.add(os.path.dirname(item.src_path))
+            elif kind is OperationKind.MOVE:
+                paths.add(os.path.dirname(item.src_path))
+                paths.add(os.path.dirname(item.dst_path))
+            elif kind is OperationKind.RENAME:
+                # Planner guarantees same-parent rename.
+                paths.add(os.path.dirname(item.src_path))
+        # Empty strings can sneak in for paths with no parent component
+        # (theoretically only at the filesystem root, which has no
+        # children to refresh anyway). Drop them so callers don't have
+        # to filter.
+        paths.discard("")
+        return paths
 
 
 def _human_bytes(n: int) -> str:

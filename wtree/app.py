@@ -68,6 +68,7 @@ from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag, TaggedSet
 from wtree.widgets.confirm import ConfirmDialog
 from wtree.widgets.contents_pane import ContentsPane
+from wtree.widgets.help import HelpScreen
 from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
 from wtree.widgets.menu_bar import MenuBar
@@ -114,9 +115,13 @@ class WTreeApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("f10", "quit", "Quit"),
-        ("question_mark", "noop", "Help"),
+        ("f1", "help", "Help"),
+        ("question_mark", "help", "Help"),
         ("tab", "cycle_focus", "Switch pane"),
+        ("ctrl+a", "tag_all", "Tag all in dir"),
         ("ctrl+u", "untag_all", "Untag all"),
+        ("plus", "tag_pattern", "Tag by glob"),
+        ("minus", "untag_pattern", "Untag by glob"),
         ("c", "copy", "Copy"),
         ("f5", "copy", "Copy"),
         ("m", "move", "Move"),
@@ -133,6 +138,10 @@ class WTreeApp(App):
         ("n", "make_new", "New"),
         ("f7", "make_new", "New"),
         ("slash", "search", "Search"),
+        ("ctrl+f", "find_tree", "Find tree"),
+        ("ctrl+g", "next_match", "Next match"),
+        ("l", "log_new_source", "Log new source"),
+        ("ctrl+r", "refresh_source", "Refresh source"),
         ("f9", "menu_bar", "Menu"),
     ]
 
@@ -162,11 +171,24 @@ class WTreeApp(App):
         self._search_matches: list[int] = []
         self._search_match_idx: int = 0
 
+        # Find-across-tree state (Ctrl+F + Ctrl+G). Distinct from the
+        # ``/`` incremental search: this one walks the *entire* source
+        # tree under ``_root_path`` (not just visible nodes), caches the
+        # matches, and lets Ctrl+G step through them.
+        self._tree_find_query: str | None = None
+        self._tree_find_matches: list[str] = []
+        self._tree_find_idx: int = 0
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield MenuBar()
         with Horizontal():
-            yield TreePane(self._source, self._root_path, id="tree-pane")
+            yield TreePane(
+                self._source,
+                self._root_path,
+                self.tagged_set,
+                id="tree-pane",
+            )
             yield ContentsPane(
                 self._source, self.tagged_set, id="contents-pane"
             )
@@ -207,8 +229,36 @@ class WTreeApp(App):
     def on_contents_pane_tags_changed(
         self, event: ContentsPane.TagsChanged
     ) -> None:
+        # The contents pane restyles its own row in ``action_toggle_tag``;
+        # we still need to refresh the tree pane so a tagged dir's row
+        # picks up (or drops) the bold-yellow style. Cheap full-pane
+        # re-render via ``Tree.refresh()``.
+        try:
+            self.query_one(TreePane).refresh_tag_styles()
+        except Exception:  # noqa: BLE001 - early-mount safety
+            pass
         self._update_subtitle()
         self._refresh_status()
+
+    def _refresh_tag_visuals(self) -> None:
+        """Restyle both panes after a bulk tagged-set mutation.
+
+        Single source of truth for the "tags changed; repaint" path so
+        ``Ctrl+A``, ``Ctrl+U``, ``+`` / ``-``, the recursive tree-pane
+        Space gesture, and the after-op tagged-set clear all share one
+        callsite. Each pane's refresh method is internally cheap (the
+        contents pane re-styles in place; the tree pane just calls
+        ``self.refresh()``), so the cost is dominated by Textual's
+        rendering loop, which would happen anyway.
+        """
+        try:
+            self.query_one(ContentsPane).refresh_tag_markers()
+        except Exception:  # noqa: BLE001 - early-mount safety
+            pass
+        try:
+            self.query_one(TreePane).refresh_tag_styles()
+        except Exception:  # noqa: BLE001 - early-mount safety
+            pass
 
     def action_cycle_focus(self) -> None:
         """Tab - swap focus between TreePane and ContentsPane."""
@@ -221,13 +271,180 @@ class WTreeApp(App):
         self._refresh_status()
 
     def action_untag_all(self) -> None:
-        """Ctrl+U - clear the tagged set, refresh markers in the pane."""
+        """Ctrl+U - clear the tagged set, refresh markers in both panes."""
         if not self.tagged_set:
             return
         self.tagged_set.clear()
-        self.query_one(ContentsPane).refresh_tag_markers()
+        self._refresh_tag_visuals()
         self._update_subtitle()
         self._refresh_status()
+
+    def action_tag_all(self) -> None:
+        """Ctrl+A - tag every taggable entry in the contents pane's current dir.
+
+        Scope is the contents pane (not the tree pane) because that's
+        where the "current dir" lives - ContentsPane.current_path is
+        the directory the user is looking at, regardless of which pane
+        has focus. Error rows are silently skipped (they're non-taggable
+        by design). Idempotent: pressing again when everything is
+        already tagged is a no-op with a flash explaining why.
+        """
+        contents = self.query_one(ContentsPane)
+        paths = contents.row_paths()
+        if not paths:
+            self.flash("Tag all: nothing to tag.")
+            return
+        sid = self._source.source_id
+        delta = self.tagged_set.add_many((sid, p) for p in paths)
+        self._refresh_tag_visuals()
+        self._update_subtitle()
+        self._refresh_status()
+        if delta == 0:
+            self.flash(f"Tag all: {len(paths)} entries already tagged.")
+        else:
+            self.flash(f"Tagged {delta} entries.")
+
+    @work
+    async def action_tag_pattern(self) -> None:
+        """``+`` - prompt for a glob and tag every contents-pane row matching it.
+
+        Uses ``fnmatch.fnmatch`` (Matthew's pick 2026-05-22) for platform-
+        default casing: case-sensitive on POSIX, case-insensitive on
+        Windows. Matches against entry basename (no path separators).
+        Scope is the contents pane's current dir, not recursive.
+        """
+        await self._tag_pattern_impl(add=True)
+
+    @work
+    async def action_untag_pattern(self) -> None:
+        """``-`` - prompt for a glob and untag every contents-pane row matching it."""
+        await self._tag_pattern_impl(add=False)
+
+    async def _tag_pattern_impl(self, *, add: bool) -> None:
+        from fnmatch import fnmatch
+
+        contents = self.query_one(ContentsPane)
+        paths = contents.row_paths()
+        if not paths:
+            self.flash(("Tag" if add else "Untag") + " pattern: nothing here.")
+            return
+
+        verb = "Tag" if add else "Untag"
+        typed = await self.push_screen_wait(
+            PromptDialog(
+                title=f"{verb} by glob pattern:",
+                placeholder="*.png  (basename match, platform-default case)",
+                hint="Enter to apply  -  Esc to cancel",
+            )
+        )
+        if typed is None:
+            self.flash(f"{verb} pattern: cancelled.")
+            return
+        pattern = typed.strip()
+        if not pattern:
+            self.flash(f"{verb} pattern: cancelled (empty pattern).")
+            return
+
+        sid = self._source.source_id
+        matches = [
+            (sid, p) for p in paths if fnmatch(posixpath.basename(p), pattern)
+        ]
+        if not matches:
+            self.flash(f"{verb} pattern: no matches for {pattern!r}.")
+            return
+
+        if add:
+            delta = self.tagged_set.add_many(matches)
+            msg = (
+                f"Tagged {delta} new entries matching {pattern!r}"
+                if delta
+                else f"All {len(matches)} matches already tagged."
+            )
+        else:
+            delta = self.tagged_set.remove_many(matches)
+            msg = (
+                f"Untagged {delta} entries matching {pattern!r}"
+                if delta
+                else f"No matches for {pattern!r} were tagged."
+            )
+
+        self._refresh_tag_visuals()
+        self._update_subtitle()
+        self._refresh_status()
+        self.flash(msg)
+
+    # ------------------------------------------------------------------
+    # Recursive subtree tag/untag (TreePane Space)
+    # ------------------------------------------------------------------
+
+    @work
+    async def on_tree_pane_tag_requested(
+        self, event: TreePane.TagRequested
+    ) -> None:
+        """Handle Space on a tree node — recursive toggle of the subtree.
+
+        Semantics (Matthew's pick 2026-05-22): the directory node's
+        own current tagged state is the toggle signal. If the node
+        is tagged -> recursively untag the node and every descendant.
+        If not -> recursively tag everything. Predictable from the
+        cursor and inverse-able by pressing Space again.
+
+        Symlinks are treated as leaves (not followed) to avoid cycles
+        - the symlink entry itself gets tagged but its target subtree
+        isn't walked. ScanErrors on subdirectories are silently
+        skipped per the errors-as-data principle (design.md): a
+        permission-denied branch doesn't abort the whole gesture.
+        """
+        path = event.path
+        sid = self._source.source_id
+        currently_tagged = self.tagged_set.contains(sid, path)
+
+        pairs: list[tuple[str, str]] = []
+        async for sub in self._walk_subtree(path):
+            pairs.append((sid, sub))
+
+        if currently_tagged:
+            delta = self.tagged_set.remove_many(pairs)
+            verb = "Untagged"
+        else:
+            delta = self.tagged_set.add_many(pairs)
+            verb = "Tagged"
+
+        self._refresh_tag_visuals()
+        self._update_subtitle()
+        self._refresh_status()
+        name = posixpath.basename(path.rstrip("/")) or path
+        self.flash(f"{verb} {delta} entries under {name}")
+
+    async def _walk_subtree(self, root_path: str):
+        """Yield every absolute path in the subtree rooted at ``root_path``.
+
+        Includes ``root_path`` itself as the first yielded value, then
+        every descendant reachable through ``EntrySource.scan()``.
+        Symlink entries are yielded but **not recursed into** (cycle
+        guard). ScanErrors are silently skipped per errors-as-data.
+        Iterative (stack-based) so deep trees don't blow Python's
+        recursion limit.
+        """
+        from wtree.sources.base import Entry as _Entry
+
+        yield root_path
+        stack: list[str] = [root_path]
+        while stack:
+            current = stack.pop()
+            try:
+                async for item in self._source.scan(current):
+                    if isinstance(item, _Entry):
+                        child = os.path.join(current, item.name)
+                        yield child
+                        if item.kind is Kind.DIR:
+                            stack.append(child)
+                    # ScanError items: skip silently.
+            except Exception:  # noqa: BLE001 - defensive vs source contract
+                # NativeSource / MockSource yield ScanError objects rather
+                # than raising, but a future source might raise; don't
+                # abort the gesture on one bad branch.
+                continue
 
     # ------------------------------------------------------------------
     # Flash convenience - route user-immediate feedback to StatusLine
@@ -532,7 +749,7 @@ class WTreeApp(App):
         self.op_queue.enqueue(plan)
         if self.tagged_set:
             self.tagged_set.clear()
-            self.query_one(ContentsPane).refresh_tag_markers()
+            self._refresh_tag_visuals()
 
         body_paths = [t.path for t in tags[:3]]
         body = ", ".join(body_paths)
@@ -569,6 +786,21 @@ class WTreeApp(App):
     ) -> None:
         """Re-root the tree at the parent of the current root."""
         event.stop()
+        await self._do_ascend()
+
+    async def _do_ascend(self) -> None:
+        """Re-root the tree at the parent of the current root.
+
+        Shared by the Left-on-root tree gesture
+        (:meth:`on_tree_pane_ascend_requested`) and the blank-Enter
+        branch of :meth:`action_log_new_source` — both express the
+        same "widen the logged window" intent. No-op (with flash) at
+        the filesystem root.
+
+        After re-rooting, the cursor lands on the old-root row in the
+        new tree so the user can immediately drill back in. Tags
+        survive because they're stored as absolute paths.
+        """
         old_root = self._root_path
         new_root = os.path.dirname(old_root)
         if not new_root or new_root == old_root:
@@ -580,6 +812,110 @@ class WTreeApp(App):
         await tree.re_root(new_root)
         await tree.focus_child_of_root(old_root)
         self.flash(f"Logged: {new_root} (ascended from {old_root})")
+        self._refresh_status()
+
+    @work
+    async def action_refresh_source(self) -> None:
+        """Ctrl+R - force a re-scan of both panes against the source.
+
+        Used when the user thinks the on-disk state may have drifted
+        from what's displayed (other process modified the tree, mount
+        re-sync, etc.). Equivalent to "tap to refresh" in a browser.
+
+        Two-stage:
+
+        * The contents pane re-runs ``show_path`` against its
+          current path — replacing every row with a fresh scan.
+        * The tree pane runs :meth:`TreePane.refresh_all` which
+          snapshots expanded paths + cursor, wipes the tree, and
+          re-walks the snapshot so the user's drilled-down context
+          survives the refresh.
+
+        Exceptions are swallowed per-pane so a refresh failure on
+        one pane doesn't block the other and never propagates back
+        to the action loop. Mirrors the structure of
+        :meth:`_refresh_panes_after_op`.
+        """
+        try:
+            contents = self.query_one(ContentsPane)
+            if contents.current_path is not None:
+                await contents.show_path(contents.current_path)
+        except Exception:  # noqa: BLE001 - per-pane isolation
+            pass
+        try:
+            tree = self.query_one(TreePane)
+            await tree.refresh_all()
+        except Exception:  # noqa: BLE001 - per-pane isolation
+            pass
+        self.flash("Source refreshed.")
+        self._refresh_status()
+
+    @work
+    async def action_log_new_source(self) -> None:
+        """L - log a new source (re-root the tree at a typed path).
+
+        XTree's "L" command was "log a new drive". WTree generalises:
+        the user types any absolute or relative path, and the tree
+        re-roots there. Tags survive (they're absolute paths).
+
+        Path resolution:
+
+        * ``~`` is expanded.
+        * Absolute paths are used as-is.
+        * Relative paths resolve against the current root (not cwd).
+          So ``../sibling`` walks sideways from the current logged
+          context, which matches the XTree "I'm in a place, switch
+          to a related place" intuition.
+
+        Special case: a blank submission means "ascend to my parent",
+        same as Left-on-root. Per the 2026-05-22 design conversation,
+        this layered discoverability hint lets a user who's already
+        in the prompt fall back to ascend without having to escape and
+        re-press Left.
+
+        Validation errors (missing path, not a directory) flash a
+        nudge without changing the root. Esc cancels.
+        """
+        old_root = self._root_path
+        typed = await self.push_screen_wait(
+            PromptDialog(
+                title=f"Log new source (current: {old_root}):",
+                placeholder="absolute path, or relative to current root",
+                hint="Enter to log  -  blank Enter to ascend  -  Esc to cancel",
+            )
+        )
+        if typed is None:
+            self.flash("Log: cancelled.")
+            return
+        typed = typed.strip()
+
+        # Blank submission = ascend (parent of current root).
+        if not typed:
+            await self._do_ascend()
+            return
+
+        # Resolve ~, then relative paths against the current root.
+        candidate = os.path.expanduser(typed)
+        if not os.path.isabs(candidate):
+            candidate = os.path.normpath(
+                os.path.join(self._root_path, candidate)
+            )
+        candidate = os.path.abspath(candidate)
+
+        if not os.path.exists(candidate):
+            self.flash(f"Log: path doesn't exist: {candidate}")
+            return
+        if not os.path.isdir(candidate):
+            self.flash(f"Log: not a directory: {candidate}")
+            return
+
+        # Re-root. ``re_root`` wipes the existing tree subtree and
+        # re-populates from the new root; tags survive because they're
+        # absolute paths.
+        self._root_path = candidate
+        tree = self.query_one(TreePane)
+        await tree.re_root(candidate)
+        self.flash(f"Logged: {candidate}")
         self._refresh_status()
 
     # ------------------------------------------------------------------
@@ -690,6 +1026,122 @@ class WTreeApp(App):
         self._refresh_status()
 
     # ------------------------------------------------------------------
+    # Find across tree (Ctrl+F + Ctrl+G)
+    # ------------------------------------------------------------------
+    #
+    # Distinct from the ``/`` incremental search:
+    #
+    # * ``/`` searches *visible* rows in whichever pane is focused. Local,
+    #   modeless, the matcher runs against displayed labels.
+    # * ``Ctrl+F`` searches the *entire* tree under the logged root by
+    #   walking the source recursively. The user types a query into a
+    #   ``PromptDialog``; on submit the app walks every directory, builds
+    #   a list of matches (basename substring, case-insensitive), and
+    #   jumps the tree cursor to the first match. Subsequent ``Ctrl+G``
+    #   presses step through the cached list with wrap.
+    #
+    # The cached match list lives on the app and survives until a fresh
+    # ``Ctrl+F`` replaces it. A future variant could surface a results
+    # modal listing all matches; v0 keeps it in-place to mirror the
+    # XTree "step through" feel.
+
+    @work
+    async def action_find_tree(self) -> None:
+        """Ctrl+F - find across the full logged tree (not just visible).
+
+        Walks the source under ``self._root_path`` via
+        :meth:`_walk_subtree` (the same async generator the recursive
+        tree-pane Space gesture uses), filters by basename substring
+        case-insensitive, caches the result list on the app, and jumps
+        the tree cursor onto the first match via
+        :meth:`TreePane.reveal_path`. Subsequent ``Ctrl+G`` steps
+        through the cache.
+
+        Errors mid-walk are silently skipped — the underlying
+        ``_walk_subtree`` already filters ``ScanError`` items per
+        errors-as-data. A partially-failed walk still produces a
+        partial match list, which is the v0 behaviour we want
+        (better than refusing to search at all).
+        """
+        typed = await self.push_screen_wait(
+            PromptDialog(
+                title="Find across tree:",
+                placeholder="basename substring (case-insensitive)",
+                hint="Enter to search  -  Esc to cancel",
+            )
+        )
+        if typed is None:
+            self.flash("Find: cancelled.")
+            return
+        query = typed.strip()
+        if not query:
+            self.flash("Find: cancelled (empty query).")
+            return
+
+        needle = query.lower()
+        matches: list[str] = []
+        async for path in self._walk_subtree(self._root_path):
+            if path == self._root_path:
+                continue  # Don't match the root itself.
+            basename = posixpath.basename(path.rstrip("/")) or path
+            if needle in basename.lower():
+                matches.append(path)
+
+        # Cache and announce. Always update the cached query - even
+        # for zero matches - so Ctrl+G's "no active search" flash
+        # carries the right context.
+        self._tree_find_query = query
+        self._tree_find_matches = matches
+        self._tree_find_idx = 0
+
+        if not matches:
+            self.flash(f"Find: no matches for {query!r}.")
+            return
+
+        tree = self.query_one(TreePane)
+        revealed = await tree.reveal_path(matches[0])
+        first = posixpath.basename(matches[0].rstrip("/")) or matches[0]
+        n = len(matches)
+        if revealed:
+            self.flash(f"Find: {n} match(es) for {query!r}; 1/{n} - {first}")
+        else:
+            # Match exists in the cache but the tree couldn't navigate
+            # to it (e.g. the source raised mid-reveal). The cache is
+            # still useful — Ctrl+G might land on a later one.
+            self.flash(
+                f"Find: {n} match(es) for {query!r}; "
+                f"couldn't reveal {first}, try Ctrl+G."
+            )
+
+    @work
+    async def action_next_match(self) -> None:
+        """Ctrl+G - jump to the next find-across-tree match (wrap).
+
+        Steps through the cached match list from the most recent
+        Ctrl+F. With no cached matches the action flashes a nudge
+        rather than no-op'ing silently — a user reaching for Ctrl+G
+        after a `/` commit (parked follow-up, ``_last_query``-style
+        re-run) should get a hint about what's missing.
+        """
+        if not self._tree_find_matches:
+            if self._tree_find_query is not None:
+                self.flash(
+                    f"Find: no matches for {self._tree_find_query!r}. "
+                    "Press Ctrl+F to search again."
+                )
+            else:
+                self.flash("Find: no active search (press Ctrl+F first).")
+            return
+        n = len(self._tree_find_matches)
+        self._tree_find_idx = (self._tree_find_idx + 1) % n
+        match = self._tree_find_matches[self._tree_find_idx]
+        tree = self.query_one(TreePane)
+        await tree.reveal_path(match)
+        basename = posixpath.basename(match.rstrip("/")) or match
+        cur = self._tree_find_idx + 1
+        self.flash(f"Find: {cur}/{n} - {basename}")
+
+    # ------------------------------------------------------------------
     # Menu bar (F9) - see design.md § Keymap
     # ------------------------------------------------------------------
 
@@ -725,8 +1177,17 @@ class WTreeApp(App):
         if asyncio.iscoroutine(result):
             await result
 
-    def action_noop(self) -> None:
-        """Placeholder action so the cheat sheet stays honest."""
+    def action_help(self) -> None:
+        """F1 / ``?`` / Help menu - open the About + keymap modal.
+
+        Pushes :class:`HelpScreen` (read-only; dismisses on Esc / Q).
+        Same screen serves both the F1 cheat-sheet role and the Help
+        menu's About item - the modal contains the version,
+        attribution, and a categorised keymap reference grouped by
+        Navigation / Tagging / File operations / Search / Application
+        / Selection rule.
+        """
+        self.push_screen(HelpScreen())
 
     # ------------------------------------------------------------------
     # OperationQueue callbacks
@@ -761,12 +1222,36 @@ class WTreeApp(App):
         asyncio.create_task(self._refresh_panes_after_op())
 
     async def _refresh_panes_after_op(self) -> None:
-        """Re-show the contents pane's current path so on-disk changes
-        appear without the user pressing anything."""
+        """Refresh both panes' on-disk view after a Plan completes.
+
+        Two steps:
+
+        1. Re-show the contents pane's ``current_path`` so the listing
+           the user is looking at reflects the new on-disk state. This
+           is the original behaviour from the Move-era follow-up.
+        2. Refresh the tree pane targeted at ``result.touched_paths``
+           (2026-05-23). Only the directory nodes whose listings
+           actually changed get re-scanned; the rest of the tree is
+           left alone, preserving expansion state for the unaffected
+           subtrees. Reads ``self.last_result`` (set just before this
+           coroutine is scheduled in :meth:`_on_plan_complete`).
+
+        Exceptions are swallowed per-pane so a refresh failure on one
+        pane doesn't block the other and never propagates back to the
+        queue worker. Tree-pane refresh wrapped in its own try/except
+        so a malformed touched-paths set on a future op kind can't
+        regress the long-standing contents-pane refresh contract.
+        """
         try:
             contents = self.query_one(ContentsPane)
             if contents.current_path is not None:
                 await contents.show_path(contents.current_path)
+        except Exception:  # noqa: BLE001 - don't propagate to queue worker
+            pass
+        try:
+            if self.last_result is not None:
+                tree = self.query_one(TreePane)
+                await tree.refresh_paths(self.last_result.touched_paths)
         except Exception:  # noqa: BLE001 - don't propagate to queue worker
             pass
 

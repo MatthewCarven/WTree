@@ -193,7 +193,9 @@ async def test_tag_marker_renders_in_t_column() -> None:
         await pilot.pause()
         contents = pilot.app.query_one(ContentsPane)
         marker = contents.get_cell_at(Coordinate(0, 0))
-        assert marker == "*"
+        # Tagged cells are now Rich Text (bold yellow) since 2026-05-22;
+        # str() returns the plain glyph for both plain-str and Text cells.
+        assert str(marker) == "*"
 
 
 async def test_tag_marker_persists_when_pane_refreshes() -> None:
@@ -217,7 +219,7 @@ async def test_tag_marker_persists_when_pane_refreshes() -> None:
         await contents.show_path(root)
         await pilot.pause()
         marker = contents.get_cell_at(Coordinate(0, 0))
-        assert marker == "*"
+        assert str(marker) == "*"
 
 
 async def test_ctrl_u_clears_tagged_set_and_refreshes_markers() -> None:
@@ -243,13 +245,14 @@ async def test_ctrl_u_clears_tagged_set_and_refreshes_markers() -> None:
         # finished its initial paint).
         contents.refresh_tag_markers()
         await pilot.pause()
-        assert contents.get_cell_at(Coordinate(0, 0)) == "*"
+        assert str(contents.get_cell_at(Coordinate(0, 0))) == "*"
         # Ctrl+U clears the set and the markers.
         await pilot.press("ctrl+u")
         await pilot.pause()
         assert len(app.tagged_set) == 0
-        assert contents.get_cell_at(Coordinate(0, 0)) == ""
-        assert contents.get_cell_at(Coordinate(1, 0)) == ""
+        # After untag, cells revert to plain "" — untagged style is plain str.
+        assert str(contents.get_cell_at(Coordinate(0, 0))) == ""
+        assert str(contents.get_cell_at(Coordinate(1, 0))) == ""
 
 
 async def test_subtitle_reflects_tag_count() -> None:
