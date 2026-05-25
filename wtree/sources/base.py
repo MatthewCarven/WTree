@@ -132,6 +132,31 @@ class EntrySource(ABC):
     def capability(self) -> SourceCapability:
         """Describe which optional fields this source can populate."""
 
+    @property
+    def scan_method_label(self) -> str:
+        """Short, user-readable label describing what this source
+        subcontracts the scan to.
+
+        Surfaced in the centered scan dialog (``ScanScreen``) when a
+        directory enumeration crosses the delayed-show threshold. The
+        UI renders the label verbatim - the source self-documents the
+        layer it delegates to.
+
+        Defaults to ``"scan"`` (generic) so existing third-party
+        sources don't need to opt in. v0 sources override:
+
+        * :class:`NativeSource` -> ``"os.scandir"`` (POSIX
+          ``opendir``/``readdir``, Windows
+          ``FindFirstFileW``/``FindNextFileW`` under the hood, but the
+          Python-API name is what our code actually calls)
+        * :class:`MockSource` -> ``"mock source"`` (rarely seen by
+          users - mock scans never hit the threshold in practice)
+
+        Post-v0: ``ArchiveSource`` -> ``"zipfile"``, ``SFTPSource``
+        -> ``"paramiko SFTP listdir"``, etc.
+        """
+        return "scan"
+
     @abstractmethod
     def scan(self, path: str) -> AsyncIterator[ScanResult]:
         """Yield the immediate children of ``path``.
@@ -172,6 +197,7 @@ class EntrySource(ABC):
         """
         # Default uses POSIX path semantics; sources that index Windows
         # paths or virtual-FS paths should override. Importing posixpath
+        # locally keeps the base module dependency-light.
         # locally keeps the base module dependency-light.
         import posixpath
 

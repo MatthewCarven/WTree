@@ -71,16 +71,26 @@ class PromptDialog(ModalScreen[str | None]):
         initial: str = "",
         placeholder: str = "",
         hint: str = "",
+        select_initial: tuple[int, int] | None = None,
     ) -> None:
         """``title`` is the question (e.g. "Copy 3 items to:"). ``initial``
         prefills the input. ``hint`` is a quiet line below the input —
         useful for "Esc to cancel" reminders until the status line exists.
+
+        ``select_initial`` is an optional ``(start, end)`` range within
+        ``initial`` to pre-select on open — typing then replaces the
+        selected portion (Textual's ``Input`` already replaces selected
+        text on the next printable key). The Rename action uses this to
+        select the basename stem so the user can type a replacement
+        while keeping the extension. ``None`` (the default) places the
+        cursor at end-of-text, matching every OS-level "Save As" dialog.
         """
         super().__init__()
         self._title = title
         self._initial = initial
         self._placeholder = placeholder
         self._hint = hint
+        self._select_initial = select_initial
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -95,11 +105,27 @@ class PromptDialog(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         # Focus the input the moment the dialog mounts so the user can
-        # start typing without an extra keypress. Pre-position the cursor
-        # to end-of-text — matches every OS-level "Save As" dialog.
+        # start typing without an extra keypress. Then either pre-select
+        # a range (smart cursor for Rename) or pre-position the cursor at
+        # end-of-text (every OS-level "Save As" dialog).
+        from textual.widgets._input import Selection
+
         inp = self.query_one(Input)
         inp.focus()
-        if self._initial:
+        if self._select_initial is not None and self._initial:
+            start, end = self._select_initial
+            # Clamp to the valid range; out-of-bounds asserts are
+            # never the caller's intent here.
+            length = len(self._initial)
+            start = max(0, min(start, length))
+            end = max(0, min(end, length))
+            # Setting ``selection`` is sufficient — Textual's ``Input``
+            # derives ``cursor_position`` from ``selection.end``. Setting
+            # ``cursor_position`` *after* this would call
+            # ``selection = Selection.cursor(end)`` and clobber the
+            # range we just installed.
+            inp.selection = Selection(start, end)
+        elif self._initial:
             inp.cursor_position = len(self._initial)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

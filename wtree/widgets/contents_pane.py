@@ -31,6 +31,7 @@ and relative timestamps is parking-lot material.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
@@ -42,6 +43,7 @@ from textual.widgets import DataTable
 
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.tagged_set import TaggedSet
+from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
 
 if TYPE_CHECKING:
     # Imported only for type hints — avoids a runtime circular dependency
@@ -177,29 +179,86 @@ class ContentsPane(DataTable):
         """
         return [p for p in self._row_paths if p]
 
-    async def show_path(self, path: str | None) -> None:
+    async def show_path(
+        self,
+        path: str | None,
+        *,
+        ctx: ScanContext | None = None,
+    ) -> None:
         """Replace the table contents with the entries at ``path``.
 
-        ``None`` clears the table (used when the tree cursor lands on an
-        error-leaf with no backing path).
+        ``None`` clears the table (used when the tree cursor lands on
+        an error-leaf with no backing path).
+
+        ``ctx`` is an optional :class:`ScanContext` shared with a
+        :class:`ScanScreen`. When supplied, the scan loop:
+
+        * yields control to the event loop every
+          :data:`SCAN_CHUNK_SIZE` entries via ``await
+          asyncio.sleep(0)`` so Textual gets paint frames during a
+          big scan (the dialog actually appears, Esc actually
+          responds);
+        * writes the running entry count to ``ctx.entries_seen`` so
+          the dialog can display it;
+        * polls ``ctx.cancelled`` between chunks and returns early
+          **without** touching the table if Esc was pressed.
+
+        Cancellation is **non-destructive**: the table is only
+        cleared and repopulated after the scan completes
+        successfully. A cancelled scan leaves the pane on its
+        previous listing, exactly equivalent to "user never pressed
+        the key". This is why the original ``self.clear()`` /
+        ``_row_*.clear()`` calls have moved from the prologue to the
+        commit block below.
+
+        Without ``ctx``, callers get the legacy "drain the iterator
+        in one shot" behaviour - useful for tests and any caller
+        that knows the scan is small (e.g. ``MockSource`` in
+        production code paths).
         """
-        self.clear()
-        self._row_paths.clear()
-        self._row_kinds.clear()
-        self._row_cells.clear()
-        self._current_path = path
         if path is None:
+            self.clear()
+            self._row_paths.clear()
+            self._row_kinds.clear()
+            self._row_cells.clear()
+            self._current_path = None
             return
 
         entries: list[Entry] = []
         errors: list[ScanError] = []
+        i = 0
         async for item in self._source.scan(path):
             if isinstance(item, Entry):
                 entries.append(item)
             elif isinstance(item, ScanError):
                 errors.append(item)
+            i += 1
+            if ctx is not None:
+                ctx.entries_seen = i
+                if i % SCAN_CHUNK_SIZE == 0:
+                    # Yield to the loop so Textual gets paint frames and
+                    # the cancel signal lands promptly. The check happens
+                    # AFTER the yield so any cancel that lands during the
+                    # yield is honoured before the next chunk starts.
+                    await asyncio.sleep(0)
+                    if ctx.cancelled.is_set():
+                        # Bail without touching the table - pane keeps
+                        # its previous listing.
+                        return
+
+        # Final cancel check before commit, in case Esc landed during
+        # the last partial chunk (entries < SCAN_CHUNK_SIZE).
+        if ctx is not None and ctx.cancelled.is_set():
+            return
 
         entries.sort(key=lambda e: (_KIND_SORT_ORDER[e.kind], e.name.lower()))
+
+        # Commit: only now do we wipe the previous listing.
+        self.clear()
+        self._row_paths.clear()
+        self._row_kinds.clear()
+        self._row_cells.clear()
+        self._current_path = path
 
         sid = self._source.source_id
 

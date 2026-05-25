@@ -37,8 +37,41 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
 )
-from wtree.sources.base import EntrySource, ScanError
+from wtree.sources.base import EntrySource, Kind, ScanError
 from wtree.tagged_set import Tag
+
+
+def select_range_for_rename(name: str, kind: Kind) -> tuple[int, int]:
+    """Return the ``(start, end)`` portion of ``name`` to pre-select in
+    the Rename modal so a typed character replaces the basename stem
+    while preserving the extension.
+
+    Mirrors Finder / Windows Explorer Rename behaviour:
+
+    * Directories: select the whole name. Folders have no extension by
+      convention; even ``archive.zip/`` (rare) gets selected in full so
+      typing replaces everything.
+    * Files with no dot (``Makefile``, ``script``): select whole name.
+    * Dotfiles - leading dot only (``.bashrc``, ``.gitignore``): select
+      whole name; the dot is part of the identity, not an extension.
+    * Trailing dot (``foo.``): select whole name; nothing meaningful
+      after the dot.
+    * Otherwise: select ``[0, last_dot)``. ``report.txt`` -> select
+      ``report``; ``foo.tar.gz`` -> select ``foo.tar`` (Finder /
+      Explorer treat only the last ``.X`` as "the" extension).
+
+    Range is always within ``[0, len(name)]``; an empty ``name`` returns
+    ``(0, 0)``.
+    """
+    if not name:
+        return (0, 0)
+    if kind is Kind.DIR:
+        return (0, len(name))
+    dot = name.rfind(".")
+    if dot <= 0 or dot == len(name) - 1:
+        # No dot, leading-dot-only (dotfile), or trailing dot.
+        return (0, len(name))
+    return (0, dot)
 
 
 async def plan_rename(

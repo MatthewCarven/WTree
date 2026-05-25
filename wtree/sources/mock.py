@@ -68,6 +68,13 @@ class MockSource(EntrySource):
     def capability(self) -> SourceCapability:
         return self._CAPABILITY
 
+    @property
+    def scan_method_label(self) -> str:
+        # Mock scans are too fast to hit the dialog threshold in
+        # practice; this label is mostly here to satisfy the contract
+        # and for tests that script slow yields.
+        return "mock source"
+
     async def scan(self, path: str) -> AsyncIterator[ScanResult]:
         # A directory-level scripted error wins over scripted contents.
         if path in self._errors:

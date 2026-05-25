@@ -3825,3 +3825,352 @@ because the sandbox times out the full suite > 30s; one transient
 flake on `test_flash_clears_after_timeout` (50 ms flash timeout
 losing to sandbox load) confirmed unrelated by clean re-run in
 isolation.
+
+## 2026-05-25 (continuation) - Smart cursor placement in Rename modal
+
+Third session of 2026-05-25. v0.x polish item: pressing `R` on
+`report.txt` should pre-select the stem `report` so typing
+replaces it while `.txt` is preserved — Finder / Windows Explorer
+muscle memory. Picked from the previous session's hand-off note
+("recommended next pickups: smart cursor in Rename / overwrite
+policy / cursor preservation across auto-refresh"). Discrete
+session: pure helper + PromptDialog kwarg + one call site.
+
+### Design call
+
+Stem-detection rule, captured before any code (then in design.md
+decision log after implementation):
+
+- **Directories** — select whole name. Folders have no extension
+  by convention; even `archive.zip/` (rare) selects all so typing
+  replaces everything.
+- **Files with no dot** (`Makefile`, `script`) — select all.
+- **Leading-dot-only dotfiles** (`.bashrc`, `.gitignore`) — select
+  all. The dot is identity, not an extension.
+- **Trailing-dot** (`foo.`) — select all. Nothing meaningful
+  after the dot.
+- **Otherwise** — select `[0, rfind('.'))`. So `report.txt` →
+  `report`, and `foo.tar.gz` → `foo.tar` (Finder / Explorer treat
+  only the **last** `.X` as "the" extension).
+
+Implemented as `wtree/ops/rename.py::select_range_for_rename(name,
+kind) -> (start, end)`. Empty name returns `(0, 0)`; range is
+always within `[0, len(name)]`. Non-FILE non-DIR kinds (`SYMLINK`,
+`OTHER`) treated like files (a `link.txt` is still a `.txt`).
+
+### Implementation
+
+Three edits, all small:
+
+1. **`wtree/ops/rename.py`** — added `select_range_for_rename`
+   above `plan_rename`; imported `Kind` from `sources.base`.
+
+2. **`wtree/widgets/prompt.py`** — `PromptDialog.__init__` grew a
+   `select_initial: tuple[int, int] | None = None` kwarg.
+   `on_mount` reads it after `inp.focus()`: clamps the range to
+   `[0, len(self._initial)]` (defensive — buggy callers passing
+   `(-1, 99)` shouldn't crash the modal) and assigns
+   `inp.selection = Selection(start, end)`. **Critical trap
+   avoided:** the first cut also wrote `inp.cursor_position = end`
+   after the selection assignment — that immediately reset
+   selection to `(end, end)` because `cursor_position.setter`
+   calls `selection = Selection.cursor(value)`. Removing that one
+   line fixed the failing test; left a comment in the source so
+   future-me doesn't reintroduce it.
+
+3. **`wtree/app.py`** — `action_rename` already had `path, _kind
+   = cursor`; renamed `_kind` → `kind`, added `stem_range =
+   select_range_for_rename(current_basename, kind)`, passed it as
+   `select_initial=stem_range` to the PromptDialog. Imported the
+   helper alongside `plan_rename` (also re-exported from
+   `wtree.ops.__init__`'s `__all__`).
+
+Default behaviour (`select_initial=None`) preserves the
+long-standing "Save As" cursor-at-end UX for every other
+PromptDialog caller (Copy/Move dest, glob prompts, `L`
+log-new-source, Make-new name). Only `action_rename` opts in. The
+zero-touch surface for non-Rename callers means no regressions in
+the existing 454-test baseline.
+
+### Tests
+
+New file `tests/test_rename_smart_cursor.py`, 26 tests:
+
+- **Pure helper, parametrised, 12 cases**: `report.txt`,
+  `notes.md`, `a.b`, `foo.tar.gz`, `.bashrc`, `.gitignore`, `.`,
+  `Makefile`, `README`, `foo.`, `weird.`, `archive.zip` (DIR),
+  `my.project` (DIR), `mydir` (DIR), empty (FILE), empty (DIR).
+- **Non-FILE-non-DIR kinds** (`SYMLINK`, `OTHER`) treated like
+  file: `link.txt` → `(0, 4)`; `socket` → `(0, 6)`.
+- **PromptDialog selection-on-mount** — push with
+  `select_initial=(0, 6)` on `report.txt`, assert
+  `tuple(inp.selection) == (0, 6)` and
+  `inp.cursor_position == 6`.
+- **Default behaviour** — `select_initial=None` lands cursor at
+  end-of-text, selection empty.
+- **Out-of-bounds clamping** — `select_initial=(-1, 99)` on
+  `abc` becomes `(0, 3)`.
+- **Empty initial** — `select_initial` ignored when
+  `initial=""`.
+- **Action layer, pilot** — pressing R on `report.txt` opens the
+  modal with `(0, 6)` selected; on `.bashrc` selects whole name
+  `(0, 7)`; on `Makefile` selects `(0, 8)`; on `mydir`
+  (directory) selects `(0, 5)`.
+- **End-to-end, real filesystem** — `tmp_path/src/report.txt`,
+  press `R`, sanity-check selection, press `drft` (5 keys),
+  assert `inp.value == "draft.txt"`, press Enter, drain queue,
+  assert `draft.txt` is on disk with the original contents and
+  `report.txt` is gone.
+
+26 new tests; 454 → **480 / 480 green**. Existing rename suites
+(`test_ops_rename.py`, `test_rename_e2e.py`) all pass unchanged —
+their assertions on `inp.value == "readme.txt"` still hold; the
+new selection behaviour doesn't change `value`, only `selection`.
+
+### Mount fights
+
+- **`wtree/ops/__init__.py`** truncated mid-string (`"plan_ren`)
+  after the Edit. File-tool view showed correct 75 lines; bash
+  saw 71. Recovered via heredoc-rewrite to `/tmp/wtree_init.py`
+  then `cp` to the mount path (atomic rename failed
+  cross-device).
+- **`wtree/widgets/prompt.py`** truncated at line 105 after the
+  second Edit (the cursor-position fix). Same heredoc-rewrite
+  recipe.
+- **`wtree/app.py`** mid-line truncation at `n = len(self.tagged_set`
+  (line 1401). Used `head -1400` to keep the intact prefix +
+  heredoc-appended the tail (13 lines), `cp` to the mount.
+- **`wtree/ops/rename.py`** more devious: bash saw the new
+  `select_range_for_rename` and import line correctly, **but**
+  the trailing `_basename` / `_parent` helpers (originally lines
+  160-176, now 193-208) had silently vanished. Caught by a real
+  test failure: `NameError: name '_basename' is not defined`
+  inside `plan_rename`. Full heredoc-rewrite recovered the file.
+  Lesson: a successful `ast.parse` from bash isn't sufficient —
+  it tells you the file is syntactically valid, not that all the
+  symbols are still where they were. Run a smoke import of any
+  module Edit-touched: `python -c "from wtree.ops.rename import
+  plan_rename, _basename, _parent; print('OK')"` would have
+  caught this in seconds.
+
+Five truncation rounds total this session; all recovered per
+[[feedback-wtree-mount-rules]].
+
+### Decisions captured in design.md
+
+One new Decision-log row (2026-05-25) covering the stem-detection
+rule, the PromptDialog `select_initial` kwarg, the
+cursor-position trap, and the test surface. Open-questions
+section updated with the 480/480 count and explicit naming of the
+feature.
+
+### Next session
+
+Same v0.x polish queue. From the previous hand-off plus this one:
+
+- **Overwrite-policy unification across Copy/Move/Rename** —
+  Copy clobbers via `shutil.copy2`; Move and Rename pre-check
+  `lexists` and fail. A plan-time overwrite/skip/rename prompt
+  would unify them. Touches `wtree/ops/copy.py`, `move.py`,
+  `rename.py`, and the modal layer. Substantial.
+- **Preserve cursor position across auto-refresh** —
+  `show_path()` resets the cursor to row 0. Deleting row 5
+  should leave the cursor near row 5, not row 0. Snapshot
+  cursor path before refresh, try to restore to the same path
+  if it still exists, else to a sibling.
+- **Initial name suggestion in Make-new** (`New Folder` /
+  `untitled.txt`) — small UX win, mirrors Finder / Explorer.
+- **Pre-position the cursor on the new entry after Make-new** —
+  the post-refresh hook is already in place; just needs to land
+  the cursor on the newly-created basename.
+
+Each is a discrete session. The cursor-position-across-refresh
+item is the smallest and naturally pairs with the existing
+refresh hook; probably the right next session.
+
+## 2026-05-25 (fourth session) - Scan dialog for slow EntrySource.scan
+
+v0.x polish, Matthew-requested. His ask, paraphrased: when he logs
+a new folder containing 100k+ files, he doesn't want a frozen
+screen - put a centred "subcontracting to <os utility>" dialog on
+top, name the os function if easily reachable. After a long-form
+design talk (committed as the new "Scan dialog" subsection under
+User interface + decision-log row in design.md), implementation
+landed in one session.
+
+### Design call
+
+Spec settled on a centred `ModalScreen` with delayed-show gate at
+`SCAN_MODAL_DELAY_SECONDS = 0.25` (tighter than progress dialog's
+0.4 - directory-entry freezes feel jankier than copy freezes
+because the user expects copies to take time). Body shows path,
+"via <method_label>" (e.g. "os.scandir"), live entry count, and
+"Esc = Cancel". Each `EntrySource` declares its own
+`scan_method_label` so the UI renders it verbatim - sources
+self-document the syscall layer. Cancel is **immediate** (unlike
+progress dialog which needs queue wind-down) because the
+consumer checks `ctx.cancelled` between chunks and bails before
+committing - no half-render state to clean up.
+
+**Load-bearing prerequisite identified during the design talk**:
+without chunked consume in `ContentsPane.show_path` /
+`TreePane._populate`, the dialog would never visually appear
+during the freeze it was meant to cover. `NativeSource.scan` is
+an async generator that yields synchronously between
+`os.scandir`'s readdir calls; the consumer's `async for` loop
+drains the iterator in one tight burst with no
+`await asyncio.sleep(0)` between entries. Event loop ticks, but
+Textual gets no paint frames - screen freezes for the duration
+of the scan. So chunked consume + atomic commit + dialog ship as
+one change.
+
+### Implementation
+
+Files touched:
+
+1. **`wtree/sources/base.py`** - new `scan_method_label` property
+   on the ABC, default `"scan"`.
+2. **`wtree/sources/native.py`** - overrides to return
+   `"os.scandir"` (honest at the Python-API layer; the OS-level
+   readdir / FindFirstFile would also be defensible but we name
+   what our code actually calls).
+3. **`wtree/sources/mock.py`** - overrides to `"mock source"`;
+   rarely surfaced since mock scans never hit the threshold in
+   practice.
+4. **`wtree/widgets/scan_screen.py`** (new file, 231 lines) -
+   constants `SCAN_MODAL_DELAY_SECONDS = 0.25` and
+   `SCAN_CHUNK_SIZE = 500`; `ScanContext` dataclass (path,
+   method_label, entries_seen, cancelled Event, completed Event);
+   `ScanScreen(ModalScreen[None])` mirroring `ProgressScreen`'s
+   shape, polling at `PROGRESS_REDRAW_HZ` to refresh the entry
+   count + auto-dismiss on `completed`; `_truncate_path` helper
+   for mid-string ellipsis on long paths.
+5. **`wtree/widgets/contents_pane.py`** - `show_path` grew a
+   `ctx: ScanContext | None = None` kwarg. When present:
+   `await asyncio.sleep(0)` every `SCAN_CHUNK_SIZE` entries,
+   writes `ctx.entries_seen = i`, polls `ctx.cancelled` between
+   chunks AND at the end (for partial-chunk-at-end). The
+   `self.clear()` calls moved from prologue to commit block so a
+   cancelled scan leaves the pane on its previous listing.
+6. **`wtree/widgets/tree_pane.py`** - same shape on `_populate`.
+   On cancel: `self._loaded.discard(node.id)` so the next expand
+   retries cleanly. `re_root` and `refresh_all` grew `ctx`
+   kwargs that thread down to `_populate`.
+7. **`wtree/app.py`** - new `_run_scan_with_dialog(path, source,
+   do_work)` helper. Builds the ctx, `set_timer(0.25)` to push
+   `ScanScreen` if work still running when it fires, awaits
+   do_work, `ctx.completed.set()` in `finally`, dismisses any
+   pushed ScanScreen explicitly. Wired at L (re_root), Ctrl+R
+   (both panes), tree NodeHighlighted (cursor-onto-dir), and
+   initial mount show_path.
+
+### Tests
+
+29 new tests in `tests/test_scan_dialog.py`:
+
+- Constants exist with expected values.
+- Per-source `scan_method_label`: native, mock, ABC default via
+  a minimal bare subclass.
+- `ScanContext`: defaults, cancel mutates, completed mutates,
+  independent Event instances across two ctxs (catches accidental
+  shared mutable defaults).
+- `_truncate_path`: under-limit, over-limit mid-ellipsis,
+  extreme-max-width.
+- `ScanScreen`: mounts with body text containing path + method
+  label + count; Esc sets cancel and dismisses; auto-dismiss when
+  `completed` is set; singular "1 entry" vs plural "N entries".
+- Chunked consume: `ctx.entries_seen` accumulates; works at
+  exactly `SCAN_CHUNK_SIZE` boundary; legacy no-ctx call still
+  works; cancel-mid-scan keeps previous listing; cancel-at-end
+  keeps previous listing.
+- `_run_scan_with_dialog`: fast scan no modal; `completed` set in
+  finally; uses source's method_label; native label correct;
+  dismisses dialog on completion after a slow do_work.
+- Integration: L and Ctrl+R work with the gate (regression checks
+  that wrapping doesn't break the normal path); full e2e cancel
+  during `show_path` keeps previous listing.
+
+**454 + 26 + 29 = 509 / 509 green.** All five batches clean.
+
+### Mount fights
+
+Massive. Every file I Edit-touched needed heredoc recovery:
+
+- `wtree/sources/base.py` - default `scan_method_label` Edit
+  applied; tail (the entire `entry_at` body) silently vanished.
+  Caught only when `test_ops_make_new` failures showed "path
+  already exists" - turned out `entry_at` was returning `None`
+  for missing paths because the function body had been truncated
+  to just the docstring + an `import posixpath` line. The bash
+  `wc -l` showed 200 vs the file tool's 228. Heredoc recovery of
+  lines 200-227 fixed all 12 cascading make-new failures. Lesson:
+  ast.parse + simple import smoke aren't enough - **run an
+  integration test** after non-trivial Edits.
+- `wtree/sources/mock.py` - truncated mid-`scan` method;
+  full-file heredoc recovery.
+- `wtree/sources/native.py` - truncated in `_entry_from`;
+  full-file heredoc recovery.
+- `wtree/widgets/prompt.py` - truncated twice during the prior
+  session's smart-cursor work (rolled in here for completeness).
+- `wtree/widgets/contents_pane.py` - truncated after the
+  chunked-consume Edit; full-file heredoc recovery (~420 lines).
+- `wtree/widgets/tree_pane.py` - truncated twice; both times the
+  marker-truncate + tail-append recipe was faster than full-file
+  heredoc because the file is 776 lines.
+- `wtree/app.py` - truncated mid-`_maybe_push_progress_dialog`
+  docstring after the `_run_scan_with_dialog` insertion;
+  marker-truncate + tail-append recipe recovered the trailing
+  ~125 lines.
+
+The atomic-rename approach in [[feedback-wtree-mount-rules]] is
+not viable on this mount (`mv` from /tmp errors with
+`inter-device move failed`). The working recipe is heredoc + `cp`,
+or for big files: `head -N intact > /tmp/head.py; cat >> /tmp/head.py
+<< 'EOF' ... EOF; cp /tmp/head.py mount/path`. Tracked the recipe
+in the project memory's feedback file already.
+
+### Decisions captured in design.md
+
+Two additions:
+
+1. New `### Scan dialog` subsection under `## User interface`,
+   covering: why it's distinct from progress dialog; delayed-show
+   threshold; chunked-consume load-bearing prerequisite; atomic
+   commit on consumer side; `ScanContext` shape; per-source
+   `scan_method_label`; layout box-art; cancellation semantics;
+   application surfaces; future `BackgroundOperationScreen[T]`
+   unification flagged.
+
+2. New decision-log row (2026-05-25) summarising the above.
+
+### Next session
+
+Same v0.x polish queue. From the design call there were a few
+follow-ups worth surfacing:
+
+- **Tree-pane Right-arrow expand wrapped in the gate** - parked
+  because the expand path runs through `on_tree_node_expanded`
+  which is sync and triggers `_populate(event.node)`; threading
+  the gate through that callback shape is a bit different from
+  the four call sites we wired.
+- **Enter-into-dir (`focus_dir_under_cursor`) wrapped** - same
+  shape, parked.
+- **Ctrl+F walker wrapped** - already `@work`'d so freezing isn't
+  the same kind of problem, but a deep-tree walk could use the
+  same dialog for "Scanning <root> for matches...".
+- **Live count in scan dialog** is now working but is byte-poor:
+  it counts entries-seen across all `_populate` calls during
+  `refresh_all`, which is correct but reads like one big number
+  rather than "currently scanning /a/b: 837 entries; total
+  scanned 12,456". A richer two-line readout could split.
+- **Cancel-during-refresh-all** stops at the current `_populate`
+  boundary, leaving partial expansion state. Acceptable for v1
+  but worth a flash hint ("refresh cancelled; tree may be partly
+  expanded").
+- **Overwrite-policy unification across Copy/Move/Rename** - the
+  bigger v0.x item Matthew flagged earlier. Plan-time
+  overwrite/skip/rename prompt. Substantial.
+
+Reasonable next pickup: tree-pane Right-arrow + Enter-into-dir
+wrap (small completion of the scan dialog story), or the
+overwrite-policy work (bigger but well-scoped).

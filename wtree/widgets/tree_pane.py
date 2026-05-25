@@ -59,6 +59,7 @@ from textual.widgets.tree import TreeNode
 
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.tagged_set import TaggedSet
+from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
 
 
 # Rich style applied to the rendered label of a tagged tree node.
@@ -232,10 +233,29 @@ class TreePane(Tree[str]):
             return
         await self._populate(event.node)
 
-    async def _populate(self, node: TreeNode[str]) -> None:
+    async def _populate(
+        self,
+        node: TreeNode[str],
+        *,
+        ctx: ScanContext | None = None,
+    ) -> None:
         """Scan ``node``'s backing path and add directory children + error
         leaves. Files and other non-directory kinds are excluded — the
         Contents pane is responsible for those.
+
+        ``ctx`` is an optional :class:`ScanContext` shared with a
+        :class:`ScanScreen`. When supplied, the scan loop yields to the
+        event loop every :data:`SCAN_CHUNK_SIZE` entries, writes the
+        running count to ``ctx.entries_seen``, and polls
+        ``ctx.cancelled`` between chunks. On cancel the node is left
+        marked-loaded but with no children added — equivalent to "the
+        scan never happened" from the user's perspective; pressing
+        Right again would re-trigger ``on_tree_node_expanded`` and the
+        consumer would still find ``_loaded`` set, so we also drop the
+        marker on cancel so the next expand retries cleanly.
+
+        Without ``ctx``, the legacy "drain the iterator in one shot"
+        behaviour is preserved for tests and small scans.
         """
         if node.id in self._loaded:
             return
@@ -251,12 +271,30 @@ class TreePane(Tree[str]):
 
         directories: list[Entry] = []
         errors: list[ScanError] = []
+        i = 0
         async for item in self._source.scan(path):
             if isinstance(item, Entry):
                 if item.kind is Kind.DIR:
                     directories.append(item)
             elif isinstance(item, ScanError):
                 errors.append(item)
+            i += 1
+            if ctx is not None:
+                ctx.entries_seen = i
+                if i % SCAN_CHUNK_SIZE == 0:
+                    await asyncio.sleep(0)
+                    if ctx.cancelled.is_set():
+                        # Drop the _loaded marker so the next expand
+                        # retries cleanly. No children added; the node
+                        # stays collapsed-but-expandable.
+                        self._loaded.discard(node.id)
+                        return
+
+        # Final cancel check in case Esc landed during the last partial
+        # chunk (entries < SCAN_CHUNK_SIZE).
+        if ctx is not None and ctx.cancelled.is_set():
+            self._loaded.discard(node.id)
+            return
 
         # Case-insensitive alpha sort, like XTree and most file managers.
         directories.sort(key=lambda e: e.name.lower())
@@ -485,7 +523,7 @@ class TreePane(Tree[str]):
             current_path = next_path
         return current
 
-    async def refresh_all(self) -> None:
+    async def refresh_all(self, *, ctx: ScanContext | None = None) -> None:
         """Re-scan every loaded subtree against the live source state.
 
         Used by ``Ctrl+R`` when the user thinks the on-disk state has
@@ -541,19 +579,25 @@ class TreePane(Tree[str]):
             cursor_node.data if cursor_node is not None else None
         )
 
-        # Nuke and rebuild from the root.
-        await self.re_root(root_path)
+        # Nuke and rebuild from the root. Thread the scan context so
+        # the user can cancel a slow refresh and so entries_seen
+        # accumulates across every level we re-populate.
+        await self.re_root(root_path, ctx=ctx)
+        if ctx is not None and ctx.cancelled.is_set():
+            return
 
         # Re-expand each previously-expanded path. ``_walk_to_node``
         # walks down + expands ancestors; we then expand the leaf
         # itself.
         for path in expanded_paths:
+            if ctx is not None and ctx.cancelled.is_set():
+                return
             node = await self._walk_to_node(path)
             if node is None:
                 continue
             if not node.is_expanded and node.allow_expand:
                 node.expand()
-                await self._populate(node)
+                await self._populate(node, ctx=ctx)
 
         # Restore cursor. ``reveal_path`` handles "target == root" by
         # landing on the root, and returns False silently if the
@@ -568,7 +612,12 @@ class TreePane(Tree[str]):
     # Re-root API used by Left-on-root ascend
     # ------------------------------------------------------------------
 
-    async def re_root(self, new_root_path: str) -> None:
+    async def re_root(
+        self,
+        new_root_path: str,
+        *,
+        ctx: ScanContext | None = None,
+    ) -> None:
         """Re-root the tree in place at ``new_root_path``.
 
         Wipes the existing node subtree under the root, resets the root
@@ -583,13 +632,17 @@ class TreePane(Tree[str]):
         rebuild (typically the root row). The caller is responsible for
         moving the cursor onto the row representing the old root via
         :meth:`focus_child_of_root` if that's the desired UX.
+
+        ``ctx`` (optional :class:`ScanContext`) is threaded down to
+        :meth:`_populate` so a slow scan of the new root's children
+        surfaces the scan dialog and can be cancelled with Esc.
         """
         new_root_path = os.path.abspath(new_root_path)
         self.root.remove_children()
         self.root.set_label(new_root_path)
         self.root.data = new_root_path
         self._loaded.clear()
-        await self._populate(self.root)
+        await self._populate(self.root, ctx=ctx)
         if not self.root.is_expanded:
             self.root.expand()
 

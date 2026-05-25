@@ -51,7 +51,7 @@ from wtree.ops.execute import apply_plan
 from wtree.ops.make_new import plan_make_new
 from wtree.ops.move import plan_move
 from wtree.ops.queue import OperationQueue
-from wtree.ops.rename import plan_rename
+from wtree.ops.rename import plan_rename, select_range_for_rename
 
 __all__ = [
     "ItemResult",
@@ -70,5 +70,6 @@ __all__ = [
     "plan_make_new",
     "plan_move",
     "plan_rename",
+    "select_range_for_rename",
     "walk_tags",
 ]

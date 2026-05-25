@@ -44,6 +44,15 @@ class NativeSource(EntrySource):
     def capability(self) -> SourceCapability:
         return self._CAPABILITY
 
+    @property
+    def scan_method_label(self) -> str:
+        # Surfaced verbatim in the scan dialog. ``os.scandir`` is the
+        # Python-API name our ``scan`` method actually calls; under the
+        # hood it's ``opendir``/``readdir`` on POSIX and
+        # ``FindFirstFileW``/``FindNextFileW`` on Windows, but the
+        # Python name is the honest one at our layer.
+        return "os.scandir"
+
     async def scan(self, path: str) -> AsyncIterator[ScanResult]:
         try:
             scanner = os.scandir(path)

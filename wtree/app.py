@@ -62,6 +62,7 @@ from wtree.ops import (
     plan_make_new,
     plan_move,
     plan_rename,
+    select_range_for_rename,
 )
 from wtree.ops.queue import (
     PROGRESS_MODAL_BYTES,
@@ -80,6 +81,11 @@ from wtree.widgets.menu_bar import MenuBar
 from wtree.widgets.menu_screen import MenuScreen
 from wtree.widgets.progress_screen import ProgressScreen
 from wtree.widgets.prompt import PromptDialog
+from wtree.widgets.scan_screen import (
+    SCAN_MODAL_DELAY_SECONDS,
+    ScanContext,
+    ScanScreen,
+)
 from wtree.widgets.properties import (
     DirProps,
     FileProps,
@@ -219,7 +225,15 @@ class WTreeApp(App):
         self.op_queue.start()
         self._update_subtitle()
         contents = self.query_one(ContentsPane)
-        await contents.show_path(self._root_path)
+        # First scan of the initial root. Wrapped so a huge directory
+        # at app-launch time gets the scan dialog instead of freezing
+        # the splash. Fast roots (the common case) never see a flash
+        # because the delayed-show timer cancels itself.
+        await self._run_scan_with_dialog(
+            self._root_path,
+            self._source,
+            lambda ctx: contents.show_path(self._root_path, ctx=ctx),
+        )
         self.query_one(TreePane).focus()
         self._refresh_status()
 
@@ -231,7 +245,21 @@ class WTreeApp(App):
         self, event: Tree.NodeHighlighted[str]
     ) -> None:
         contents = self.query_one(ContentsPane)
-        await contents.show_path(event.node.data)
+        path = event.node.data
+        if path is None:
+            # Error-placeholder leaf - clear the pane without invoking
+            # the scan-dialog gate (there's no scan to gate).
+            await contents.show_path(None)
+        else:
+            # Wrap so cursor movement onto a (potentially huge) dir
+            # surfaces the scan dialog after the threshold instead of
+            # freezing the UI. The common case (small dirs) never sees
+            # a flash because the delayed-show timer cancels itself.
+            await self._run_scan_with_dialog(
+                path,
+                self._source,
+                lambda ctx: contents.show_path(path, ctx=ctx),
+            )
         self._refresh_status()
 
     def on_data_table_row_highlighted(
@@ -510,9 +538,12 @@ class WTreeApp(App):
         if cursor is None:
             self.flash("Rename: nothing under the cursor.")
             return
-        path, _kind = cursor
+        path, kind = cursor
         tag = Tag(source_id=self._source.source_id, path=path)
         current_basename = posixpath.basename(path.rstrip("/"))
+        # Pre-select the basename stem so typing replaces the name
+        # while keeping the extension (Finder / Explorer convention).
+        stem_range = select_range_for_rename(current_basename, kind)
 
         typed = await self.push_screen_wait(
             PromptDialog(
@@ -520,6 +551,7 @@ class WTreeApp(App):
                 initial=current_basename,
                 placeholder="new name (no path separators)",
                 hint="Enter to confirm  -  Esc to cancel",
+                select_initial=stem_range,
             )
         )
         if typed is None:
@@ -851,13 +883,24 @@ class WTreeApp(App):
         """
         try:
             contents = self.query_one(ContentsPane)
-            if contents.current_path is not None:
-                await contents.show_path(contents.current_path)
+            path = contents.current_path
+            if path is not None:
+                # Scan-dialog gate. Big-dir refresh now surfaces the
+                # dialog after the threshold instead of freezing.
+                await self._run_scan_with_dialog(
+                    path,
+                    self._source,
+                    lambda ctx: contents.show_path(path, ctx=ctx),
+                )
         except Exception:  # noqa: BLE001 - per-pane isolation
             pass
         try:
             tree = self.query_one(TreePane)
-            await tree.refresh_all()
+            await self._run_scan_with_dialog(
+                self._root_path,
+                self._source,
+                lambda ctx: tree.refresh_all(ctx=ctx),
+            )
         except Exception:  # noqa: BLE001 - per-pane isolation
             pass
         self.flash("Source refreshed.")
@@ -924,10 +967,16 @@ class WTreeApp(App):
 
         # Re-root. ``re_root`` wipes the existing tree subtree and
         # re-populates from the new root; tags survive because they're
-        # absolute paths.
+        # absolute paths. Wrapped in the scan-dialog gate so logging a
+        # 100 k-entry folder shows "Scanning ... via os.scandir ..."
+        # rather than freezing the UI.
         self._root_path = candidate
         tree = self.query_one(TreePane)
-        await tree.re_root(candidate)
+        await self._run_scan_with_dialog(
+            candidate,
+            self._source,
+            lambda ctx: tree.re_root(candidate, ctx=ctx),
+        )
         self.flash(f"Logged: {candidate}")
         self._refresh_status()
 
@@ -1274,11 +1323,83 @@ class WTreeApp(App):
         self._refresh_status()
         self._maybe_push_progress_dialog(plan, queue)
 
+    async def _run_scan_with_dialog(
+        self,
+        path: str,
+        source: EntrySource,
+        do_work: Callable[[ScanContext], Awaitable[None]],
+    ) -> None:
+        """Run ``do_work(ctx)`` under the scan-dialog gate.
+
+        Builds a fresh :class:`ScanContext` tied to ``path`` and the
+        source's :attr:`scan_method_label`. Schedules a
+        ``set_timer(SCAN_MODAL_DELAY_SECONDS)`` that pushes
+        :class:`ScanScreen` only if the work is still running when it
+        fires - so fast scans never see a flash. Awaits ``do_work``,
+        then ``ctx.completed.set()`` so the dialog (if it was pushed)
+        notices on its next redraw tick and dismisses itself.
+
+        Cancellation: the user pressing Esc inside the dialog sets
+        ``ctx.cancelled``; the consumer (``show_path`` / ``_populate``
+        / ``refresh_all`` / ``re_root``) checks it between
+        :data:`SCAN_CHUNK_SIZE`-entry chunks and returns without
+        committing, leaving the pane on its previous listing. No
+        exception is raised - cancellation is just early-return.
+
+        Surfaces this helper is wired at (design.md User interface
+        -> Scan dialog -> Application surfaces):
+
+        * ``L`` log new source - the new root's first-level scan.
+        * ``Ctrl+R`` refresh source - both panes' re-scans.
+        * Tree NodeHighlighted - cursor onto a (potentially huge)
+          dir triggers a contents-pane scan.
+        * Initial mount - the very first contents-pane scan on app
+          launch.
+
+        Future call sites (parked on todo.md): tree-pane Right-arrow
+        expand of a node with many children; ``focus_dir_under_cursor``
+        on Enter into a big dir; ``Ctrl+F`` find-across-tree's walker.
+        """
+        ctx = ScanContext(
+            path=path, method_label=source.scan_method_label
+        )
+
+        def _push_if_still_running() -> None:
+            # Don't push if the work finished/cancelled before the
+            # timer fired, or if a ScanScreen is already on the stack
+            # (defensive; the helper itself runs serially per call,
+            # but a concurrent _run_scan_with_dialog would race here).
+            if ctx.completed.is_set() or ctx.cancelled.is_set():
+                return
+            for screen in self.screen_stack:
+                if isinstance(screen, ScanScreen):
+                    return
+            self.push_screen(ScanScreen(ctx))
+
+        delay_timer = self.set_timer(
+            SCAN_MODAL_DELAY_SECONDS, _push_if_still_running
+        )
+        try:
+            await do_work(ctx)
+        finally:
+            ctx.completed.set()
+            delay_timer.stop()
+            # The dialog's own polling timer dismisses on
+            # ctx.completed - we don't have to chase it down here.
+            # But if push happened during this method's await
+            # window and the user is still looking at the dialog,
+            # we explicitly dismiss to avoid a stale frame.
+            for screen in list(self.screen_stack):
+                if isinstance(screen, ScanScreen) and screen._ctx is ctx:
+                    screen.dismiss()
+                    break
+
     def _maybe_push_progress_dialog(
         self, plan: Plan, queue: OperationQueue
     ) -> None:
         """Threshold gate for the progress modal (design.md 2026-05-25).
 
+        Push immediately if the plan trips the size or item-count
         Push immediately if the plan trips the size or item-count
         threshold; otherwise schedule a delayed-show that pushes only
         if the plan is still running ``PROGRESS_MODAL_DELAY_SECONDS``
