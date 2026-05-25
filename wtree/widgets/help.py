@@ -170,6 +170,7 @@ def _help_content() -> Text:
     row("F9", "Open the menu bar")
     row("F1  /  ?", "This help screen")
     row("Ctrl+R", "Refresh source (re-scan both panes)")
+    row("Ctrl+I", "Properties (cursor entry or tagged-set summary)")
     row("Q   /  F10", "Quit")
     row("Esc", "Cancel the current dialog or modal")
     t.append("\n")

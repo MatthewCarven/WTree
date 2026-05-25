@@ -62,11 +62,25 @@ from wtree.sources.base import EntrySource, Kind
 # rather than this raw stream.
 ProgressCb = Callable[[ItemResult], None]
 
+# Callback signature for per-chunk byte progress (2026-05-25 progress
+# dialog). Called from inside :func:`_chunked_copy` (which runs in a
+# worker thread via :func:`asyncio.to_thread`) once per chunk written.
+# Receives ``(item, bytes_done_in_item, item_size)``; returns ``True``
+# to continue, ``False`` to cancel the copy (the chunk loop deletes
+# the partial destination file and the item ends as FAILED).
+#
+# THREADING: the callback may fire from a worker thread, NOT the
+# event loop. Subscribers must not touch event-loop-affine state
+# directly; see design.md -> Progress dialog -> Concurrency
+# assumptions.
+BytesProgressCb = Callable[[PlanItem, int, int], bool]
+
 
 async def apply_plan(
     plan: Plan,
     registry: Mapping[str, EntrySource],
     progress: ProgressCb | None = None,
+    bytes_progress: BytesProgressCb | None = None,
 ) -> OperationResult:
     """Apply every :class:`PlanItem` in ``plan`` in order.
 
@@ -92,7 +106,9 @@ async def apply_plan(
     results: list[ItemResult] = []
     for item in plan.items:
         try:
-            result = await _apply_item(plan.kind, item, registry)
+            result = await _apply_item(
+                plan.kind, item, registry, bytes_progress
+            )
         except Exception as exc:  # noqa: BLE001 - intentional: per-item isolation
             result = ItemResult(
                 item=item,
@@ -114,6 +130,7 @@ async def _apply_item(
     kind: OperationKind,
     item: PlanItem,
     registry: Mapping[str, EntrySource],
+    bytes_progress: BytesProgressCb | None = None,
 ) -> ItemResult:
     """Pick the right adapter for ``(kind, src, dst)`` and run it.
 
@@ -160,8 +177,12 @@ async def _apply_item(
     pair = (item.src_source_id, item.dst_source_id)
     if pair == ("native", "native"):
         if kind is OperationKind.COPY:
-            return await _native_copy(item)
+            return await _native_copy(item, bytes_progress)
         if kind is OperationKind.MOVE:
+            # Move doesn't take bytes_progress yet - shutil.move's
+            # cross-fs fallback uses copy2 internally and exposes no
+            # chunk-level hook. The progress dialog's Rate / Drag
+            # readouts render an em-dash for moves until that lands.
             return await _native_move(item)
         raise NotImplementedError(
             f"{kind.value!r} on (native, native) not supported in v0"
@@ -186,7 +207,10 @@ def _normalise_dst(dst_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _native_copy(item: PlanItem) -> ItemResult:
+async def _native_copy(
+    item: PlanItem,
+    bytes_progress: BytesProgressCb | None = None,
+) -> ItemResult:
     """``shutil.copy2`` for files, ``os.makedirs`` for dirs, recreate
     symlinks. Each kind handled explicitly so the failure modes have
     clean per-kind error messages.
@@ -195,6 +219,13 @@ async def _native_copy(item: PlanItem) -> ItemResult:
     Textual event loop stays responsive during large copies. The OS
     handles the actual byte movement; we just don't block the main
     thread waiting on it.
+
+    When ``bytes_progress`` is supplied (progress-dialog era) the FILE
+    branch uses :func:`_chunked_copy` so per-chunk progress can be
+    reported and cancellation can break the copy mid-file. When it's
+    None (tests, headless usage) we fall through to ``shutil.copy2``
+    which is faster for small files and preserves the long-standing
+    contract.
     """
     src = item.src_path
     dst = _normalise_dst(item.dst_path)
@@ -210,8 +241,23 @@ async def _native_copy(item: PlanItem) -> ItemResult:
         parent = os.path.dirname(dst)
         if parent:
             await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
-        # copy2 preserves mtime/permissions - matches what XTree/MC do.
-        await asyncio.to_thread(shutil.copy2, src, dst)
+        if bytes_progress is None:
+            # Fast path: no progress callback, use shutil.copy2 which
+            # is faster than our pure-Python chunk loop for small files
+            # and preserves the metadata in one call.
+            await asyncio.to_thread(shutil.copy2, src, dst)
+            return ItemResult(item=item, status=ItemStatus.SUCCESS)
+        # Progress-aware path: chunked copy with per-chunk callback,
+        # then copystat to restore mtime/permissions (matching copy2).
+        cancelled = await asyncio.to_thread(
+            _chunked_copy, item, src, dst, bytes_progress
+        )
+        if cancelled:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message="cancelled",
+            )
         return ItemResult(item=item, status=ItemStatus.SUCCESS)
 
     if item.kind is Kind.SYMLINK:
@@ -244,6 +290,81 @@ async def _native_copy(item: PlanItem) -> ItemResult:
         status=ItemStatus.SKIPPED,
         message=f"unhandled kind: {item.kind.value}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Chunked file copy (with per-chunk callback + cancellation)
+# ---------------------------------------------------------------------------
+
+
+def _chunked_copy(
+    item: PlanItem,
+    src: str,
+    dst: str,
+    bytes_progress: BytesProgressCb,
+) -> bool:
+    """Pure-Python chunked file copy with per-chunk progress callback.
+
+    Runs inside :func:`asyncio.to_thread` - everything here is
+    synchronous I/O. Returns ``True`` if the callback asked to cancel
+    (in which case the partial destination file has already been
+    deleted), ``False`` on successful completion.
+
+    Chunk size is :data:`wtree.ops.queue.COPY_CHUNK_SIZE`. After the
+    data is copied :func:`shutil.copystat` restores mtime / permissions
+    so the result matches what ``shutil.copy2`` would have produced.
+
+    THREADING: ``bytes_progress`` is invoked from this worker thread,
+    NOT the event loop. Subscribers must not touch event-loop-affine
+    state directly. The default queue-side callback only mutates
+    GIL-atomic single-int attributes, which is safe.
+    """
+    # Import here to avoid a circular import (queue.py imports from us).
+    from wtree.ops.queue import COPY_CHUNK_SIZE
+
+    item_size = item.size
+    bytes_done = 0
+    cancelled = False
+    try:
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            # Fire one initial callback at zero so subscribers learn the
+            # item's size up front (useful for per-item progress UI).
+            if not bytes_progress(item, 0, item_size):
+                cancelled = True
+            while not cancelled:
+                chunk = fsrc.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                bytes_done += len(chunk)
+                if not bytes_progress(item, bytes_done, item_size):
+                    cancelled = True
+                    break
+    except Exception:
+        # Clean up the partial destination before propagating, so a
+        # failed copy doesn't leave a truncated file behind.
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
+
+    if cancelled:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        return True
+
+    # Mirror shutil.copy2's metadata-preservation: mtime + permissions.
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        # copystat failure is non-fatal - the data is on disk; metadata
+        # restore is best-effort (matches shutil's own forgiveness on
+        # filesystems that don't support all the bits).
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------

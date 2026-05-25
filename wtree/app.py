@@ -63,6 +63,11 @@ from wtree.ops import (
     plan_move,
     plan_rename,
 )
+from wtree.ops.queue import (
+    PROGRESS_MODAL_BYTES,
+    PROGRESS_MODAL_DELAY_SECONDS,
+    PROGRESS_MODAL_ITEMS,
+)
 from wtree.sources.base import EntrySource, Kind
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag, TaggedSet
@@ -73,7 +78,14 @@ from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
 from wtree.widgets.menu_bar import MenuBar
 from wtree.widgets.menu_screen import MenuScreen
+from wtree.widgets.progress_screen import ProgressScreen
 from wtree.widgets.prompt import PromptDialog
+from wtree.widgets.properties import (
+    DirProps,
+    FileProps,
+    PropertiesScreen,
+    TaggedProps,
+)
 from wtree.widgets.search_bar import SearchBar
 from wtree.widgets.status_line import StatusLine
 from wtree.widgets.tree_pane import TreePane
@@ -142,6 +154,7 @@ class WTreeApp(App):
         ("ctrl+g", "next_match", "Next match"),
         ("l", "log_new_source", "Log new source"),
         ("ctrl+r", "refresh_source", "Refresh source"),
+        ("ctrl+i", "properties", "Properties"),
         ("f9", "menu_bar", "Menu"),
     ]
 
@@ -381,7 +394,7 @@ class WTreeApp(App):
     async def on_tree_pane_tag_requested(
         self, event: TreePane.TagRequested
     ) -> None:
-        """Handle Space on a tree node — recursive toggle of the subtree.
+        """Handle Space on a tree node - recursive toggle of the subtree.
 
         Semantics (Matthew's pick 2026-05-22): the directory node's
         own current tagged state is the toggle signal. If the node
@@ -793,7 +806,7 @@ class WTreeApp(App):
 
         Shared by the Left-on-root tree gesture
         (:meth:`on_tree_pane_ascend_requested`) and the blank-Enter
-        branch of :meth:`action_log_new_source` — both express the
+        branch of :meth:`action_log_new_source` - both express the
         same "widen the logged window" intent. No-op (with flash) at
         the filesystem root.
 
@@ -825,7 +838,7 @@ class WTreeApp(App):
         Two-stage:
 
         * The contents pane re-runs ``show_path`` against its
-          current path — replacing every row with a fresh scan.
+          current path - replacing every row with a fresh scan.
         * The tree pane runs :meth:`TreePane.refresh_all` which
           snapshots expanded paths + cursor, wipes the tree, and
           re-walks the snapshot so the user's drilled-down context
@@ -919,7 +932,7 @@ class WTreeApp(App):
         self._refresh_status()
 
     # ------------------------------------------------------------------
-    # Incremental search (``/``) - see design.md § Modality
+    # Incremental search (``/``) - see design.md
     # ------------------------------------------------------------------
 
     def action_search(self) -> None:
@@ -1057,7 +1070,7 @@ class WTreeApp(App):
         :meth:`TreePane.reveal_path`. Subsequent ``Ctrl+G`` steps
         through the cache.
 
-        Errors mid-walk are silently skipped — the underlying
+        Errors mid-walk are silently skipped - the underlying
         ``_walk_subtree`` already filters ``ScanError`` items per
         errors-as-data. A partially-failed walk still produces a
         partial match list, which is the v0 behaviour we want
@@ -1107,7 +1120,7 @@ class WTreeApp(App):
         else:
             # Match exists in the cache but the tree couldn't navigate
             # to it (e.g. the source raised mid-reveal). The cache is
-            # still useful — Ctrl+G might land on a later one.
+            # still useful - Ctrl+G might land on a later one.
             self.flash(
                 f"Find: {n} match(es) for {query!r}; "
                 f"couldn't reveal {first}, try Ctrl+G."
@@ -1119,7 +1132,7 @@ class WTreeApp(App):
 
         Steps through the cached match list from the most recent
         Ctrl+F. With no cached matches the action flashes a nudge
-        rather than no-op'ing silently — a user reaching for Ctrl+G
+        rather than no-op'ing silently - a user reaching for Ctrl+G
         after a `/` commit (parked follow-up, ``_last_query``-style
         re-run) should get a hint about what's missing.
         """
@@ -1142,7 +1155,7 @@ class WTreeApp(App):
         self.flash(f"Find: {cur}/{n} - {basename}")
 
     # ------------------------------------------------------------------
-    # Menu bar (F9) - see design.md § Keymap
+    # Menu bar (F9) - see design.md
     # ------------------------------------------------------------------
 
     @work
@@ -1177,6 +1190,69 @@ class WTreeApp(App):
         if asyncio.iscoroutine(result):
             await result
 
+    def action_properties(self) -> None:
+        """Ctrl+I - open the Properties inspector for the current Selection.
+
+        Mode picked here, before constructing :class:`PropertiesScreen`:
+
+        * Tagged set non-empty -> tagged mode (count + breakdown + total
+          file-size sum, dirs skipped).
+        * Else focused pane's cursor on a non-directory -> file mode
+          (identity, size, mtime, permissions, owner).
+        * Else focused pane's cursor on a directory -> dir mode
+          (identity rows plus an async recursive walk for total size /
+          file count / dir count; Esc cancels the walk).
+        * Else (no tags, no cursor entry) -> flash "Nothing to inspect"
+          per the 2026-05-25 design call. Cheaper than opening an
+          empty modal.
+
+        Source-of-cursor follows the existing op convention (View / Edit
+        / Rename): whichever pane has focus. Tree-pane cursor entries
+        are always directories (tree node ``data`` is a dir path or
+        ``None`` for error placeholders); contents-pane cursor entries
+        carry their own kind.
+        """
+        if self.tagged_set:
+            tags = tuple(
+                sorted(
+                    (Tag(t.source_id, t.path) for t in self.tagged_set),
+                    key=lambda t: (t.source_id, t.path),
+                )
+            )
+            self.push_screen(
+                PropertiesScreen("tagged", tagged=TaggedProps(tags=tags))
+            )
+            return
+
+        path: str | None = None
+        kind: Kind | None = None
+
+        if isinstance(self.focused, TreePane):
+            node = self.focused.cursor_node
+            if node is not None and node.data is not None:
+                path = node.data
+                kind = Kind.DIR
+        else:
+            contents = self.query_one(ContentsPane)
+            cursor = contents.cursor_entry()
+            if cursor is not None:
+                path, kind = cursor
+
+        if path is None or kind is None:
+            self.flash("Properties: nothing to inspect.")
+            return
+
+        if kind is Kind.DIR:
+            self.push_screen(
+                PropertiesScreen("dir", directory=DirProps(path=path))
+            )
+        else:
+            self.push_screen(
+                PropertiesScreen(
+                    "file", file=FileProps(path=path, kind=kind)
+                )
+            )
+
     def action_help(self) -> None:
         """F1 / ``?`` / Help menu - open the About + keymap modal.
 
@@ -1196,6 +1272,57 @@ class WTreeApp(App):
     def _on_plan_start(self, plan: Plan, queue: OperationQueue) -> None:
         self._update_subtitle()
         self._refresh_status()
+        self._maybe_push_progress_dialog(plan, queue)
+
+    def _maybe_push_progress_dialog(
+        self, plan: Plan, queue: OperationQueue
+    ) -> None:
+        """Threshold gate for the progress modal (design.md 2026-05-25).
+
+        Push immediately if the plan trips the size or item-count
+        threshold; otherwise schedule a delayed-show that pushes only
+        if the plan is still running ``PROGRESS_MODAL_DELAY_SECONDS``
+        later. Tiny ops never trip and never see a modal.
+
+        Same-drive rename-fast-path moves report ``bytes_total > 0``
+        because the planner sums file sizes regardless of whether the
+        execution path actually moves bytes - so they may show the
+        modal briefly. The modal's Rate / Drag render an em-dash for
+        those, and the dialog dismisses as soon as ``os.rename``
+        returns.
+        """
+        if (
+            plan.total_bytes > PROGRESS_MODAL_BYTES
+            or len(plan.items) > PROGRESS_MODAL_ITEMS
+        ):
+            self._push_progress_dialog_if_running(plan, queue)
+            return
+
+        async def _delayed() -> None:
+            await asyncio.sleep(PROGRESS_MODAL_DELAY_SECONDS)
+            self._push_progress_dialog_if_running(plan, queue)
+
+        asyncio.create_task(_delayed())
+
+    def _push_progress_dialog_if_running(
+        self, plan: Plan, queue: OperationQueue
+    ) -> None:
+        """Push ``ProgressScreen`` for ``plan`` iff it's still running
+        and no progress dialog is already on the stack.
+
+        The "still running" check is a plan-identity comparison (``is``,
+        not ``==``) - if the queue has moved on to the next plan, this
+        plan finished faster than the delayed-show timer and no dialog
+        is warranted. The "already on stack" check avoids the racy
+        double-push that could occur if the immediate-push branch and
+        a stale delayed-show fire close together.
+        """
+        if queue.running is not plan:
+            return
+        for screen in self.screen_stack:
+            if isinstance(screen, ProgressScreen):
+                return
+        self.push_screen(ProgressScreen(queue))
 
     def _on_item_progress(
         self, item: ItemResult, queue: OperationQueue

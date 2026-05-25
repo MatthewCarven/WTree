@@ -56,12 +56,20 @@ def test_help_content_lists_core_bindings() -> None:
         "Space",
         "Ctrl+A",
         "Ctrl+U",
+        "Ctrl+I",
         "F5",
         "F6",
         "F9",
         "F10",
     ):
         assert binding in text, f"missing binding label: {binding!r}"
+
+
+def test_help_content_documents_properties_row() -> None:
+    """The Ctrl+I Properties row landed in the Application section (2026-05-25)."""
+    text = str(_help_content())
+    assert "Ctrl+I" in text
+    assert "Properties" in text
 
 
 # ---------------------------------------------------------------------------

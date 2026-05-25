@@ -3506,3 +3506,322 @@ usefulness:
 - **`Ctrl+I` properties dialog.** Read-only modal showing the
   cursor entry's full stat output, or the tagged set's size totals.
 - **`O` sort menu.** Modal listing sort keys.
+
+
+## 2026-05-25 - `Ctrl+I` Properties inspector + cross-platform owner lookup
+
+First v0.x polish session. Implements the long-parked `Ctrl+I`
+properties dialog from the tagged-set-era follow-ups, and ships
+the cross-platform owner lookup helper that the skeleton-era
+follow-up had reserved as a separate decision. 22 new tests
+(21 in `tests/test_properties.py`, 1 in `tests/test_help.py`),
+0 regressions. **427/427 green** (was 405/405).
+
+### Design alignment (before code)
+
+Two rounds of `AskUserQuestion` to lock the design before
+writing anything:
+
+1. Dir-mode size: **recursive walk, async with cancel** (not
+   own-size-only). Tagged-set fields: **count breakdown + total
+   file-size sum** (dropped source-id breakdown and newest/oldest
+   pair as forward-looking noise). Shape: **ModalScreen** like
+   ViewerScreen / HelpScreen. Menu: **File menu after Delete**
+   with accelerator `i`.
+2. Cancel gesture: **Esc cancels walk first, second Esc dismisses**
+   (one-key escape was tempting but losing the partial result was
+   the bigger cost). Source-mode fallback: **dropped** in favour of
+   a flash on empty selection.
+
+### Implementation
+
+**`wtree/_owner.py`** (new, 2441 bytes): `lookup(stat) -> (owner, group)`.
+POSIX path uses `pwd.getpwuid` + `grp.getgrgid`, each wrapped in its
+own try/except so a `KeyError` on one ID (common on container images
+and synthetic mounts where the local NSS DB is incomplete) falls back
+to the numeric ID as a string. Windows path returns `("n/a", "n/a")`
+since `pywin32`/`win32security.LookupAccountSid` is still off-limits.
+The split is decided at import time (`HAS_PWD_GRP`) via an
+`ImportError`-guarded import, so the cost is one try/except at module
+load and nothing at call time.
+
+**`wtree/widgets/properties.py`** (new, 16874 bytes):
+`PropertiesScreen(ModalScreen[None])` with a discriminator constructor
+(`"tagged"` / `"file"` / `"dir"`) plus the data each mode needs. CSS
+mirrors HelpScreen (centered, 80% x 80%, `VerticalScroll` body,
+docked header + hint labels). Three body builders are pure functions
+(`_render_tagged`, `_render_file`, `_render_dir_initial`,
+`_render_dir_complete`) so tests assert on Rich `Text` output without
+instantiating the screen.
+
+The dir-mode walk (`_walk_directory`) is iterative (stack-based via
+`os.scandir`) so deep trees don't blow Python's recursion limit; polls
+an `asyncio.Event` once per directory visited so Esc-during-walk takes
+effect quickly; per-directory `await asyncio.sleep(0)` keeps Textual
+painting. Symlinks are treated as leaves (cycle guard). Permission
+errors and other OSErrors are counted and surfaced as a "Walk errors:
+N (silently skipped)" row rather than aborting the inspection.
+
+Cancel gesture: `action_escape_pressed` checks `_walk_done` -- if the
+walk is still in flight, sets `_cancel_event` and returns (no dismiss);
+otherwise dismisses. `_walk_done` flips True at the end of `on_mount`.
+`action_dismiss_screen` (Q binding) always dismisses regardless. Hint
+text re-renders after the walk completes so the user knows Esc has
+flipped from "cancel walk" to "close dialog".
+
+**`wtree/app.py`** -- new `("ctrl+i", "properties", "Properties")`
+binding, new `action_properties` (sync, not `@work`: the async work
+lives inside the screen). Mode picker: tags non-empty -> tagged mode;
+else focused pane's cursor on a dir -> dir mode; else focused pane's
+cursor on a non-dir -> file mode; else flash. TreePane cursor reading
+uses `node.cursor_node` + `node.data` (always a dir path); ContentsPane
+uses `cursor_entry()`.
+
+**`wtree/widgets/menu_bar.py`** -- new "Properties" item inserted in
+the File menu after Delete with accelerator `i`. File menu now has 10
+items (+1 separator), the existing `test_down_skips_separator` test
+flipped from `range(7)` to `range(8)` to compensate.
+
+**`wtree/widgets/help.py`** -- new row in the Application section
+documenting `Ctrl+I` -> "Properties (cursor entry or tagged-set
+summary)".
+
+### Tests
+
+- `tests/test_properties.py` (new, 21 tests): owner lookup happy path
+  / KeyError-fallback / Windows branch; file body field coverage;
+  missing-path stat-failure rendering; dir body computing placeholder
+  and post-walk totals; cancellation tag in body; walk-errors row;
+  tagged-set kind breakdown and unreadable count; recursive walk sum
+  + count correctness; cancel via the Event; end-to-end via
+  `pilot.press("ctrl+i")` for tagged / file / dir / empty-selection
+  paths; Esc and Q dismiss flows; bad-mode rejection at construction.
+- `tests/test_help.py` (+1 test): `Ctrl+I` added to the
+  `core_bindings` spot-check; new `test_help_content_documents_properties_row`
+  to lock the row's presence.
+- `tests/test_menu.py` -- updated `test_down_skips_separator` for the
+  new 10-item File menu shape; `test_menus_definition_has_expected_items`
+  asserts Properties is in `file_items`.
+
+### Mount fights
+
+Four Edit-truncations recovered via the marker-truncate + tail-append
+recipe per [[feedback-wtree-mount-rules]]:
+
+- `tests/test_menu.py`: truncated mid-`assert len(app.tagge` after
+  the in-place `range(7)` -> `range(8)` Edit. Rebuilt via heredoc
+  using the file-tool view.
+- `wtree/widgets/help.py`: truncated at the closing parenthesis of
+  the Selection-rule paragraph after the Edit that added the Ctrl+I
+  row. Heredoc rebuild.
+- `tests/test_help.py`: truncated mid `screen.active_menu == 2` after
+  the Edit adding `test_help_content_documents_properties_row`.
+  Heredoc rebuild.
+- `design.md`: truncated mid the new Ctrl+I row's text, the "Open
+  questions" section disappeared entirely. Recovered via marker
+  truncate (last intact line was the Ctrl+R row from 2026-05-23)
+  + Python-string append in a single bash call.
+- `todo.md`: lost 6 lines of trailing "Lessons learned" bullets after
+  the two `Edit`s ticking the cross-platform-owner and Ctrl+I lines.
+  Marker-truncate at the previous intact line + Python-string append
+  recovered them.
+
+The pattern is consistent and now well-understood: file-tool view is
+the authoritative pre-mount-flush state, bash sees the actual on-disk
+state. `wc -c` after any non-trivial Edit + `python3 -c "import ast;
+ast.parse(open('file').read())"` is the cheapest probe.
+
+### Decisions captured in design.md
+
+New Decision-log row (2026-05-25) covering the full Ctrl+I design:
+three modes + the priority order, cancel gesture, dir-walk
+implementation, owner lookup story, surface wiring, symlink
+handling. Open-questions section updated with the 427/427 count
+and explicit naming of the new feature.
+
+### Next session
+
+Pick from the same v0.x polish queue. The Ctrl+I session unblocked
+two long-parked items (owner lookup + properties). The next
+candidates from the conversation: smart cursor placement in the
+rename modal (preserve `.ext`), progress dialog for large
+copies/moves/deletes, or overwrite-policy unification across
+Copy/Move/Rename. Each is a discrete session.
+
+### Design session — progress dialog (no code)
+
+Pure design pass, no implementation. Talked through the copy/move
+progress modal Matthew has been dreaming about. Committed to
+`design.md` as a new `### Progress dialog` subsection under User
+interface plus a dated decision-log row; `todo.md` line 75
+rewritten to point back at the design instead of re-asking the
+questions.
+
+Six-field readout grid: **Percent** (byte-weighted), **Elapsed**,
+**Data**, **Rate**, **Drag** = `(1 − bytes_done/bytes_total) ×
+elapsed_seconds` (Matthew's quirky readout — derived patience-tax
+vibe number, *not* buffer depth; label `Drag` per his call), and
+**Files** (preserves the existing N/M signal). **Zero
+guard** added at Matthew's request and then unified across both
+axes mid-session: any readout touching `elapsed_seconds` *or*
+`bytes_done` skips the math and renders `—` while either is
+zero. Catches divide-by-zero on Rate, the all-zero opening-paint
+on Drag, *and* the big-file-just-opened case where elapsed has
+ticked but no bytes have flowed yet (would otherwise produce a
+flat `0.0 MB/s` Rate and a Drag spiked to its theoretical max at
+second one — both false-meaningful).
+
+Chunk size and redraw rate exposed as tunable module-level
+constants in `wtree/ops/queue.py` (`COPY_CHUNK_SIZE = 256 * 1024`,
+`PROGRESS_REDRAW_HZ = 10`) — Matthew flagged that rig-tuners will
+want sector / cluster alignment and shouldn't have to grep for a
+magic literal. `WTREE_COPY_CHUNK` env-var override deferred.
+Delayed-show threshold is 4 MiB *or* 50 items *or* 400 ms so
+tiny copies don't flash a modal. Cancel (Esc) returns `False`
+from the chunk callback to break mid-copy and clean partial files;
+completed items stay done.
+
+Implementation pass is queued — needs the new
+`on_bytes_progress(item, bytes_done_in_item, item_size, queue)`
+callback wired through `apply_plan`'s chunked `copyfileobj`, plus
+the `ProgressScreen(ModalScreen[None])` and its threshold gate.
+
+**Concurrency footnote added** (separate decision-log row, same
+date). Matthew raised re-entrancy on 128-core hardware and asked
+whether Python has anything like C's `static` for the constants.
+Answer documented: no real `static`; `typing.Final` is a type-
+checker hint only; module-level immutable ints are the closest
+thing and are safe to read from any number of threads on any
+CPython build (GIL or no-GIL per PEP 703). v0 progress callbacks
+fire single-threaded from the asyncio loop so re-entrancy is
+impossible by construction. The trap that *would* open if anyone
+later parallelizes per-item copy via `ThreadPoolExecutor` /
+`ProcessPoolExecutor` is the cumulative counters (`bytes_done`,
+`items_done`) and the redraw-throttle timestamp — `+=` is not
+atomic, and worker threads can't touch event-loop-affine state
+directly. Captured the mitigations (`threading.Lock`,
+`itertools.count()`, or the preferred `asyncio.Queue` +
+`loop.call_soon_threadsafe()` funnel) as a footnote inside the
+Progress dialog subsection so future-contributor sees the rake
+before reaching for it.
+
+No tunable-redraw-rate guidance added to the README despite a
+brief chuckle about 144 Hz — Matthew chose to let people discover
+the diminishing-returns trap themselves.
+
+### Implementation pass — progress dialog
+
+Same day, after the design + concurrency-footnote conversation
+landed. Built the whole thing in one session: 427 → 454 tests
+green, no regressions.
+
+**Constants** (`wtree/ops/queue.py`, module-level): `COPY_CHUNK_SIZE
+= 256 * 1024`, `PROGRESS_REDRAW_HZ = 10`, plus the threshold-gate
+trio `PROGRESS_MODAL_BYTES = 4 MiB`, `PROGRESS_MODAL_ITEMS = 50`,
+`PROGRESS_MODAL_DELAY_SECONDS = 0.4`. All sit at the top of
+queue.py under a `Tuning` comment block with the alignment
+landmarks (4 KB sector, 64 KB shutil default, 256 KB SSD sweet
+spot, 1 MB NTFS clusters, 4 MB 10GbE / NVMe) so anyone tuning for
+their rig has the reference without grepping.
+
+**Queue contract extension**: `OperationQueue.__init__` gained an
+optional `on_bytes_progress` callback. New properties
+`bytes_progress` (cumulative `(done, total)` summing completed-item
+sizes + in-flight chunk progress), `elapsed_seconds` (monotonic
+clock; 0.0 when idle), `cancel_requested` flag. New `request_cancel()`
+method - sets the flag if a plan is running, no-op otherwise. Worker
+loop resets all byte state per plan; `_progress` closure only
+credits an item's bytes to the completed bucket on SUCCESS (cancelled
+items don't fake-forward the cumulative readout). All single-int
+attribute mutations are GIL-atomic, so the worker-thread chunk
+callback writing `_bytes_done_current` while the event-loop dialog
+reads `bytes_progress` is safe per the concurrency footnote.
+
+**Chunked copy** (`wtree/ops/execute._chunked_copy`): pure-Python
+read/write loop using `COPY_CHUNK_SIZE`, fires the new
+`BytesProgressCb = Callable[[PlanItem, int, int], bool]` per
+chunk (initial zero callback up front so subscribers learn the
+size, then one per chunk). Callback returning False breaks the
+loop and unlinks the partial dest. After successful copy,
+`shutil.copystat` restores mtime/perms to mirror what
+`shutil.copy2` would have produced. `_native_copy`'s FILE branch
+uses the chunked path **only when** `bytes_progress` is supplied;
+absent the callback it falls through to `shutil.copy2` which is
+faster for small files and preserves the long-standing test
+contract. Move executor left alone for v0 - `shutil.move`'s
+cross-fs fallback uses `copy2` internally with no chunk-level
+hook, so Rate / Drag render em-dashes for moves until the
+underlying executor grows a chunked-cross-fs path.
+
+**ProgressScreen** (`wtree/widgets/progress_screen.py`):
+`ModalScreen[None]` mirroring `PropertiesScreen`'s shape. Polls
+queue state via `set_interval(1/PROGRESS_REDRAW_HZ)` rather than
+subscribing to `on_bytes_progress` - deliberate choice to keep
+the dialog event-loop-affine and sidestep the per-chunk worker-
+thread fan-out cost. Six-field readout grid (Percent / Elapsed /
+Data / Rate / Drag / Files) with byte-weighted bar, unified
+zero-guard rendering em-dash on Rate + Drag while either
+`elapsed_seconds == 0` OR `bytes_done == 0`. Esc-cancel is
+two-stage: first press calls `queue.request_cancel()` and flips
+the header to `Cancelling...`; subsequent press dismisses
+immediately (so a stuck cancel doesn't trap the user). Auto-
+dismiss when the queue's `running` is no longer the plan we
+were spawned for - the threshold gate then pushes a fresh
+dialog for the next plan if it trips.
+
+**Threshold gate** (`WTreeApp._maybe_push_progress_dialog` +
+`_push_progress_dialog_if_running`): called from
+`_on_plan_start`. Immediate push when `plan.total_bytes > 4 MiB`
+or `len(plan.items) > 50`; otherwise an `asyncio.create_task`
+sleeps `PROGRESS_MODAL_DELAY_SECONDS` and pushes only if the plan
+is still running (`queue.running is plan` - identity check, not
+equality - if the queue moved on, no dialog is warranted). The
+push helper scans `self.screen_stack` for an existing
+`ProgressScreen` to prevent double-push races between the
+immediate branch and a stale delayed-show.
+
+**Tests** (`tests/test_progress_dialog.py`, 27 new):
+- constants match what design.md committed to;
+- chunked_copy single-file success with monotone callbacks;
+- multi-chunk monotone with full + partial-final read;
+- mid-copy cancel cleans the partial dest;
+- initial-zero cancel writes nothing;
+- mtime preservation (via `shutil.copystat`);
+- `apply_plan` threads bytes_progress through, fast-path absent
+  the callback;
+- queue.bytes_progress is None idle, valid running, monotone
+  during plan, lands on total at completion;
+- elapsed_seconds non-negative during plan, 0.0 after wait_until_idle;
+- request_cancel no-op when idle;
+- request_cancel mid-plan (deterministic - cancel fired from the
+  first chunk callback to avoid wall-clock race on fast disk)
+  lands as FAILED with "cancelled" message + cleans dest;
+- cancel flag resets between plans (plan1 cancelled, plan2
+  succeeds);
+- pure helpers: _render_bar 0/50/100% + clamping out-of-range,
+  _format_elapsed MM:SS / H:MM:SS, _format_bytes scaling,
+  _format_rate scaling, _current_item dst-for-copy / src-for-
+  delete / None for empty/overflow;
+- zero-guard: elapsed=0 renders em-dash; bytes=0+elapsed>0 also
+  renders em-dash (the big-file-just-opened case);
+- zero-guard releases once both nonzero;
+- Drag formula matches `(1 − fraction) × elapsed` at 25%/10s = 7.50;
+- Percent is byte-weighted not item-weighted (470/1000 bytes with
+  0/10 items reads as 47%).
+
+**Mount-write protocol notes**: queue.py, execute.py, app.py, and
+the new progress_screen.py + test_progress_dialog.py all needed
+the stage-in-outputs → atomic-rename → verify-size protocol from
+the project memory. Edit-tool writes truncated silently on the
+mount each time. Whole-file Write to /sessions/.../mnt/outputs/
+then `cp + sync + mv + sync` into the project tree with size
+verification worked first try each time after I switched to it
+(per `feedback_wtree_mount_rules`). The test file also got
+truncated mid-tail through the Write tool itself; bash heredoc
+append was the recovery path.
+
+**Suite count**: 427 → 454, no regressions. Ran in four batches
+because the sandbox times out the full suite > 30s; one transient
+flake on `test_flash_clears_after_timeout` (50 ms flash timeout
+losing to sandbox load) confirmed unrelated by clean re-run in
+isolation.

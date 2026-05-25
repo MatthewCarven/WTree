@@ -90,6 +90,7 @@ MENUS: tuple[Menu, ...] = (
             MenuItem("Move", "m", "M / F6", "move"),
             MenuItem("Rename", "r", "R / F2", "rename"),
             MenuItem("Delete", "d", "D / F8", "delete"),
+            MenuItem("Properties", "i", "Ctrl+I", "properties"),
             MenuItem("", "", "", "", separator=True),
             MenuItem("Quit", "q", "Q / F10", "quit"),
         ),

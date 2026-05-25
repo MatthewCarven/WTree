@@ -71,8 +71,9 @@ in [`design.md`](design.md) § Keymap.
 pytest
 ```
 
-Current suite: 159 tests, covering planners, executor adapters, queue
-semantics, and end-to-end pilot runs.
+Current suite: 454 tests, covering planners, executor adapters
+(including the chunked-copy progress path), queue semantics,
+ProgressScreen helpers, and end-to-end pilot runs.
 
 ## Documentation
 
@@ -92,6 +93,29 @@ semantics, and end-to-end pilot runs.
   binding, so the app is fully usable either way.
 - **Linux:** any modern terminal (Alacritty, Kitty, WezTerm, GNOME Terminal,
   Konsole) works out of the box.
+
+## Tuning
+
+`wtree/ops/queue.py` exposes two module-level constants that govern
+copy throughput and the live progress readouts:
+
+- `COPY_CHUNK_SIZE` (default `256 KB`) — bytes per read/write chunk
+  during copies. Aligning to your storage's cluster or sector
+  geometry helps: roughly `4 KB` for a physical sector, `64 KB` for
+  the Python `shutil` default, `1 MB+` for NTFS large-volume
+  clusters or SMB/NFS shares, `4 MB+` for 10 GbE → NVMe sequential
+  bulk transfers. **Note:** the per-chunk constant is tunable, but
+  copy time (and the progress dialog's update rate) is only as
+  granular as how often the per-chunk callback is called — bigger
+  chunks mean faster bulk throughput on fast hardware but coarser
+  progress steps.
+- `PROGRESS_REDRAW_HZ` (default `10`) — caps progress-dialog
+  repaints per second, coalescing the per-chunk callbacks so the
+  UI doesn't thrash on fast transfers.
+
+No environment-variable override yet; edit the constants and
+reinstall. An `WTREE_COPY_CHUNK` env-var override is on the
+backlog.
 
 ## License
 

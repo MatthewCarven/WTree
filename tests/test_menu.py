@@ -43,19 +43,22 @@ async def test_menu_bar_renders_both_menus(tmp_path: Path) -> None:
 async def test_menus_definition_has_expected_items() -> None:
     """MENUS module-global: File, Commands, Help.
 
-    File: New, View, Edit, Copy, Move, Rename, Delete, separator, Quit.
+    File: New, View, Edit, Copy, Move, Rename, Delete, Properties,
+          separator, Quit.
     Commands: Search, Find tree, Next match, Log new source, Refresh
               source, Untag all.
     Help: About.
 
     Items grew over 2026-05-23 sessions: Help (F1), Find tree + Next
-    match (Ctrl+F), Log new source (L), Refresh source (Ctrl+R).
+    match (Ctrl+F), Log new source (L), Refresh source (Ctrl+R). And
+    2026-05-25: Properties (Ctrl+I) added to the File menu.
     """
     assert [m.name for m in MENUS] == ["File", "Commands", "Help"]
     file_items = [i.label for i in MENUS[0].items]
     assert "New" in file_items
     assert "Copy" in file_items
     assert "Quit" in file_items
+    assert "Properties" in file_items
     # Separator is an empty-label item with separator=True.
     assert any(i.separator for i in MENUS[0].items)
     commands_items = [i.label for i in MENUS[1].items]
@@ -175,10 +178,10 @@ async def test_down_skips_separator(tmp_path: Path) -> None:
         screen = app.screen
         assert isinstance(screen, MenuScreen)
         # File items: New, View, Edit, Copy, Move, Rename, Delete,
-        # [SEPARATOR], Quit. The separator is at index 7.
-        # Step Down 7 times should land on Quit (index 8), skipping
+        # Properties, [SEPARATOR], Quit. The separator is at index 8.
+        # Step Down 8 times should land on Quit (index 9), skipping
         # the separator.
-        for _ in range(7):
+        for _ in range(8):
             await pilot.press("down")
         await pilot.pause()
         item = MENUS[0].items[screen._cursor_idx]
