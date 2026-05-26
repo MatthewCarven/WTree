@@ -697,6 +697,16 @@ class TreePane(Tree[str]):
         Awaiting ``_populate`` directly — instead of relying on the
         ``NodeExpanded`` event handler — keeps this call deterministic for
         the contents pane's synchronous-feeling "drill in" gesture.
+
+        Yields once via ``asyncio.sleep(0)`` after the expand+populate
+        so Textual's internal line indexer catches up before we read
+        ``child.line``. Without this yield, freshly-added children
+        report ``line == -1``, and assigning ``cursor_line = -1``
+        deselects rather than moves — the user sees the cursor "jump
+        back to the logged folder" on the second Right-arrow press
+        from the contents pane (first press worked because the logged
+        root was auto-expanded+populated at mount). Same trick used
+        by :meth:`focus_child_of_root`.
         """
         node = self.cursor_node
         if node is None or node.data is None:
@@ -706,6 +716,9 @@ class TreePane(Tree[str]):
         if not node.is_expanded:
             node.expand()
         await self._populate(node)
+        # CRITICAL: yield to let the line indexer rebuild after the
+        # expand. See docstring for the bug this prevents.
+        await asyncio.sleep(0)
         for child in node.children:
             if child.data == child_path:
                 self.cursor_line = child.line

@@ -4633,3 +4633,153 @@ Reasonable next pickup: plan-time conflict detection. Chunky but
 well-scoped, and it's the last big UX gap before the overwrite
 policy can land. Or the cross-fs dir walked-progress for a
 smaller, more contained session.
+
+
+## 2026-05-27 — Bug fix: contents-pane Right-arrow drill-in
+
+### The bug
+
+Matthew reported: with a logged folder a few levels deep (say
+`c:\foo\bar`), tab to the contents pane, Right descends into the
+first folder fine. Press Right *again* on a folder shown in the
+new listing — instead of going one level deeper, the cursor
+jumps back to `c:\foo\bar`.
+
+### Root cause
+
+`TreePane.focus_dir_under_cursor(child_path)` is the method the
+contents pane calls when the user presses Right on a directory
+row. It expands the tree's current cursor node, populates its
+children, then sets `cursor_line = matching_child.line`.
+
+The problem: Textual's `Tree` widget rebuilds its line indexer
+*lazily on next render*, not synchronously after `node.expand()`.
+A child node that was added inside this method's `_populate` call
+reports `line == -1` until the indexer catches up. Assigning
+`cursor_line = -1` doesn't raise — it deselects the cursor,
+which then falls back to row 0 (the logged root).
+
+Why the **first** Right worked: the logged root is auto-expanded
++populated in `TreePane.on_mount` (`self.root.expand()`), so its
+children are already laid out and their `.line` values are valid.
+`focus_dir_under_cursor` on a root-cursored tree took the "node
+is already expanded; populate is a no-op" path and never tripped
+the stale-indexer condition.
+
+Why the **second** Right failed: after the first Right, the tree
+cursor sat on (say) `c:\foo\bar\test1`. test1 itself had never
+been expanded in the tree — the user had only ever seen its
+*contents* via the contents pane (which uses its own source scan,
+not the tree). The second Right's `focus_dir_under_cursor` was
+the first time test1 got expanded; the populate added test1's
+children, and the immediate `child.line` read returned `-1`.
+
+`focus_child_of_root` (used post-ascend) already had the same
+trap documented in its docstring and fixed with a single
+`await asyncio.sleep(0)` after the expand+populate. The yield
+gives Textual one tick to rebuild the indexer before the
+`.line` read. `focus_dir_under_cursor` was added later and
+didn't inherit the fix.
+
+### The fix
+
+One line:
+
+```python
+await self._populate(node)
+await asyncio.sleep(0)  # <-- new; let the line indexer rebuild
+for child in node.children:
+    if child.data == child_path:
+        self.cursor_line = child.line
+        return True
+```
+
+Plus an expanded docstring on `focus_dir_under_cursor` that
+spells out the trap and points at `focus_child_of_root` as the
+sibling that already handles it — so the next person who copies
+this pattern doesn't have to rediscover the bug.
+
+### Test
+
+`tests/test_drillin_regression.py` — one focused pilot test:
+
+1. Stage `root/alpha/a1/a1a` on disk.
+2. Down-arrow to navigate the tree cursor from root to alpha.
+3. Tab to contents pane (cursor at row 0 = a1).
+4. Right → assert tree cursor moves to `alpha/a1` and contents
+   refreshes to a1's listing with cursor at row 0 = a1a.
+5. Right → assert tree cursor moves to `alpha/a1/a1a` (NOT
+   back to root, which is what the bug produced).
+
+Without the fix the test fails at step 4 (because in my repro
+flow the cursor starts at alpha rather than root, so the bug
+shows up one Right earlier than Matthew's flow but with the
+same root cause).
+
+### Surfaces touched
+
+- `wtree/widgets/tree_pane.py` — one-line `await asyncio.sleep(0)`
+  insertion + expanded docstring on `focus_dir_under_cursor`.
+- `tests/test_drillin_regression.py` — new (8 lines of setup +
+  five-step pilot).
+
+No design.md change — this was a missed-yield bug, not a design
+shift. The behaviour the docstring of `focus_child_of_root`
+already commits to ("yield before reading child.line") is now
+honoured by `focus_dir_under_cursor` too.
+
+### Mount fights
+
+One: `mv` and `rm` both came back "Operation not permitted" when
+I tried to rename the test file from `test_drillin_repro.py` to
+`test_drillin_regression.py`. Fixed via the Cowork
+`allow_cowork_file_delete` tool — first time I've needed it in
+this project. Worth remembering: file deletion on the project
+mount needs explicit permission, even for files I just created.
+
+### Diagnostic process worth noting
+
+The first cut of the repro test added `print` statements around
+each tab/right press, captured by `pytest -s`. The trace showed:
+
+```
+[BEFORE TAB] tree.cursor_node.data='.../alpha'
+[AFTER  TAB] tree.cursor_node.data='.../alpha'    # tab didn't move tree cursor
+[BEFORE 1st RIGHT] tree.cursor_node.data='.../alpha'
+[AFTER  1st RIGHT] tree.cursor_node.data='...'    # tree cursor jumped to ROOT
+```
+
+That trace immediately pointed at `focus_dir_under_cursor`
+returning "successfully" but landing the cursor on the wrong
+node — which narrowed it to `cursor_line` assignment + line
+indexer. Grepping for `asyncio.sleep(0)` in the same file found
+the sibling method that already documented the exact bug. From
+"bug confirmed" to "one-line fix" took less than five minutes.
+
+The lesson: when a Textual cursor assignment seems to do the
+wrong thing, suspect the line indexer first. `.line` on a
+just-added node lies until the next render.
+
+### Results
+
+544 → **545 / 545** green. Five batches: 116 + 72 + 156 + 146 +
+55 = 545 across all 43 test files (was 43; +1 for
+`tests/test_drillin_regression.py`, but also -0 because
+`test_drillin_repro.py` was renamed-via-delete-and-recreate).
+
+### Notes for next session
+
+This was a sniped-while-paused commit; back to the planned
+queue:
+
+- **Plan-time conflict detection** — pre-stat destinations, tag
+  each PlanItem with overwrite/skip/rename, surface in modal.
+  The bigger v0.x item.
+- **Cross-fs dir moves with walked progress** — the documented
+  gap from the move-chunk-hook session.
+- **Cross-platform `dst_path` normalisation**.
+- **`Plan.apply` shorthand** vs free function.
+
+Same recommendation as last session: plan-time conflict
+detection is the chunkier-but-load-bearing one; cross-fs dir
+walked-progress is the smaller alternative.
