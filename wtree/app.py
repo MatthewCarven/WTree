@@ -161,6 +161,7 @@ class WTreeApp(App):
         ("l", "log_new_source", "Log new source"),
         ("ctrl+r", "refresh_source", "Refresh source"),
         ("ctrl+i", "properties", "Properties"),
+        ("ctrl+p", "show_progress", "Show progress"),
         ("f9", "menu_bar", "Menu"),
     ]
 
@@ -1301,6 +1302,32 @@ class WTreeApp(App):
                     "file", file=FileProps(path=path, kind=kind)
                 )
             )
+
+    def action_show_progress(self) -> None:
+        """Ctrl+P - re-open a minimized progress dialog.
+
+        The ``OperationQueue`` keeps running whether or not a
+        :class:`ProgressScreen` is on the stack. Minimize (``m`` on
+        the dialog) dismisses the screen without setting
+        ``cancel_requested``; Ctrl+P from anywhere in the app
+        re-pushes a fresh ``ProgressScreen`` bound to the same queue.
+        The new screen polls live queue state on first paint, so
+        it comes up at whatever percentage the op has actually
+        reached - no stale snapshot.
+
+        If the queue isn't running anything, flash a nudge through
+        :meth:`StatusLine.flash` (same idiom ``Ctrl+G`` uses with an
+        empty find-tree cache). If a ``ProgressScreen`` is already
+        on the stack, no-op so spamming Ctrl+P doesn't double-stack.
+        """
+        queue = self.op_queue
+        if queue is None or queue.running is None:
+            self.flash("No operation in progress")
+            return
+        for screen in self.screen_stack:
+            if isinstance(screen, ProgressScreen):
+                return
+        self.push_screen(ProgressScreen(queue))
 
     def action_help(self) -> None:
         """F1 / ``?`` / Help menu - open the About + keymap modal.

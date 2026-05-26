@@ -160,9 +160,24 @@ class StatusLine(Static):
                 ahead_note = (
                     "" if ahead <= 0 else f"  [+{ahead} queued]"
                 )
+                # Discovery hint for the resume key. Only show when
+                # the progress dialog is NOT currently on the screen
+                # stack - no point hinting at Ctrl+P while the dialog
+                # is up. Import is local to avoid widget->widget
+                # import cycles at module load.
+                hint = ""
+                try:
+                    from wtree.widgets.progress_screen import ProgressScreen
+                    if not any(
+                        isinstance(s, ProgressScreen)
+                        for s in app.screen_stack
+                    ):
+                        hint = "  [dim][Ctrl+P][/dim]"
+                except Exception:  # noqa: BLE001 - defensive at render time
+                    pass
                 return (
                     f"[b]{running.kind.value.capitalize()}[/b]: "
-                    f"{done}/{total} items{ahead_note}"
+                    f"{done}/{total} items{ahead_note}{hint}"
                 )
             # Pending-only state (worker hasn't picked it up yet).
             return f"[b]Queued[/b]: {queue.depth} op(s) pending"

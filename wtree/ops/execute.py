@@ -81,6 +81,7 @@ async def apply_plan(
     registry: Mapping[str, EntrySource],
     progress: ProgressCb | None = None,
     bytes_progress: BytesProgressCb | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> OperationResult:
     """Apply every :class:`PlanItem` in ``plan`` in order.
 
@@ -102,19 +103,43 @@ async def apply_plan(
     Errors mid-item never propagate. Each ``PlanItem`` produces an
     :class:`ItemResult`; ``progress`` (if provided) is called once per
     item in order.
+
+    ``is_cancelled`` (optional) is polled at the top of the per-item
+    loop. Once it returns True, every remaining item is marked
+    ``ItemStatus.SKIPPED`` with message ``"cancelled"`` and the
+    per-item ``progress`` callback still fires for each so the dialog's
+    items counter stays consistent. The in-flight item that was
+    cancelled mid-copy (via ``bytes_progress`` returning False) keeps
+    its existing ``FAILED("cancelled")`` status - distinct from the
+    not-yet-started SKIPPED items so ``OperationResult.summary()``
+    surfaces the difference. See design.md -> Progress dialog ->
+    Mid-plan cancellation.
     """
     results: list[ItemResult] = []
+    cancelled = False
     for item in plan.items:
-        try:
-            result = await _apply_item(
-                plan.kind, item, registry, bytes_progress
-            )
-        except Exception as exc:  # noqa: BLE001 - intentional: per-item isolation
+        if not cancelled and is_cancelled is not None and is_cancelled():
+            cancelled = True
+        if cancelled:
+            # Don't even try; mark and continue so the per-item
+            # progress callback still fires (keeps the dialog's
+            # items counter consistent with len(plan.items)).
             result = ItemResult(
                 item=item,
-                status=ItemStatus.FAILED,
-                message=f"{type(exc).__name__}: {exc}",
+                status=ItemStatus.SKIPPED,
+                message="cancelled",
             )
+        else:
+            try:
+                result = await _apply_item(
+                    plan.kind, item, registry, bytes_progress
+                )
+            except Exception as exc:  # noqa: BLE001 - intentional: per-item isolation
+                result = ItemResult(
+                    item=item,
+                    status=ItemStatus.FAILED,
+                    message=f"{type(exc).__name__}: {exc}",
+                )
         results.append(result)
         if progress is not None:
             progress(result)
@@ -179,11 +204,7 @@ async def _apply_item(
         if kind is OperationKind.COPY:
             return await _native_copy(item, bytes_progress)
         if kind is OperationKind.MOVE:
-            # Move doesn't take bytes_progress yet - shutil.move's
-            # cross-fs fallback uses copy2 internally and exposes no
-            # chunk-level hook. The progress dialog's Rate / Drag
-            # readouts render an em-dash for moves until that lands.
-            return await _native_move(item)
+            return await _native_move(item, bytes_progress)
         raise NotImplementedError(
             f"{kind.value!r} on (native, native) not supported in v0"
         )
@@ -372,22 +393,43 @@ def _chunked_copy(
 # ---------------------------------------------------------------------------
 
 
-async def _native_move(item: PlanItem) -> ItemResult:
-    """``shutil.move`` for files, dirs, and symlinks.
+async def _native_move(
+    item: PlanItem,
+    bytes_progress: BytesProgressCb | None = None,
+) -> ItemResult:
+    """Move ``item`` from src to dst, threading bytes progress for
+    cross-filesystem file moves so the progress dialog can render
+    ``Rate`` / ``Drag`` instead of em-dashes.
 
-    ``shutil.move(src, dst)`` tries ``os.rename`` first; if that fails
-    (cross-fs ``EXDEV``, dst is on a different device, etc.) it falls
-    back to ``copy + delete``. This single call handles every case the
-    Move design called out in the worklog:
+    Dispatch (matches design.md -> Progress dialog -> Move executor
+    chunk hook):
 
-    * **Same filesystem:** ``os.rename`` - O(1), instant for any size.
-    * **Cross filesystem:** ``shutil.copy2`` (preserving mtime) + remove.
+    1. **Always try** ``os.rename(src, dst)`` first. Atomic, instant
+       same-fs for any kind. No bytes flow; the progress dialog's
+       zero-guard correctly renders em-dashes for ``Rate`` / ``Drag``.
+    2. On ``OSError`` (cross-fs ``EXDEV`` on POSIX,
+       ``ERROR_NOT_SAME_DEVICE`` on Windows; caught generically so
+       the same code works on both platforms), dispatch by kind:
+
+       * **FILE**: ``_chunked_copy(item, src, dst, bytes_progress)``
+         then ``os.unlink(src)``. Cancel mid-copy returns
+         ``FAILED("cancelled")`` with the partial dst cleaned and
+         the source intact. If ``bytes_progress`` is None (test
+         contract / headless), fall through to ``shutil.move`` for
+         the file too - mirrors ``_native_copy``'s
+         callback-present-or-fast-path pattern.
+       * **SYMLINK**: ``os.readlink`` + ``os.symlink`` at dst +
+         ``os.unlink`` src. No bytes flow.
+       * **DIR**: ``shutil.move`` (which does ``copytree + rmtree``
+         internally). Recursive walked-progress for cross-fs dir
+         moves is parked - rare case, real code, mid-walk cancel
+         and mid-dir errors deserve their own pass.
+       * **OTHER**: SKIPPED (matches the copy executor).
 
     Pre-check that ``dst`` does not already exist. ``shutil.move``'s
     behaviour when ``dst`` is an existing directory is "move src INTO
-    dst" (i.e. dst becomes ``dst/basename(src)``) - that would silently
-    nest user data deeper than intended. Failing fast is safer for v0;
-    a future overwrite/merge prompt can layer on top.
+    dst" (i.e. dst becomes ``dst/basename(src)``); failing fast is
+    safer for v0. A future overwrite/merge prompt can layer on top.
     """
     src = item.src_path
     dst = _normalise_dst(item.dst_path)
@@ -422,8 +464,96 @@ async def _native_move(item: PlanItem) -> ItemResult:
             message=f"unhandled kind: {item.kind.value}",
         )
 
-    await asyncio.to_thread(shutil.move, src, dst)
-    return ItemResult(item=item, status=ItemStatus.SUCCESS)
+    # Always try the rename fast-path first. Atomic same-fs for any
+    # kind; instant. shutil.move does this internally too, but we
+    # need to split it apart so the cross-fs fallback can call our
+    # chunked path with the byte-progress callback.
+    try:
+        await asyncio.to_thread(os.rename, src, dst)
+        return ItemResult(item=item, status=ItemStatus.SUCCESS)
+    except OSError:
+        # Cross-filesystem (EXDEV) or some other rename
+        # incompatibility. Fall through to per-kind dispatch.
+        pass
+
+    if item.kind is Kind.FILE:
+        if bytes_progress is None:
+            # Fast path: no progress callback, use shutil.move which
+            # is well-tested for cross-fs file moves. Preserves the
+            # pre-progress-dialog test contract.
+            await asyncio.to_thread(shutil.move, src, dst)
+            return ItemResult(item=item, status=ItemStatus.SUCCESS)
+        # Progress-aware path: chunked copy then unlink source.
+        cancelled = await asyncio.to_thread(
+            _chunked_copy, item, src, dst, bytes_progress
+        )
+        if cancelled:
+            # _chunked_copy already cleaned the partial dst.
+            # Source is intact.
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message="cancelled",
+            )
+        try:
+            await asyncio.to_thread(os.unlink, src)
+        except OSError as exc:
+            # Copy succeeded but the source unlink failed; the user
+            # now has the file in both places. Surface a clearer
+            # error than shutil.move would have given.
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=(
+                    f"unlink source after copy: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        return ItemResult(item=item, status=ItemStatus.SUCCESS)
+
+    if item.kind is Kind.SYMLINK:
+        # Recreate the link at dst, then unlink src. No bytes flow.
+        try:
+            target = await asyncio.to_thread(os.readlink, src)
+        except OSError as exc:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"readlink: {type(exc).__name__}: {exc}",
+            )
+        try:
+            await asyncio.to_thread(os.symlink, target, dst)
+        except OSError as exc:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"symlink: {type(exc).__name__}: {exc}",
+            )
+        try:
+            await asyncio.to_thread(os.unlink, src)
+        except OSError as exc:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=(
+                    f"unlink source after symlink: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        return ItemResult(item=item, status=ItemStatus.SUCCESS)
+
+    if item.kind is Kind.DIR:
+        # Cross-fs DIR moves keep shutil.move (copytree + rmtree).
+        # Recursive walked-progress is parked - see design.md.
+        await asyncio.to_thread(shutil.move, src, dst)
+        return ItemResult(item=item, status=ItemStatus.SUCCESS)
+
+    # Unreachable - OTHER handled above. Defensive.
+    return ItemResult(
+        item=item,
+        status=ItemStatus.SKIPPED,
+        message=f"unhandled kind: {item.kind.value}",
+    )
 
 
 # ---------------------------------------------------------------------------

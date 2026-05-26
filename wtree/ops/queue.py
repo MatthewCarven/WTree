@@ -319,12 +319,21 @@ class OperationQueue:
                             )
                     return not self._cancel_requested
 
+                # Closure passed to apply_plan so its per-item loop
+                # can short-circuit remaining items when request_cancel
+                # fires between items (the chunk-level callback already
+                # handles mid-item cancellation). See design.md ->
+                # Progress dialog -> Mid-plan cancellation.
+                def _is_cancelled() -> bool:
+                    return self._cancel_requested
+
                 try:
                     result = await apply_plan(
                         plan,
                         self._registry,
                         progress=_progress,
                         bytes_progress=_bytes_progress,
+                        is_cancelled=_is_cancelled,
                     )
                 except Exception as exc:  # noqa: BLE001 - keep queue alive
                     _log.exception(

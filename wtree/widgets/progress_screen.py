@@ -117,6 +117,7 @@ class ProgressScreen(ModalScreen[None]):
 
     BINDINGS = [
         Binding("escape", "cancel_or_dismiss", "Cancel / Close", show=False),
+        Binding("m", "minimize", "Minimize", show=False),
     ]
 
     def __init__(self, queue: OperationQueue) -> None:
@@ -133,7 +134,7 @@ class ProgressScreen(ModalScreen[None]):
         with Vertical():
             yield Label(self._header_text(), classes="header", id="progress-header")
             yield Static(self._body_text(), classes="body", id="progress-body")
-            yield Label("Esc = Cancel", classes="hint")
+            yield Label("Esc = Cancel    m = Minimize", classes="hint")
 
     def on_mount(self) -> None:
         """Start the polling timer at PROGRESS_REDRAW_HZ Hz."""
@@ -163,6 +164,26 @@ class ProgressScreen(ModalScreen[None]):
             self._refresh_header()
             return
         self.dismiss(None)
+
+    def action_minimize(self) -> None:
+        """Dismiss the dialog without cancelling the queue.
+
+        The queue keeps running in the background; ``Ctrl+P`` on the app
+        re-pushes a fresh ``ProgressScreen`` bound to the same queue,
+        which polls the live state on first paint. No state is duplicated
+        - the queue is the single source of truth, this screen is a view.
+
+        After dismiss, schedule a status-line refresh so the
+        ``[Ctrl+P]`` discovery hint appears immediately. The check in
+        ``StatusLine._build_text`` only fires the hint when no
+        ``ProgressScreen`` is on the stack, so the refresh must run
+        *after* the dismiss is processed - hence ``call_after_refresh``.
+        """
+        self.dismiss(None)
+        try:
+            self.app.call_after_refresh(self.app._refresh_status)
+        except Exception:  # noqa: BLE001 - defensive; not all hosts are WTreeApp
+            pass
 
     # --- repaint ---------------------------------------------------------
 

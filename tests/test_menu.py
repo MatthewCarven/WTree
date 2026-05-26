@@ -68,6 +68,7 @@ async def test_menus_definition_has_expected_items() -> None:
         "Next match",
         "Log new source",
         "Refresh source",
+        "Progress dialog",
         "Untag all",
     ]
     help_items = [i.label for i in MENUS[2].items]
@@ -274,10 +275,10 @@ async def test_untag_all_from_commands_menu(tmp_path: Path) -> None:
         await pilot.press("right")  # Commands
         await pilot.pause()
         # Commands menu items: Search (0), Find tree (1), Next match (2),
-        # Log new source (3), Refresh source (4), Untag all (5). The
-        # cursor starts on Search; press Down five times to reach
-        # Untag all.
-        for _ in range(5):
+        # Log new source (3), Refresh source (4), Progress dialog (5),
+        # Untag all (6). The cursor starts on Search; press Down six
+        # times to reach Untag all.
+        for _ in range(6):
             await pilot.press("down")
             await pilot.pause()
         await pilot.press("enter")

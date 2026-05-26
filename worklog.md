@@ -4174,3 +4174,462 @@ follow-ups worth surfacing:
 Reasonable next pickup: tree-pane Right-arrow + Enter-into-dir
 wrap (small completion of the scan dialog story), or the
 overwrite-policy work (bigger but well-scoped).
+
+
+## 2026-05-26 — Progress dialog: minimize / resume
+
+### What landed
+
+Long copies no longer trap the user behind the progress modal.
+`m` (lowercase) on the dialog dismisses without setting
+`cancel_requested`; the `OperationQueue` keeps running in the
+background. `Ctrl+P` (new global app binding) re-pushes a fresh
+`ProgressScreen` bound to the same queue — the new screen polls
+live state on first paint so it comes up at the actual percentage
+the op has reached, not a stale snapshot.
+
+Two-instinct split, not one toggle:
+
+- **`m` = Minimize** on the dialog. Mnemonic; unbound on the
+  modal because the app-level `m` for Move is blocked while a
+  `ModalScreen` owns the keymap. Single action: `self.dismiss(None)`
+  then `self.app.call_after_refresh(self.app._refresh_status)` so
+  the StatusLine repaints with the `[Ctrl+P]` discovery hint
+  after the screen is off the stack.
+- **`Ctrl+P` = Show progress dialog** globally. If `op_queue.running`
+  is `None`, flash `"No operation in progress"` (same idiom as
+  `Ctrl+G` with an empty find-tree cache). If a `ProgressScreen`
+  is already on `self.screen_stack`, no-op (spamming Ctrl+P
+  doesn't double-stack). Else `push_screen(ProgressScreen(queue))`.
+
+Cancel and minimize stay separate intents (stop the work vs. stop
+showing me the work). Overloading Esc with state-dependent
+meaning was on the table briefly and rejected — that's the kind
+of UX that gets users to lose data once and never trust the
+dialog again.
+
+### Status-line affordance
+
+`StatusLine._build_text` now appends `  [Ctrl+P]` to the existing
+`Copy 3/12 items` readout iff the queue is running AND no
+`ProgressScreen` is on `app.screen_stack`. Local import of
+`ProgressScreen` inside the method keeps the widget→widget
+import out of module load. While the dialog is up the suffix
+disappears (no point hinting at a key the user can't usefully
+press from inside the modal).
+
+### Why no auto-restore on completion
+
+`_on_plan_complete` already fires `notify()`, which surfaces a
+toast even if focus has moved to another app. Auto-popping the
+dialog after the user explicitly minimized would override their
+express layout choice — especially painful if they minimized
+*because* they wanted to keep working in the panes. Toast-only
+is honest about the contract: the dialog is a view; the queue
+runs whether or not you're looking at it.
+
+### Surfaces touched
+
+- `wtree/widgets/progress_screen.py` — `m` binding, `action_minimize`,
+  hint label updated to `Esc = Cancel    m = Minimize`.
+- `wtree/app.py` — `ctrl+p` binding, `action_show_progress`.
+- `wtree/widgets/status_line.py` — `[Ctrl+P]` hint in `_build_text`.
+- `wtree/widgets/menu_bar.py` — new "Progress dialog" item in
+  Commands menu (accelerator `p`).
+- `wtree/widgets/help.py` — `Ctrl+P` row under Application section.
+- `design.md` — Progress dialog → Minimize / resume subsection,
+  decision-log row (2026-05-26), Ctrl+P row in canonical bindings.
+
+### Tests
+
+`tests/test_progress_minimize.py` — 16 new tests.
+
+- Static surface: `m` in `ProgressScreen.BINDINGS`, `ctrl+p` in
+  `WTreeApp.BINDINGS`, `action_minimize` / `action_show_progress`
+  present, Commands menu lists the new item, HelpScreen body
+  mentions `Ctrl+P`, dialog hint includes `Minimize`.
+- StatusLine: hint appears when running + dialog down; vanishes
+  when a `ProgressScreen` is on the stack; idle queue gives no
+  queue-line at all.
+- Pilot integration: idle-`Ctrl+P`-flashes; running-`Ctrl+P`-pushes;
+  triple-`Ctrl+P` never stacks twice; minimize dismisses without
+  calling `request_cancel`; resume after minimize gives a new
+  screen instance bound to the same queue; status text flips
+  between hint-present and hint-absent across the minimize cycle.
+
+### Mount fights
+
+Two design.md truncations during initial Edit attempts — the
+first wiped the closing prose and the second clipped the
+Rename-smart-cursor decision-log row mid-sentence. Recovered
+both via `git show HEAD:design.md > /tmp/design_orig.md` + python
+rebuild + `cp /tmp/design_new.md mount/design.md`. After that I
+went straight to the heredoc-then-cp pattern for every file
+larger than ~10KB (app.py was 58KB, status_line.py was 8KB,
+progress_screen.py was 12KB). All landed clean by size check.
+
+One new wrinkle this session: `len(unicode_string)` in Python
+counts code points, not bytes, so `print(len(src))` reports a
+smaller number than `os.path.getsize()` when the file contains
+non-ASCII chars (em-dashes in design.md, in the menu_bar
+underline marker, etc.). The byte-comparison `mount_size ==
+src_size` is the only reliable mount-write check. Updated the
+mental model.
+
+### Results
+
+454 → 480 → 509 → **525 / 525** green. Took the full suite in
+four batches (66 + 88 + 166 + 124 + 81 = 525 tests across all 41
+test files). No flakes this run — `test_flash_clears_after_timeout`
+was happy on its first attempt for a change.
+
+### Notes for next session
+
+Remaining ops/queue-era follow-ups from `todo.md`:
+
+- **Conflict detection at plan time** — pre-stat destinations,
+  tag PlanItem with overwrite/skip/rename, surface in modal.
+  Move and Rename already do a runtime `lexists` pre-check;
+  plan-time would be friendlier. Bigger v0.x item.
+- **Cross-platform `dst_path` normalisation** for cross-source
+  pairs. Small but specific.
+- **Cancel a running plan** mid-plan via a cancellation token in
+  `apply_plan`. `OperationQueue.stop()` already cancels the
+  worker; the gap is per-item.
+- **`Plan.apply` shorthand** vs free function — ergonomics call.
+- **Move executor chunk hook** so progress dialog can show Rate
+  / Drag for cross-fs moves (currently em-dashes). `shutil.move`'s
+  cross-fs fallback uses `copy2` internally; replacing it with
+  the existing `_chunked_copy` call site + a delete is the path.
+
+Reasonable next pickup: the move-executor chunk hook — small,
+self-contained, and closes the "Rate is em-dashed during moves"
+gap that the original progress dialog landed without. Or the
+plan-time conflict detection if Matthew wants to tackle the
+bigger overwrite-policy unification.
+
+
+## 2026-05-26 (later) — Progress dialog: move executor chunk hook
+
+### What landed
+
+Cross-filesystem moves now render `Rate` / `Drag` properly instead
+of em-dashes. The original progress-dialog landing flagged this
+explicitly — `shutil.move` does `copy2 + delete` internally on
+cross-fs with no chunk-level hook, so byte progress was invisible
+for any move that crossed a device. Today's pass unwinds that.
+
+`_native_move` no longer delegates to `shutil.move` wholesale. The
+dispatch:
+
+1. **Always try `os.rename` first.** Atomic same-fs for files,
+   dirs, and symlinks of any size — no bytes flow, so the progress
+   dialog's zero-guard correctly em-dashes `Rate` / `Drag`. Fast
+   rename-moves often complete before the 400ms delayed-show timer
+   fires and the dialog never appears.
+2. **On `OSError`** (cross-fs `EXDEV` on POSIX, `ERROR_NOT_SAME_DEVICE`
+   on Windows — caught generically so the same code works on both
+   platforms; matches `shutil.move`'s own pattern), dispatch by kind:
+   - **FILE**: `_chunked_copy(item, src, dst, bytes_progress)` then
+     `os.unlink(src)`. The existing copy chunk path; reused as-is.
+   - **SYMLINK**: `os.readlink(src)` + `os.symlink(target, dst)` +
+     `os.unlink(src)`. Three short syscalls; no cancel point; no
+     bytes flow.
+   - **DIR**: keeps `shutil.move`. Recursive walked-progress for
+     cross-fs dir moves stays parked (rare case, real code,
+     mid-walk cancel + mid-dir errors deserve their own pass).
+   - **OTHER**: SKIPPED.
+
+### Scope decision
+
+Files + symlinks chunked, dirs keep `shutil.move`. Matthew picked
+the recommended option. Reasoning: cross-fs file moves are the
+common case (drag from `~` to `/mnt/backup`, move a video off
+the SSD, etc.); cross-fs dir moves are genuinely rare and the
+walker would add real code (per-file callback semantics across
+PlanItem boundaries, mid-walk cancellation, mid-dir error
+handling). The dir case is now documented as a known gap rather
+than silently broken — `Rate` / `Drag` em-dash during the
+copytree phase of cross-fs dir moves.
+
+### Cancel semantics
+
+Cancel-mid-copy on a cross-fs file move:
+- The chunk callback returns `False`.
+- `_chunked_copy` cleans the partial destination file.
+- The source file is intact (we hadn't started the unlink yet).
+- Item returns `FAILED("cancelled")`.
+
+Data-safe by construction. If the user hits Esc halfway through a
+big cross-fs move, they get their source file back, no half-state.
+
+### Partial-failure semantics
+
+Copy succeeds, `os.unlink(src)` fails (permissions, file in use,
+race with another process): the file exists in both places, and
+the item returns FAILED with a clear `"unlink source after copy:
+<errtype>: <msg>"` message. Same semantics as `shutil.move` today
+(which also leaves the source file behind on a failed final
+remove), just with a more specific error.
+
+### Test-contract preservation
+
+When `bytes_progress is None` (headless test runs, scripts that
+don't care about per-chunk progress), the FILE branch falls
+through to `shutil.move` rather than instantiating a no-op chunk
+loop. Same pattern `_native_copy` uses: callback present →
+chunked path; callback absent → fast path. Existing move
+executor tests are untouched — verified by running the original
+46 move/execute tests before touching anything else.
+
+### Surfaces touched
+
+- `wtree/ops/execute.py` — `_native_move` grew the optional
+  `bytes_progress` arg and the per-kind cross-fs dispatch. The
+  `# Move doesn't take bytes_progress yet` comment in
+  `_apply_item` is gone; the MOVE branch now passes
+  `bytes_progress` through.
+- `design.md` — new "Move executor chunk hook" subsection under
+  Progress dialog; new decision-log row (2026-05-26).
+
+No widget changes. No queue changes. No menu / help changes.
+Pure executor work; the dialog reads the queue, the queue reads
+the executor.
+
+### Tests
+
+`tests/test_move_chunk_hook.py` — 11 new tests.
+
+- Signature: `_native_move` takes optional `bytes_progress`,
+  default `None` so existing callers compile.
+- Same-fs: rename fast path still works with and without
+  callback; with callback the callback never fires (no bytes
+  flow — zero-guard does the right thing).
+- Cross-fs FILE simulated via `monkeypatch.setattr(os, 'rename',
+  …)` raising `OSError(errno.EXDEV)`: with callback the chunk
+  path runs and `fired[0] == 0`, `fired[-1] == src_size`; without
+  callback the `shutil.move` fast path runs.
+- Cross-fs FILE cancel mid-copy: source intact, partial dst
+  cleaned, FAILED("cancelled") message.
+- Cross-fs FILE unlink failure: source still exists, dst exists,
+  FAILED("unlink source after copy: …") message.
+- Cross-fs SYMLINK: target read + recreated + source unlinked,
+  no bytes fired.
+- Cross-fs DIR: keeps `shutil.move`, no bytes fired (documents
+  the known gap as a test invariant rather than a footnote).
+- `apply_plan` threading: callback reaches `_native_move` via
+  `_apply_item`'s MOVE branch.
+- Queue integration: `OperationQueue(registry=…).start()` +
+  `enqueue(plan)` + `wait_until_idle()` drains correctly for a
+  cross-fs move.
+
+### Bug en route
+
+The first cut of the queue-integration test called
+`OperationQueue()` and `await queue.start(registry)` — wrong
+signature (registry is a positional kwarg on `__init__`; `start`
+is sync). And one test asserted `src.stat().st_size` after the
+move had already unlinked the source. Both caught by the first
+test-file run; fixed in-place; no more failures after.
+
+### Mount fights
+
+One Edit-truncation on the test file at line 438 (the file ended
+mid-`assert`); recovered via the same heredoc-rebuild-then-cp
+recipe. Confirmed once more: the Edit tool is unsafe on this
+mount for any non-trivial change; default to heredoc + `cp /tmp`
+for everything that isn't a one-line tweak.
+
+### Results
+
+525 → **536 / 536** green. Five batches: 107 + 84 + 156 + 134 +
+55 = 536 across all 42 test files (was 41; +1 for
+`tests/test_move_chunk_hook.py`).
+
+### Notes for next session
+
+The progress-dialog story is now feature-complete for the common
+case. Files of any size, cross-fs or same-fs, render proper
+`Rate` / `Drag` with `[Ctrl+P]` resume support. The remaining
+ops/queue-era follow-ups:
+
+- **Cross-fs dir moves with walked progress** — the documented
+  gap from today's pass. Recursive walker, per-file callback that
+  accumulates `bytes_done` across the PlanItem's contained files,
+  mid-walk cancel handling, mid-dir error continuation. Real
+  code but well-scoped.
+- **Mid-plan cancel token in `apply_plan`** — the queue's
+  `request_cancel()` flag is read by `_chunked_copy` per chunk
+  but the executor's per-item loop doesn't currently honor it
+  between items. Means a cancel during a 50-file plan finishes
+  the current item and the rest of the plan; user expected
+  cancel to take effect ASAP.
+- **Plan-time conflict detection** — pre-stat destinations, tag
+  each PlanItem with overwrite/skip/rename, surface in modal.
+  The bigger v0.x item Matthew flagged earlier.
+- **Cross-platform `dst_path` normalisation** — small but
+  specific; needs the cross-source pair test matrix.
+
+Reasonable next pickup: mid-plan cancel token. Small, closes a
+real user expectation gap, falls naturally out of the existing
+`request_cancel` infrastructure.
+
+
+## 2026-05-26 (third pass) — Mid-plan cancellation in apply_plan
+
+### What landed
+
+Cancel now stops the rest of the plan, not just the in-flight
+item. Before this pass, hitting Esc on a 50-file copy would cancel
+the file currently being copied (via the chunk-callback returning
+False) but the other 49 items would keep running because the
+per-item loop in `apply_plan` never consulted `_cancel_requested`.
+
+`apply_plan` grew an optional `is_cancelled: Callable[[], bool]`
+parameter. The per-item loop polls it at the top of each
+iteration. Once it returns True, every remaining `PlanItem`
+short-circuits to `ItemStatus.SKIPPED` with message `"cancelled"`.
+
+The queue's `_run` wires the closure:
+
+```python
+def _is_cancelled() -> bool:
+    return self._cancel_requested
+
+result = await apply_plan(
+    plan, self._registry,
+    progress=_progress,
+    bytes_progress=_bytes_progress,
+    is_cancelled=_is_cancelled,
+)
+```
+
+The progress callback still fires for each skipped item so the
+dialog's items counter stays consistent with `len(plan.items)`.
+The bytes-progress accounting in the queue's `_progress` closure
+only credits SUCCESS items, so the bar doesn't lie about what
+landed.
+
+### Status split (load-bearing decision)
+
+Two ways an item can be "cancelled":
+
+- **In-flight** — the chunk callback returned False mid-copy.
+  `_chunked_copy` cleaned the partial dst, source intact. Item
+  ends `FAILED("cancelled")`.
+- **Not yet started** — `is_cancelled()` returned True before
+  the per-item dispatch ran. Item ends `SKIPPED("cancelled")`.
+
+The semantic distinction is real: one we tried and lost work on,
+the other we never attempted. `OperationResult.summary()`
+already breaks out `N ok M skipped K failed` so the difference
+surfaces in the toast without any UI changes. A 50-file plan
+cancelled at item 5 shows: `Copy done: 4 ok 45 skipped 1 failed`.
+
+A future unified `ItemStatus.CANCELLED` is on the table for a
+later refactor — it'd collapse the two cancelled-buckets into one
+and let the summary read `Copy cancelled: 4 of 50 done`. Not
+worth the enum-churn-across-base.py-and-callers cost this pass.
+
+### Pre-item, not mid-item
+
+The check runs *before* each `_apply_item` call. That's the
+clean boundary: once cancel fires, no new items start. Mid-item
+cancellation (the chunk callback returning False path) is
+already wired and remains the only way to stop work *inside* an
+item. The two layers don't overlap — pre-item handles the loop
+boundary, mid-item handles the file boundary.
+
+### Surfaces touched
+
+- `wtree/ops/execute.py` — `apply_plan` signature + docstring +
+  per-item loop. `_apply_item` untouched.
+- `wtree/ops/queue.py` — `_run` constructs `_is_cancelled`
+  closure and passes it as the new kwarg.
+- `design.md` — new "Mid-plan cancellation" paragraph under
+  Progress dialog → Cancellation; new decision-log row.
+
+No widget changes. No menu / help / status-line changes. The
+dialog reads queue state via its existing poll loop; nothing
+about the visible UI moved.
+
+### Tests
+
+`tests/test_midplan_cancel.py` — 8 new tests:
+
+- Signature: `is_cancelled` is an optional kwarg, default None.
+- `is_cancelled` returning False always: behaviour matches the
+  no-cancel path (regression guard); closure is polled once per
+  item.
+- Cancel before first item: all items SKIPPED("cancelled"), no
+  SUCCESS, no files copied.
+- Cancel mid-plan: items 0..N succeed, N+1..end SKIPPED, file
+  landings match the SUCCESS/SKIPPED split.
+- Per-item progress callback fires for every item (SUCCESS and
+  SKIPPED both) — the dialog's items counter relies on this.
+- `OperationResult.summary()` surfaces "2 skipped" alongside
+  "2 ok" for a cancel-after-2-items run.
+- Queue integration: `request_cancel()` from inside
+  `on_item_progress` after the first SUCCESS drains the rest of
+  the plan to SKIPPED; `queue.completed[0]` reflects the partial
+  state.
+- Cancel flag resets between plans: plan-1 cancelled mid-flight,
+  plan-2 queued behind it runs clean (verifies the existing
+  `_cancel_requested = False` reset at plan start).
+
+### Bug en route
+
+The cancel-flag-resets-between-plans test originally tried to
+re-stage files in subdirs via `_make_copy_plan(tmp_path / "p1",
+…)` without mkdir'ing the parent first. The helper assumed the
+parent exists. Fixed by mkdir'ing each plan's parent dir
+explicitly before staging. One-line fix; no surprises.
+
+### Cleanup
+
+Caught a deprecation warning while running batches:
+`SyntaxWarning: invalid escape sequence '\\\`'` in
+`action_show_progress`'s docstring (from the minimize-resume
+session — I'd used `\\\`m\\\`` thinking it was Rich-markup, but it's a
+Python string literal). Switched to `\`\`m\`\`` (RST inline code) to
+match the rest of the docstring's style. Verified with
+`python3 -W error::DeprecationWarning -c "from wtree.app import
+WTreeApp"`.
+
+### Mount fights
+
+Zero this session. Every file write went through the heredoc +
+cp pattern by default; no Edits, no recovery passes. Byte-size
+checks all matched on first attempt.
+
+### Results
+
+536 → **544 / 544** green. Five batches: 115 + 84 + 156 + 134 +
+55 = 544 across all 43 test files (was 42; +1 for
+`tests/test_midplan_cancel.py`).
+
+The known-flaky `test_flash_clears_after_timeout` flaked once
+mid-batch (sandbox load vs 50ms flash timeout); reran clean in
+isolation as documented in [[feedback-wtree-mount-rules]].
+
+### Notes for next session
+
+Cancel is now feature-complete. The remaining ops/queue-era
+follow-ups from `todo.md`:
+
+- **Cross-fs dir moves with walked progress** — the documented
+  gap from the move-chunk-hook session. Recursive walker,
+  per-file callback that accumulates bytes_done across a
+  PlanItem's contained files, mid-walk cancel handling,
+  mid-dir error continuation.
+- **Plan-time conflict detection** — pre-stat destinations, tag
+  each PlanItem with overwrite/skip/rename, surface in modal.
+  The bigger v0.x item Matthew flagged earlier.
+- **Cross-platform `dst_path` normalisation** — small but
+  specific; needs the cross-source pair test matrix.
+- **`Plan.apply` shorthand** vs free function — ergonomics call.
+
+Reasonable next pickup: plan-time conflict detection. Chunky but
+well-scoped, and it's the last big UX gap before the overwrite
+policy can land. Or the cross-fs dir walked-progress for a
+smaller, more contained session.

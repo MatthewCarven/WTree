@@ -104,6 +104,7 @@ MENUS: tuple[Menu, ...] = (
             MenuItem("Next match", "n", "Ctrl+G", "next_match"),
             MenuItem("Log new source", "l", "L", "log_new_source"),
             MenuItem("Refresh source", "r", "Ctrl+R", "refresh_source"),
+            MenuItem("Progress dialog", "p", "Ctrl+P", "show_progress"),
             MenuItem("Untag all", "u", "Ctrl+U", "untag_all"),
         ),
     ),
