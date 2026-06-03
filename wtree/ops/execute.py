@@ -53,6 +53,7 @@ from wtree.ops.base import (
     OperationResult,
     Plan,
     PlanItem,
+    Resolution,
 )
 from wtree.sources.base import EntrySource, Kind
 
@@ -223,6 +224,28 @@ def _normalise_dst(dst_path: str) -> str:
     return os.path.normpath(dst_path) if os.sep == "\\" else dst_path
 
 
+def _remove_existing_blocking(dst: str) -> None:
+    """Remove whatever currently occupies ``dst`` (the OVERWRITE pre-step).
+
+    Synchronous - call via :func:`asyncio.to_thread`. Symlinks are unlinked
+    (never followed - we remove the link, not its target); real directories
+    are recursively removed; everything else is unlinked. A ``dst`` that no
+    longer exists is a silent no-op (a benign TOCTOU race - the obstacle
+    cleared itself).
+
+    Used only when a :class:`PlanItem` carries ``Resolution.OVERWRITE``;
+    the conflict was detected at plan time and the user explicitly chose to
+    replace. "Replace, not merge" - see ``design.md`` -> Conflict resolution
+    dialog.
+    """
+    if os.path.islink(dst):
+        os.unlink(dst)
+    elif os.path.isdir(dst):
+        shutil.rmtree(dst)
+    elif os.path.lexists(dst):
+        os.unlink(dst)
+
+
 # ---------------------------------------------------------------------------
 # Native -> native copy
 # ---------------------------------------------------------------------------
@@ -250,6 +273,13 @@ async def _native_copy(
     """
     src = item.src_path
     dst = _normalise_dst(item.dst_path)
+
+    # OVERWRITE pre-step: clear whatever's in the way so the copy lands on a
+    # clean destination. Needed for type-mismatch collisions (dir onto an
+    # existing file, file onto an existing dir); a file-onto-file overwrite
+    # would clobber anyway, but removing first keeps the behaviour uniform.
+    if item.resolution is Resolution.OVERWRITE:
+        await asyncio.to_thread(_remove_existing_blocking, dst)
 
     if item.kind is Kind.DIR:
         await asyncio.to_thread(os.makedirs, dst, exist_ok=True)
@@ -449,13 +479,19 @@ async def _native_move(
                 ),
             )
 
-    # Guard against shutil.move's "move INTO existing directory" mode.
+    # Guard against shutil.move's "move INTO existing directory" mode. When
+    # the user resolved the plan-time conflict with OVERWRITE, clear the
+    # destination first (replace semantics); otherwise an existing dst is a
+    # TOCTOU race that arrived after planning - fail it.
     if await asyncio.to_thread(os.path.lexists, dst):
-        return ItemResult(
-            item=item,
-            status=ItemStatus.FAILED,
-            message=f"destination already exists: {dst}",
-        )
+        if item.resolution is Resolution.OVERWRITE:
+            await asyncio.to_thread(_remove_existing_blocking, dst)
+        else:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"destination already exists: {dst}",
+            )
 
     if item.kind is Kind.OTHER:
         return ItemResult(
@@ -617,14 +653,19 @@ async def _native_rename(item: PlanItem) -> ItemResult:
     dst = _normalise_dst(item.dst_path)
 
     # The planner already verified dst_path stays in the same parent as
-    # src_path - we don't need to mkdir anything. But pre-check
-    # collision so we don't silently clobber.
+    # src_path - we don't need to mkdir anything. But pre-check collision so
+    # we don't silently clobber. OVERWRITE (chosen at plan time) clears the
+    # destination first; otherwise an existing dst is a post-plan TOCTOU
+    # race and we fail rather than destroy.
     if await asyncio.to_thread(os.path.lexists, dst):
-        return ItemResult(
-            item=item,
-            status=ItemStatus.FAILED,
-            message=f"destination already exists: {dst}",
-        )
+        if item.resolution is Resolution.OVERWRITE:
+            await asyncio.to_thread(_remove_existing_blocking, dst)
+        else:
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"destination already exists: {dst}",
+            )
 
     await asyncio.to_thread(os.rename, src, dst)
     return ItemResult(item=item, status=ItemStatus.SUCCESS)

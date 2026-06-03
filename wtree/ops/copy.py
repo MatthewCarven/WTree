@@ -26,6 +26,7 @@ from wtree.ops.base import (
     WalkedEntry,
     WalkSummary,
 )
+from wtree.ops.conflicts import annotate_conflicts
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.tagged_set import Tag
 
@@ -146,7 +147,8 @@ async def plan_copy(
                 )
             )
 
-    return Plan(kind=OperationKind.COPY, items=items, errors=walk.errors)
+    plan = Plan(kind=OperationKind.COPY, items=items, errors=walk.errors)
+    return await annotate_conflicts(plan, registry)
 
 
 # ---------------------------------------------------------------------------

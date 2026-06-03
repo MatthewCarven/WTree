@@ -52,16 +52,19 @@ from textual.widgets import DataTable, Header, Tree
 from wtree import __version__
 from wtree.editor import launch_editor_blocking, resolve_editor
 from wtree.ops import (
+    ConflictKind,
     ItemResult,
     OperationKind,
     OperationQueue,
     OperationResult,
     Plan,
+    Resolution,
     plan_copy,
     plan_delete,
     plan_make_new,
     plan_move,
     plan_rename,
+    resolve_conflicts,
     select_range_for_rename,
 )
 from wtree.ops.queue import (
@@ -73,6 +76,7 @@ from wtree.sources.base import EntrySource, Kind
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag, TaggedSet
 from wtree.widgets.confirm import ConfirmDialog
+from wtree.widgets.conflict import ConflictDialog
 from wtree.widgets.contents_pane import ContentsPane
 from wtree.widgets.help import HelpScreen
 from wtree.widgets.keybar import KeyBar
@@ -82,6 +86,7 @@ from wtree.widgets.menu_screen import MenuScreen
 from wtree.widgets.progress_screen import ProgressScreen
 from wtree.widgets.prompt import PromptDialog
 from wtree.widgets.scan_screen import (
+    SCAN_CHUNK_SIZE,
     SCAN_MODAL_DELAY_SECONDS,
     ScanContext,
     ScanScreen,
@@ -436,14 +441,63 @@ class WTreeApp(App):
         isn't walked. ScanErrors on subdirectories are silently
         skipped per the errors-as-data principle (design.md): a
         permission-denied branch doesn't abort the whole gesture.
+
+        Feedback (2026-06-03): the subtree walk runs under the
+        scan-dialog gate (:meth:`_run_scan_with_dialog`) so a large
+        subtree surfaces a live "Tagging N..." modal after the
+        delayed-show threshold instead of freezing silently. The walk
+        is chunked (``await asyncio.sleep(0)`` every
+        ``SCAN_CHUNK_SIZE`` entries) so Textual paints frames during
+        it, and Esc leaves the tagged set untouched - the mutation is
+        applied only after an un-cancelled completion (atomic commit,
+        mirroring the contents pane's atomic commit on scan cancel).
+        See design.md -> User interface -> Scan dialog.
         """
         path = event.path
         sid = self._source.source_id
         currently_tagged = self.tagged_set.contains(sid, path)
+        header = "Untagging" if currently_tagged else "Tagging"
+        await self._run_scan_with_dialog(
+            path,
+            self._source,
+            lambda ctx: self._recursive_tag_walk(
+                path, sid, currently_tagged, ctx
+            ),
+            header=header,
+        )
 
+    async def _recursive_tag_walk(
+        self,
+        path: str,
+        sid: str,
+        currently_tagged: bool,
+        ctx: ScanContext,
+    ) -> None:
+        """Walk the subtree under ``path`` and toggle its tagged state.
+
+        The ``do_work`` body for the recursive-tag scan-dialog gate.
+        Consumes :meth:`_walk_subtree` in ``SCAN_CHUNK_SIZE`` chunks,
+        writing ``ctx.entries_seen`` (drives the live "Tagging N..."
+        count) and polling ``ctx.cancelled`` so the dialog paints and
+        Esc responds. **Atomic commit**: the tagged-set mutation runs
+        only after the walk completes un-cancelled, so Esc leaves the
+        set untouched - mirroring ``ContentsPane.show_path``'s atomic
+        commit on scan cancel. Exposed as a named method (not an inline
+        closure) so tests can drive it with a pre-cancelled ctx, the
+        same way the scan-dialog tests drive ``show_path(ctx=...)``.
+        """
         pairs: list[tuple[str, str]] = []
+        count = 0
         async for sub in self._walk_subtree(path):
             pairs.append((sid, sub))
+            count += 1
+            ctx.entries_seen = count
+            if count % SCAN_CHUNK_SIZE == 0:
+                if ctx.cancelled.is_set():
+                    return
+                await asyncio.sleep(0)
+        if ctx.cancelled.is_set():
+            return
 
         if currently_tagged:
             delta = self.tagged_set.remove_many(pairs)
@@ -571,6 +625,10 @@ class WTreeApp(App):
             err = plan.errors[0]
             self.flash(f"Rename: {err.message}")
             self.last_plan = plan
+            return
+
+        plan = await self._resolve_plan_conflicts(plan, "Rename")
+        if plan is None:
             return
 
         self._finalise_plan(plan, [tag], "Rename", destination_path=None)
@@ -742,7 +800,38 @@ class WTreeApp(App):
 
         destination = Tag(source_id=self._source.source_id, path=typed)
         plan = await planner(tags, destination, self.sources)
+        plan = await self._resolve_plan_conflicts(plan, verb)
+        if plan is None:
+            return
         self._finalise_plan(plan, tags, verb, destination_path=destination.path)
+
+    async def _resolve_plan_conflicts(
+        self, plan: Plan, verb: str
+    ) -> Plan | None:
+        """Surface plan-time conflicts and fold the user's choices back in.
+
+        Returns the plan to enqueue - unchanged if nothing collided, or
+        rebuilt by :func:`resolve_conflicts` once the user has chosen
+        per-conflict resolutions. Returns ``None`` (and flashes) when the
+        user cancels the whole operation in :class:`ConflictDialog`, or when
+        every conflicting item was skipped leaving nothing to do.
+
+        See ``design.md`` -> User interface -> Conflict resolution dialog.
+        """
+        conflicts = [
+            i for i in plan.items if i.conflict is not ConflictKind.NONE
+        ]
+        if not conflicts:
+            return plan
+        resolutions = await self.push_screen_wait(ConflictDialog(conflicts))
+        if resolutions is None:
+            self.flash(f"{verb}: cancelled.")
+            return None
+        resolved = await resolve_conflicts(plan, resolutions, self.sources)
+        if not resolved.items:
+            self.flash(f"{verb}: nothing to do (all conflicts skipped).")
+            return None
+        return resolved
 
     async def _plan_confirm_enqueue(
         self,
@@ -1355,6 +1444,8 @@ class WTreeApp(App):
         path: str,
         source: EntrySource,
         do_work: Callable[[ScanContext], Awaitable[None]],
+        *,
+        header: str = "Scanning",
     ) -> None:
         """Run ``do_work(ctx)`` under the scan-dialog gate.
 
@@ -1388,7 +1479,9 @@ class WTreeApp(App):
         on Enter into a big dir; ``Ctrl+F`` find-across-tree's walker.
         """
         ctx = ScanContext(
-            path=path, method_label=source.scan_method_label
+            path=path,
+            method_label=source.scan_method_label,
+            header=header,
         )
 
         def _push_if_still_running() -> None:

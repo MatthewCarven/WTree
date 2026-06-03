@@ -82,6 +82,7 @@ class ScanContext:
 
     path: str
     method_label: str
+    header: str = "Scanning"
     entries_seen: int = 0
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     completed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -200,7 +201,7 @@ class ScanScreen(ModalScreen[None]):
     # --- text builders ---------------------------------------------------
 
     def _header_text(self) -> str:
-        return "Scanning"
+        return self._ctx.header
 
     def _body_text(self) -> str:
         """Three lines: path, "via <method_label>", live entry count.

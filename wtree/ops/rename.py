@@ -37,6 +37,7 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
 )
+from wtree.ops.conflicts import annotate_conflicts
 from wtree.sources.base import EntrySource, Kind, ScanError
 from wtree.tagged_set import Tag
 
@@ -187,7 +188,8 @@ async def plan_rename(
         kind=entry.kind,
         size=entry.size,
     )
-    return Plan(kind=OperationKind.RENAME, items=[item], errors=errors)
+    plan = Plan(kind=OperationKind.RENAME, items=[item], errors=errors)
+    return await annotate_conflicts(plan, registry)
 
 
 def _basename(path: str) -> str:

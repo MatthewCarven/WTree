@@ -20,6 +20,8 @@ Layout:
 * ``make_new.py`` - the make-new planner (plan_make_new; NO tags,
   parent + name + kind, lenient subdir creation, executor uses
   ``os.makedirs`` or ``open(path, "x")``)
+* ``conflicts.py`` - plan-time conflict detection (annotate_conflicts)
+  and the resolution transform (resolve_conflicts)
 * ``execute.py`` - the apply_plan dispatcher (native->native in v0)
 * ``queue.py`` - serialised :class:`OperationQueue` (one plan at a time,
   background worker, callbacks for UI updates)
@@ -35,6 +37,7 @@ Make-new is no-tags, no-source - see ``make_new.py`` docstring.
 """
 
 from wtree.ops.base import (
+    ConflictKind,
     ItemResult,
     ItemStatus,
     OperationKind,
@@ -42,9 +45,11 @@ from wtree.ops.base import (
     Plan,
     PlanError,
     PlanItem,
+    Resolution,
     WalkSummary,
     WalkedEntry,
 )
+from wtree.ops.conflicts import resolve_conflicts, suffixed_name
 from wtree.ops.copy import plan_copy, walk_tags
 from wtree.ops.delete import plan_delete
 from wtree.ops.execute import apply_plan
@@ -54,6 +59,7 @@ from wtree.ops.queue import OperationQueue
 from wtree.ops.rename import plan_rename, select_range_for_rename
 
 __all__ = [
+    "ConflictKind",
     "ItemResult",
     "ItemStatus",
     "OperationKind",
@@ -62,6 +68,7 @@ __all__ = [
     "Plan",
     "PlanError",
     "PlanItem",
+    "Resolution",
     "WalkSummary",
     "WalkedEntry",
     "apply_plan",
@@ -70,6 +77,8 @@ __all__ = [
     "plan_make_new",
     "plan_move",
     "plan_rename",
+    "resolve_conflicts",
     "select_range_for_rename",
+    "suffixed_name",
     "walk_tags",
 ]

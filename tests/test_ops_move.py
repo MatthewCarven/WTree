@@ -218,6 +218,13 @@ async def test_action_move_uses_cursor_when_no_tags(
         assert isinstance(app.screen, PromptDialog)
         await pilot.press("enter")
         await pilot.pause()
+        # Destination collides (copying/moving into the item's own dir);
+        # the conflict dialog appears - overwrite-all keeps every item.
+        from wtree.widgets.conflict import ConflictDialog
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("O")
+        await pilot.press("enter")
+        await pilot.pause()
         await pilot.pause()
     assert app.last_plan is not None
     assert app.last_plan.kind is OperationKind.MOVE
@@ -240,6 +247,13 @@ async def test_action_move_uses_tagged_set_when_present(
         assert len(app.tagged_set) == 2
         await pilot.press("m")
         await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        # Destination collides (copying/moving into the item's own dir);
+        # the conflict dialog appears - overwrite-all keeps every item.
+        from wtree.widgets.conflict import ConflictDialog
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("O")
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()

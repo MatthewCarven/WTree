@@ -4783,3 +4783,185 @@ queue:
 Same recommendation as last session: plan-time conflict
 detection is the chunkier-but-load-bearing one; cross-fs dir
 walked-progress is the smaller alternative.
+
+## 2026-06-03 — Plan-time conflict detection + resolution
+
+Took the chunky-but-load-bearing v0.x item off the queue: conflicts are
+now detected when the plan is built, surfaced in a per-conflict modal,
+and resolved by transforming the plan before it enqueues. Replaces the
+old three-way inconsistency where Move/Rename hard-failed on an existing
+destination and Copy silently clobbered files / merged directories.
+
+Design conversation up front (per the project's design-first rule). Three
+forks settled with Matthew via the question tool: detect **per-leaf**
+(not just top-level), resolve **per-conflict** (not one policy for the
+whole plan), and ship **Skip + Overwrite + Rename** (the full set). The
+maximal combination, which created one genuinely sharp case I had to
+resolve coherently before writing anything down — see below. Committed to
+`design.md` as a new "Conflict resolution dialog" subsection plus a
+dated decision-log row.
+
+### The benign-merge insight
+
+Per-leaf detection on Copy's flattened model threatened a nasty cascade:
+if a tagged directory's destination already exists and the user picks
+Skip/Rename, every descendant item has to follow. The thing that made it
+tractable: for COPY, a directory landing on an existing directory is
+**not a conflict** — that's the merge that already works correctly. Only
+leaf file/other collisions and *type-mismatches* (copying a dir onto an
+existing file) are blocking. So every blocking conflict sits on a
+childless leaf — except the rare type-mismatch dir, which still cascades
+by path-prefix and is the only place the cascade code runs. Move/Rename
+emit one item per tag, so any existing dst is blocking and the cascade is
+moot there.
+
+### What landed
+
+- **`ops/base.py`**: `ConflictKind` (NONE/FILE/DIR/OTHER) and `Resolution`
+  (PROCEED/SKIP/OVERWRITE/RENAME) enums; two new defaulted `PlanItem`
+  fields (`conflict`, `resolution`) so the undo-log wire format and old
+  call sites are unaffected.
+- **`ops/conflicts.py`** (new): `annotate_conflicts` (stats each item's
+  dst via `entry_at`, applies the benign-merge rule), `suffixed_name`
+  (extension-aware ` (n)` insertion, same last-`.X` rule as the rename
+  smart cursor), and `resolve_conflicts` (the plan transform — Skip drops
+  item + dir descendants by prefix, Rename rewrites to a collision-free
+  name and cascades the prefix, Overwrite tags for the executor).
+- **Planners** (`copy`/`move`/`rename`): one line each at the tail —
+  `return await annotate_conflicts(plan, registry)`.
+- **`ops/execute.py`**: new `_remove_existing_blocking` (unlink/rmtree);
+  the Move and Rename `lexists` guards now fail only when the dst exists
+  *and* resolution isn't OVERWRITE (they're TOCTOU race-nets now);
+  OVERWRITE pre-removes the dst (replace, not merge). Copy's file
+  overwrite already clobbered; its type-mismatch dir overwrite pre-removes
+  the blocking file.
+- **`widgets/conflict.py`** (new): `ConflictDialog` — one row per
+  conflict, default Skip, `s/o/r` set the current row, `S/O/R` set all,
+  Enter commits the `list[Resolution]`, Esc cancels the whole op.
+- **`app.py`**: `_resolve_plan_conflicts` helper wired into
+  `_plan_modal_enqueue` (Copy/Move) and `action_rename`; empty-after-skip
+  flashes "nothing to do" rather than enqueuing a no-op.
+
+### Mount fights (again)
+
+The flaky project mount truncated writes badly this session — worse than
+usual. File-tool Edits to `base.py`, `move.py`, `rename.py`, `app.py` and
+`ops/__init__.py` all landed corrupted (mid-docstring truncation, often
+in regions I hadn't even touched). `git` itself was unreliable too — an
+`index.lock` unlink came back "Operation not permitted". The recovery
+that worked: stop trusting live disk state, pull clean baselines via
+`git show HEAD:<path>`, re-apply every edit in `/tmp` with a Python script
+that asserts each anchor is unique and `ast.parse`s the result, then
+`cp` into place and verify byte-for-byte with `wc -c`. The
+`feedback_wtree_mount_rules` protocol earned its keep; the new wrinkle is
+that the corruption hits *collateral* regions, so size+parse verification
+after every single write is non-negotiable, not just on suspect files.
+
+### Two pre-existing tests changed (legitimately)
+
+`test_action_copy/move_uses_cursor/tagged_set` accept the default
+destination, which is the item's *own directory* — so dst == src and the
+new detector correctly fires a conflict where the old code silently
+overwrote a file with itself. Updated the four to drive the dialog
+(Overwrite-all, which preserves every item) so they still assert the same
+plan shape. Bonus: free integration coverage of the dialog inside the
+existing op test files.
+
+### Results
+
+545 → **579 / 579** green. 34 new tests in `tests/test_conflicts.py`:
+detection across copy/move/rename incl. benign-merge and type-mismatch;
+`suffixed_name` parametrised; `resolve_conflicts` skip/overwrite/rename
+incl. dir cascade and the length-mismatch guard; executor OVERWRITE on
+real files/dirs/rename/copy/type-mismatch plus the no-overwrite race-net;
+`ConflictDialog` state machine; and three e2e app-wiring tests
+(overwrite-all, skip-all-does-nothing, Esc-cancels).
+
+### Notes for next session
+
+- **Same-directory operations.** Copying/moving an entry into its own
+  directory now always conflicts (dst == src). Overwrite on a *move*
+  onto self is nonsensical (it would rmtree the source). A dedicated
+  "same-dir / src==dst" check at plan time — no-op for move, auto-suffix
+  for copy (the Finder "copy 2" idiom) — would be friendlier. Parked on
+  `todo.md`.
+- **Make-new** still uses its own exclusive-create path; folding it into
+  the conflict flow is parked.
+- Remaining v0.x queue items untouched: cross-fs dir walked-progress,
+  cross-platform `dst_path` normalisation, `Plan.apply` shorthand,
+  persist queue state.
+
+## 2026-06-03 (later) — Recursive-tag scan-dialog feedback + cancellation
+
+Matthew pressed Space on a folder and noticed no progress box appeared
+before the worker started churning — "we don't have a delayed feedback
+handler in there?" Correct. The tree-pane recursive tag/untag walk
+(`on_tree_pane_tag_requested` → `_walk_subtree`) was `@work` so it didn't
+hard-freeze the app, but it had **no feedback surface at all**: it
+accumulated the whole subtree into a list and flashed a single count at
+the end — no in-flight count, no cancel. Two open `todo.md` items
+(recursive-tag progress feedback + cancellation).
+
+### Root cause was twofold
+
+Not just the missing dialog. `_walk_subtree` consumes
+`self._source.scan()`, which yields *synchronously* between `os.scandir`
+calls, and the consume loop had **no `await asyncio.sleep(0)`**. That's
+the same load-bearing chunked-consume trap the scan dialog hit back on
+2026-05-25: without yielding, Textual gets no paint frames during the
+walk, so even if we'd pushed a dialog it wouldn't have rendered until the
+walk already finished. So nothing would have popped up regardless. Both
+halves had to be fixed together.
+
+### Design call (Matthew picked "reuse the scan dialog")
+
+Offered three shapes via the question tool: reuse the existing ScanScreen
+gate, a lightweight periodic status-line flash, or just-diagnose. He took
+the consistent option — reuse `_run_scan_with_dialog`. Committed to
+`design.md` (Scan dialog → new surface bullet + configurable-header note,
+plus a decision-log row).
+
+### What landed
+
+- **`ScanContext.header`** — new defaulted field (`"Scanning"`). `ScanScreen._header_text` now returns `self._ctx.header` instead of a hardcoded literal.
+- **`_run_scan_with_dialog(..., *, header="Scanning")`** — threads the header into the ctx it builds. Navigation surfaces unchanged (default); the tag walk passes `"Tagging"` / `"Untagging"` so the modal names the actual operation. Body line still reads `via os.scandir`.
+- **`on_tree_pane_tag_requested`** now computes the header and runs the walk under the gate.
+- **`_recursive_tag_walk(path, sid, currently_tagged, ctx)`** — extracted as a *named method* (not an inline closure) so tests can drive it with a pre-cancelled ctx exactly the way the scan-dialog tests drive `show_path(ctx=...)`. Consumes `_walk_subtree` in `SCAN_CHUNK_SIZE` chunks, writes `ctx.entries_seen`, polls `ctx.cancelled`, and applies the tagged-set mutation **only after an un-cancelled completion** (atomic commit — Esc leaves the set untouched, mirroring the contents pane's atomic commit on scan cancel).
+
+### design.md was found truncated — recovered
+
+While going to add the design note I discovered the mount had **truncated
+`design.md` during the earlier conflict-detection session**: the decision
+log was cut off mid-row at the 2026-05-25 rename-smart-cursor entry, and
+everything after it — the three 2026-05-26 rows, my 2026-06-03
+conflict-detection row, *and the entire "Open questions" section* — was
+gone. The "### Conflict resolution dialog" subsection edit had landed but
+its sibling decision-log row hadn't, and the write had eaten collateral
+content. Recovered by rebuilding from `git show HEAD:design.md` (clean
+416-line baseline), re-applying the conflict subsection + row **and** the
+new recursive-tag edits via an anchor-asserting Python script, then
+byte-verifying. Lesson reinforced (now in [[feedback-wtree-mount-rules]]
+rule 16): after any design.md write this session, grep for the tail
+section (`## Open questions`) to confirm the file wasn't truncated — a
+"successful" markdown write can silently drop everything past the edit.
+
+### Results
+
+579 → **587 / 587** green. 8 new tests in
+`tests/test_recursive_tag_feedback.py`: `ScanContext.header` default +
+custom, `ScanScreen` rendering the custom header, `_recursive_tag_walk`
+tagging / untagging a subtree with `entries_seen` written, the
+atomic-commit guarantee under a pre-cancelled ctx for both tag and untag,
+and a handler-wiring test (monkeypatched gate) asserting the header is
+`"Tagging"` then `"Untagging"` across two Space presses. Full suite
+re-run in chunks, all green.
+
+### Notes for next session
+
+- The lightweight periodic-flash alternative is now moot (the modal
+  covers it). The "future unified `BackgroundOperationScreen[T]`"
+  (ScanScreen + ProgressScreen + Properties' recursive-total placeholder)
+  is still the natural next consolidation if these three surfaces keep
+  growing parallel features.
+- Conflict-detection follow-ups from earlier today still parked: same-dir
+  `src==dst` handling, folding Make-new into the conflict flow.

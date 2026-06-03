@@ -34,6 +34,50 @@ class OperationKind(str, Enum):
     MAKE_NEW = "make_new"
 
 
+class ConflictKind(str, Enum):
+    """What already occupies a :class:`PlanItem`'s destination at plan time.
+
+    Set by the planners (``plan_copy`` / ``plan_move`` / ``plan_rename``)
+    from a pre-stat of ``dst_path``. ``NONE`` means the destination is free
+    (the common case); the others describe the *kind* of the existing entry
+    so the conflict dialog can show "(existing: file)" vs "(existing: dir)"
+    and the resolution transform can reason about replace semantics.
+
+    String values are stable wire format for the future undo log.
+
+    See ``design.md`` -> User interface -> Conflict resolution dialog. Note
+    the *benign-merge rule*: for COPY a directory landing on an existing
+    directory is deliberately left ``NONE`` - directory merge is correct
+    existing behaviour, not a conflict. Only leaf file/other collisions and
+    type-mismatches are flagged.
+    """
+
+    NONE = "none"
+    FILE = "file"
+    DIR = "dir"
+    OTHER = "other"
+
+
+class Resolution(str, Enum):
+    """How a conflicting :class:`PlanItem` should be applied.
+
+    Default ``PROCEED`` covers both "no conflict" and "conflict cleared by
+    rename". The conflict dialog produces ``SKIP`` / ``OVERWRITE`` /
+    ``RENAME`` choices which :func:`wtree.ops.conflicts.resolve_conflicts`
+    bakes into the plan: ``SKIP`` items are dropped before the executor sees
+    them, ``RENAME`` rewrites ``dst_path`` and resets to ``PROCEED``, and
+    only ``OVERWRITE`` survives into the executor as a live signal to replace
+    the existing destination.
+
+    String values are stable wire format for the future undo log.
+    """
+
+    PROCEED = "proceed"
+    SKIP = "skip"
+    OVERWRITE = "overwrite"
+    RENAME = "rename"
+
+
 @dataclass(frozen=True, slots=True)
 class WalkedEntry:
     """One leaf of a tag-tree walk - file or directory, source-side only.
@@ -81,6 +125,12 @@ class PlanItem:
     dst_path: str
     kind: Kind
     size: int
+    # Plan-time conflict state. ``conflict`` is set by the planner from a
+    # pre-stat of ``dst_path``; ``resolution`` is set by the conflict
+    # dialog's resolution transform and read by the executor. Both default
+    # so older call sites and the undo-log wire format stay unaffected.
+    conflict: ConflictKind = ConflictKind.NONE
+    resolution: Resolution = Resolution.PROCEED
 
 
 @dataclass

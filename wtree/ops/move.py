@@ -30,6 +30,7 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
 )
+from wtree.ops.conflicts import annotate_conflicts
 from wtree.sources.base import EntrySource, ScanError
 from wtree.tagged_set import Tag
 
@@ -109,7 +110,8 @@ async def plan_move(
             )
         )
 
-    return Plan(kind=OperationKind.MOVE, items=items, errors=errors)
+    plan = Plan(kind=OperationKind.MOVE, items=items, errors=errors)
+    return await annotate_conflicts(plan, registry)
 
 
 def _basename(path: str) -> str:
