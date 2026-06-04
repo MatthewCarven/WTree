@@ -122,9 +122,11 @@ async def test_e2e_make_new_prompt_cancel_no_op(tmp_path: Path) -> None:
     assert app.last_plan is None
 
 
-async def test_e2e_make_new_clobber_refused(tmp_path: Path) -> None:
-    """Trying to make a dir that already exists surfaces a PlanError
-    and doesn't touch the existing entry."""
+async def test_e2e_make_new_clobber_skip_keeps_original(tmp_path: Path) -> None:
+    """Make-new onto an existing dir surfaces ConflictDialog; Skip (the
+    default) leaves the existing entry untouched and enqueues nothing."""
+    from wtree.widgets.conflict import ConflictDialog
+
     (tmp_path / "exists").mkdir()
     (tmp_path / "exists" / "marker.txt").write_text("preserved")
 
@@ -132,13 +134,60 @@ async def test_e2e_make_new_clobber_refused(tmp_path: Path) -> None:
     async with app.run_test() as pilot:
         await pilot.pause()
         await _make_new(pilot, app, dir_or_file="d", name="exists")
-        # No queue work to drain - planner rejected before enqueue.
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("enter")  # commit; default is Skip
+        await pilot.pause()
 
-    assert app.last_plan is not None
-    assert app.last_plan.items == []
-    assert app.last_plan.errors[0].cause == "Exists"
-    # Original contents intact.
+    # Skip drops the only item -> nothing to do, original intact.
     assert (tmp_path / "exists" / "marker.txt").read_text() == "preserved"
+
+
+async def test_e2e_make_new_clobber_overwrite_replaces(tmp_path: Path) -> None:
+    """Overwrite clears the existing entry and drops an empty new one in
+    its place (replace, not merge)."""
+    from wtree.widgets.conflict import ConflictDialog
+
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "exists" / "marker.txt").write_text("gone")
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _make_new(pilot, app, dir_or_file="d", name="exists")
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("o")      # set current row -> Overwrite
+        await pilot.press("enter")  # commit
+        await pilot.pause()
+        await _drain_queue(app)
+
+    leaf = tmp_path / "exists"
+    assert leaf.is_dir()
+    # The old contents are gone - replaced by an empty dir.
+    assert list(leaf.iterdir()) == []
+
+
+async def test_e2e_make_new_clobber_rename_duplicates(tmp_path: Path) -> None:
+    """Rename creates 'exists (1)' and leaves the original alone."""
+    from wtree.widgets.conflict import ConflictDialog
+
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "exists" / "marker.txt").write_text("preserved")
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _make_new(pilot, app, dir_or_file="d", name="exists")
+        await pilot.pause()
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("r")      # set current row -> Rename
+        await pilot.press("enter")  # commit
+        await pilot.pause()
+        await _drain_queue(app)
+
+    assert (tmp_path / "exists" / "marker.txt").read_text() == "preserved"
+    assert (tmp_path / "exists (1)").is_dir()
 
 
 async def test_e2e_make_new_subtitle_returns_to_baseline(

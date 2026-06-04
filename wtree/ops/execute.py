@@ -776,6 +776,16 @@ async def _native_make_new(item: PlanItem) -> ItemResult:
             message=f"unhandled kind: {item.kind.value}",
         )
 
+    # OVERWRITE pre-step: the user resolved a plan-time leaf collision by
+    # choosing to replace whatever occupies it. Clear it before the
+    # exclusive create. ``src`` is deliberately *not* passed to the
+    # self-destruct guard: Make-new mirrors ``src_path`` onto ``dst_path``,
+    # so ``_would_destroy_source`` would always fire - but the mirror is
+    # structural, there is no real source to protect, and the existing entry
+    # at the leaf is exactly what the user asked to replace.
+    if item.resolution is Resolution.OVERWRITE:
+        await asyncio.to_thread(_remove_existing_blocking, dst)
+
     try:
         await asyncio.to_thread(_make_new_blocking, dst, item.kind)
     except FileExistsError as exc:

@@ -5080,3 +5080,70 @@ tests retargeted to a non-colliding dir — they had accepted the default
   source wouldn't compare equal under `posixpath.normpath`. v0 native
   paths are POSIX-style on both sides so it holds today; worth folding into
   that broader normalisation pass when it lands.
+
+---
+
+## 2026-06-04 — Fold Make-new into the conflict flow
+
+Picked up after committing the parked self-target work (`c1d93fa`, authored
+on top of `534d6fe`). Then closed the long-parked **Fold Make-new into the
+conflict flow** item.
+
+### What changed
+
+Make-new previously hard-rejected a leaf collision: `plan_make_new`
+pre-statted the leaf and returned `PlanError(cause="Exists")`, and the action
+flashed a bespoke message. No Skip/Overwrite/Rename choice; the executor used
+exclusive-create only. Now it routes through the same `ConflictDialog` as
+Copy/Move/Rename.
+
+- `plan_make_new`: dropped the Exists pre-stat/reject; emits the single
+  `MAKE_NEW` item and returns `await annotate_conflicts(plan, registry)`.
+  (Dropped the now-unused `ScanError` import; added `annotate_conflicts`.)
+- `conflicts._annotate_item`: exempted `OperationKind.MAKE_NEW` from the
+  `_same_location` short-circuit. Make-new's `src_path == dst_path` mirror is
+  structural, not a duplicate-in-place — without the exemption annotate would
+  skip the stat and never flag the collision. Benign dir-on-dir merge is
+  COPY-only, so Make-new dir-onto-dir correctly flags `DIR`.
+- `execute._native_make_new`: `OVERWRITE` pre-step → `_remove_existing_blocking(dst)`
+  with **`src=None`** (passing the mirrored `src` would always trip the
+  self-destruct guard; there's no real source to protect).
+- `app.action_make_new`: reordered to flash genuine planner errors first,
+  then `_resolve_plan_conflicts(plan, "Make-new")`.
+
+**User design call**: full **Skip/Overwrite/Rename** for Make-new (not a
+softer Skip/Rename-only), kept consistent with the other ops.
+
+### Mount-flakiness, again (rule 16)
+
+The project mount truncated `wtree/ops/make_new.py` to 230 lines in the bash
+view *after* the Edit tool wrote the full file to the Windows side — the
+Read tool (Windows) and the bash mount disagreed, exactly the worklog's
+recurring gremlin. Since `git commit` runs through the bash view, committing
+then would have committed a truncated file. Resolution: rebuilt the tree in a
+pure sandbox via `git archive HEAD | tar -x`, re-applied all edits there with
+anchor-asserting Python, ran the suite green, then pushed every changed file
+back to the mount with **staged-tmp → atomic `mv -f` → `md5sum` equality
+check** (all 6 matched), and re-ran the make-new slice against the *mount's*
+actual files to confirm. Also cleared a stale `.git/index.lock` (and the
+`HEAD.lock` / `master.lock` git left behind — the mount blocks unlink, so
+each git write leaves a lock; `mv`-aside works where `rm` doesn't).
+
+### Results
+
+611 → **620 / 620** green. New/updated coverage: `tests/test_ops_make_new.py`
+(annotate FILE/DIR/NONE, resolve Rename/Skip/Overwrite, real-FS apply
+Overwrite-replaces-dir + Overwrite-replaces-file + Rename-suffixes, action
+surfaces-dialog-and-cancels) and `tests/test_make_new_e2e.py` (clobber
+Skip/Overwrite/Rename keystroke e2e, replacing the old clobber-refused test).
+
+### Notes for next session
+
+- Still parked from the conflict era: **inline edit / live preview of the
+  suffixed `name (n)`** inside `ConflictDialog` (a Rename row shows the
+  pre-rename dst path; the concrete `name (1)` is computed later in
+  `resolve_conflicts`). Make-new now feeds this dialog too, so the payoff is
+  a touch larger.
+- **Cross-platform `dst_path` normalisation** (todo.md) still outstanding;
+  matters for `_same_location` and now for Make-new's leaf comparison on a
+  Windows-`\` vs POSIX-`/` destination.

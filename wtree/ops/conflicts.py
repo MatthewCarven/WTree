@@ -168,7 +168,15 @@ async def _annotate_item(
     # marked the topmost Copy self-target ``SELF`` and dropped Move/Rename
     # self-targets. Anything still matching here is a Copy descendant whose
     # prefix the resolution transform will rewrite, so it must stay NONE.
-    if _same_location(item):
+    #
+    # Make-new is the exception: it mirrors ``src_path`` onto ``dst_path``
+    # for executor symmetry, so *every* Make-new item is a structural
+    # self-target - but its "self-target" is the leaf the user asked to
+    # create, and that leaf genuinely already existing is a real collision.
+    # Exempt MAKE_NEW so annotate stats the leaf and flags FILE/DIR/OTHER.
+    # ``resolve_self_targets`` is never run for Make-new, so the mirror is
+    # never mistaken for a duplicate-in-place.
+    if kind is not OperationKind.MAKE_NEW and _same_location(item):
         return item
     dst_src = registry.get(item.dst_source_id)
     if dst_src is None:

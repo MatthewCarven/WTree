@@ -742,13 +742,21 @@ class WTreeApp(App):
             self._source.source_id,
             self.sources,
         )
-        if plan.is_empty:
-            self.flash("Make-new: planner produced no items.")
-            return
         if plan.errors and not plan.items:
             err = plan.errors[0]
             self.flash(f"Make-new: {err.message}")
             self.last_plan = plan
+            return
+        if plan.is_empty:
+            self.flash("Make-new: planner produced no items.")
+            return
+
+        # A leaf-already-exists collision is now annotated on the item (not a
+        # planner error), so route Make-new through the shared conflict dialog
+        # for Skip / Overwrite / Rename - same flow as Copy / Move. No
+        # collision: _resolve_plan_conflicts returns the plan unchanged.
+        plan = await self._resolve_plan_conflicts(plan, "Make-new")
+        if plan is None:
             return
 
         synthetic_tag = Tag(

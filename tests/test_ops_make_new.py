@@ -23,6 +23,8 @@ import pytest
 
 from wtree.app import WTreeApp
 from wtree.ops import OperationKind, apply_plan, plan_make_new
+from wtree.ops.base import ConflictKind, Resolution
+from wtree.ops.conflicts import resolve_conflicts
 from wtree.ops.execute import _make_new_blocking
 from wtree.sources.base import Entry, Kind
 from wtree.sources.mock import MockSource
@@ -247,26 +249,86 @@ async def test_plan_make_new_rejects_dotdot_segment(
     assert ".." in plan.errors[0].message
 
 
-async def test_plan_make_new_rejects_existing_leaf(
+async def test_plan_make_new_existing_dir_flags_conflict(
     small_mock: MockSource,
 ) -> None:
-    """The leaf can't exist - small_mock has /proj already, so making
-    a new entry named 'proj' under '/' is a clobber."""
+    """An existing leaf is no longer a hard rejection: the item is
+    emitted and annotate_conflicts flags it so the action layer can
+    route it through ConflictDialog. /proj already exists as a dir."""
     plan = await plan_make_new(
         "/", "proj", Kind.DIR, "mock", {"mock": small_mock}
     )
-    assert plan.items == []
-    assert plan.errors[0].cause == "Exists"
+    assert plan.errors == []
+    assert len(plan.items) == 1
+    # No benign-merge for Make-new: a dir landing on an existing dir is
+    # a real collision (unlike COPY dir-on-dir).
+    assert plan.items[0].conflict is ConflictKind.DIR
 
 
-async def test_plan_make_new_rejects_existing_file(
+async def test_plan_make_new_existing_file_flags_conflict(
     small_mock: MockSource,
 ) -> None:
     plan = await plan_make_new(
         "/", "readme.txt", Kind.FILE, "mock", {"mock": small_mock}
     )
-    assert plan.items == []
-    assert plan.errors[0].cause == "Exists"
+    assert plan.errors == []
+    assert len(plan.items) == 1
+    assert plan.items[0].conflict is ConflictKind.FILE
+
+
+async def test_plan_make_new_no_collision_stays_none(
+    small_mock: MockSource,
+) -> None:
+    """A free leaf name annotates to NONE - no spurious self-target flag
+    even though Make-new mirrors src_path onto dst_path."""
+    plan = await plan_make_new(
+        "/", "fresh", Kind.DIR, "mock", {"mock": small_mock}
+    )
+    assert len(plan.items) == 1
+    assert plan.items[0].conflict is ConflictKind.NONE
+
+
+async def test_resolve_make_new_rename_suffixes(
+    small_mock: MockSource,
+) -> None:
+    """RENAME on a Make-new collision rewrites dst to a free 'name (n)'
+    and clears the conflict."""
+    plan = await plan_make_new(
+        "/", "proj", Kind.DIR, "mock", {"mock": small_mock}
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], {"mock": small_mock}
+    )
+    assert len(resolved.items) == 1
+    assert resolved.items[0].dst_path == "/proj (1)"
+    assert resolved.items[0].conflict is ConflictKind.NONE
+    assert resolved.items[0].resolution is Resolution.PROCEED
+
+
+async def test_resolve_make_new_skip_drops_item(
+    small_mock: MockSource,
+) -> None:
+    plan = await plan_make_new(
+        "/", "proj", Kind.DIR, "mock", {"mock": small_mock}
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.SKIP], {"mock": small_mock}
+    )
+    assert resolved.items == []
+
+
+async def test_resolve_make_new_overwrite_tags_item(
+    small_mock: MockSource,
+) -> None:
+    plan = await plan_make_new(
+        "/", "proj", Kind.DIR, "mock", {"mock": small_mock}
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.OVERWRITE], {"mock": small_mock}
+    )
+    assert len(resolved.items) == 1
+    assert resolved.items[0].resolution is Resolution.OVERWRITE
+    assert resolved.items[0].dst_path == "/proj"
 
 
 async def test_plan_make_new_rejects_only_dot_segments(
@@ -505,11 +567,14 @@ async def test_action_make_new_empty_name_cancels(
     assert app.last_plan is None
 
 
-async def test_action_make_new_exists_surfaces_error(
+async def test_action_make_new_exists_surfaces_conflict_dialog(
     small_mock: MockSource,
 ) -> None:
-    """Trying to create an entry whose leaf already exists surfaces
-    a PlanError (Exists) via the standard last_plan + notify path."""
+    """A leaf collision now surfaces ConflictDialog (Skip/Overwrite/
+    Rename) instead of a hard PlanError. A real collision defaults to
+    the safe Skip; Esc cancels the whole op leaving nothing enqueued."""
+    from wtree.widgets.conflict import ConflictDialog
+
     app = WTreeApp(source=small_mock, root_path="/")
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -522,11 +587,11 @@ async def test_action_make_new_exists_surfaces_error(
         modal_input.value = "proj"  # already exists in small_mock
         await pilot.press("enter")
         await pilot.pause()
+        assert isinstance(app.screen, ConflictDialog)
+        # Real (non-SELF) collision defaults to Skip.
+        assert app.screen._res == [Resolution.SKIP]
+        await pilot.press("escape")  # cancel the whole op
         await pilot.pause()
-
-    assert app.last_plan is not None
-    assert app.last_plan.items == []
-    assert app.last_plan.errors[0].cause == "Exists"
 
 
 async def test_action_make_new_dotdot_surfaces_error(
@@ -590,3 +655,62 @@ async def test_action_make_new_tagged_set_silently_ignored(
     # be empty here. This documents that behaviour; if it changes, this
     # test will catch it.
     assert len(app.tagged_set) == 0
+
+
+# ---------------------------------------------------------------------------
+# Make-new OVERWRITE executor (real filesystem) - the fold's new path
+# ---------------------------------------------------------------------------
+
+
+async def test_apply_make_new_overwrite_replaces_dir(tmp_path: Path) -> None:
+    """plan -> resolve(OVERWRITE) -> apply: the existing dir (and its
+    contents) is cleared and an empty dir lands in its place."""
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "exists" / "marker.txt").write_text("gone")
+    src = NativeSource()
+    plan = await plan_make_new(
+        str(tmp_path), "exists", Kind.DIR, "native", {"native": src}
+    )
+    assert plan.items[0].conflict is ConflictKind.DIR
+    resolved = await resolve_conflicts(
+        plan, [Resolution.OVERWRITE], {"native": src}
+    )
+    result = await apply_plan(resolved, {"native": src})
+    assert result.all_succeeded
+    leaf = tmp_path / "exists"
+    assert leaf.is_dir()
+    assert list(leaf.iterdir()) == []  # replaced, not merged
+
+
+async def test_apply_make_new_overwrite_replaces_file(tmp_path: Path) -> None:
+    (tmp_path / "exists.txt").write_text("old contents")
+    src = NativeSource()
+    plan = await plan_make_new(
+        str(tmp_path), "exists.txt", Kind.FILE, "native", {"native": src}
+    )
+    assert plan.items[0].conflict is ConflictKind.FILE
+    resolved = await resolve_conflicts(
+        plan, [Resolution.OVERWRITE], {"native": src}
+    )
+    result = await apply_plan(resolved, {"native": src})
+    assert result.all_succeeded
+    leaf = tmp_path / "exists.txt"
+    assert leaf.is_file()
+    assert leaf.read_bytes() == b""  # truncated to a fresh empty file
+
+
+async def test_apply_make_new_rename_lands_suffixed(tmp_path: Path) -> None:
+    """RENAME on a collision creates 'name (1)' and leaves the original."""
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "exists" / "keep.txt").write_text("preserved")
+    src = NativeSource()
+    plan = await plan_make_new(
+        str(tmp_path), "exists", Kind.DIR, "native", {"native": src}
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], {"native": src}
+    )
+    result = await apply_plan(resolved, {"native": src})
+    assert result.all_succeeded
+    assert (tmp_path / "exists (1)").is_dir()
+    assert (tmp_path / "exists" / "keep.txt").read_text() == "preserved"

@@ -54,7 +54,8 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
 )
-from wtree.sources.base import EntrySource, Kind, ScanError
+from wtree.ops.conflicts import annotate_conflicts
+from wtree.sources.base import EntrySource, Kind
 
 
 # Kinds the user can ask Make-new to create. SYMLINK and OTHER are
@@ -209,26 +210,18 @@ async def plan_make_new(
     else:
         leaf_path = parent_posix.rstrip("/") + "/" + name_rel
 
-    # Refuse to clobber the leaf. Intermediate dirs may exist (lenient
-    # mode); the leaf itself must be new. We use the source's
-    # ``entry_at`` so the check stays source-agnostic - a future
-    # ArchiveSource would use the same call. A ScanError here is
-    # treated as "doesn't exist" for Make-new purposes; the executor
-    # surfaces real errors (permission denied, etc.) at apply time.
-    existing = await src.entry_at(leaf_path)
-    if not isinstance(existing, ScanError):
-        return Plan(
-            kind=OperationKind.MAKE_NEW,
-            errors=[
-                PlanError(
-                    source_id=source_id,
-                    path=leaf_path,
-                    message=f"path already exists: {leaf_path}",
-                    cause="Exists",
-                )
-            ],
-        )
-
+    # A leaf that already exists is no longer a hard rejection. Emit the
+    # item and let :func:`annotate_conflicts` stat ``dst_path`` and flag the
+    # collision, so the action layer can route it through ``ConflictDialog``
+    # (Skip / Overwrite / Rename) exactly like Copy / Move / Rename. The
+    # leaf-exists pre-stat that used to live here is gone; the safety belt is
+    # now the conflict annotation plus the executor's exclusive-create /
+    # OVERWRITE pre-step. Intermediate dirs may still exist (lenient mode) -
+    # only the leaf participates in conflict detection. ``resolve_self_targets``
+    # is deliberately *not* run for Make-new: its ``src_path == dst_path``
+    # mirror is structural, not a duplicate-in-place, and ``annotate_conflicts``
+    # exempts MAKE_NEW from the self-target short-circuit for exactly this
+    # reason.
     item = PlanItem(
         src_source_id=source_id,
         src_path=leaf_path,  # Make-new has no "from"; mirror dst for executor symmetry.
@@ -237,4 +230,5 @@ async def plan_make_new(
         kind=kind,
         size=0,
     )
-    return Plan(kind=OperationKind.MAKE_NEW, items=[item])
+    plan = Plan(kind=OperationKind.MAKE_NEW, items=[item])
+    return await annotate_conflicts(plan, registry)
