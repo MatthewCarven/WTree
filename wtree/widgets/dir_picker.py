@@ -40,6 +40,7 @@ from wtree.ops.base import resolve_relative_leaf, to_posix
 from wtree.ops.execute import _make_new_blocking
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.widgets.prompt import PromptDialog
+from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
 
 
 class _PickerTree(Tree[str]):
@@ -65,13 +66,19 @@ class _PickerTree(Tree[str]):
         await self._populate(self.root)
         self.root.expand()
 
-    async def _populate(self, node: TreeNode[str]) -> None:
+    async def _populate(
+        self, node: TreeNode[str], *, ctx: ScanContext | None = None
+    ) -> None:
         """Scan ``node``'s path; add directory children + error leaves.
 
         Dir-only (files live elsewhere - you pick a directory). Idempotent
-        via ``_loaded``. Mirrors ``TreePane._populate``'s legacy one-shot
-        drain; large dirs stay responsive because ``scan`` is an async
-        generator that yields between ``os.scandir`` reads.
+        via ``_loaded``. With a ``ctx`` (supplied by the scan-dialog gate for
+        interactive expands) the loop yields every ``SCAN_CHUNK_SIZE`` entries,
+        writes the running count, and polls ``ctx.cancelled`` - on cancel it
+        drops the ``_loaded`` marker and returns **before** adding any
+        children (atomic: a cancelled expand leaves the node empty +
+        re-expandable, exactly as if it never happened). Without a ``ctx`` it
+        is the legacy one-shot drain (reveal walk, tests).
         """
         if node.id in self._loaded:
             return
@@ -81,12 +88,25 @@ class _PickerTree(Tree[str]):
             return
         directories: list[Entry] = []
         errors: list[ScanError] = []
+        i = 0
         async for item in self._source.scan(path):
             if isinstance(item, Entry):
                 if item.kind is Kind.DIR:
                     directories.append(item)
             elif isinstance(item, ScanError):
                 errors.append(item)
+            i += 1
+            if ctx is not None:
+                ctx.entries_seen = i
+                if i % SCAN_CHUNK_SIZE == 0:
+                    await asyncio.sleep(0)
+                    if ctx.cancelled.is_set():
+                        self._loaded.discard(node.id)
+                        return
+        # Final cancel check (Esc during the last partial chunk).
+        if ctx is not None and ctx.cancelled.is_set():
+            self._loaded.discard(node.id)
+            return
         directories.sort(key=lambda e: e.name.lower())
         for err in errors:
             node.add_leaf(f"⚠ {err.message}", data=None)
@@ -100,9 +120,30 @@ class _PickerTree(Tree[str]):
     async def on_tree_node_expanded(
         self, event: Tree.NodeExpanded[str]
     ) -> None:
-        if event.node.id in self._loaded:
+        await self._expand_with_dialog(event.node)
+
+    async def _expand_with_dialog(self, node: TreeNode[str]) -> None:
+        """Populate ``node`` through the app's scan-dialog gate, so a slow
+        directory shows a cancellable :class:`ScanScreen` instead of freezing.
+
+        The gate (``WTreeApp._run_scan_with_dialog``) only pushes the dialog
+        if the scan is still running after a short delay, so fast expands
+        never flash it. Falls back to a bare populate when there's no gate on
+        the app (keeps ``_PickerTree`` usable outside ``WTreeApp``). The
+        reveal walk and the initial root populate deliberately stay bare -
+        the cancel-UI is for *interactive* expands, not programmatic ones.
+        """
+        if node.data is None or node.id in self._loaded:
             return
-        await self._populate(event.node)
+        gate = getattr(self.app, "_run_scan_with_dialog", None)
+        if gate is None:
+            await self._populate(node)
+            return
+        await gate(
+            node.data,
+            self._source,
+            lambda ctx: self._populate(node, ctx=ctx),
+        )
 
     async def on_key(self, event: events.Key) -> None:
         """Left = collapse / cursor-to-parent; Right = expand / drill-in.
@@ -131,8 +172,10 @@ class _PickerTree(Tree[str]):
             event.prevent_default()
             if not node.is_expanded:
                 if node.allow_expand:
+                    # expand() posts NodeExpanded -> on_tree_node_expanded ->
+                    # _expand_with_dialog (gated). No inline populate here, so
+                    # the slow-dir dialog gets its chance.
                     node.expand()
-                    await self._populate(node)
                 return
             if node.children:
                 await asyncio.sleep(0)

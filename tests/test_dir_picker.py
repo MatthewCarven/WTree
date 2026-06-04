@@ -190,3 +190,96 @@ async def test_copy_prompt_ctrl_b_opens_picker_then_esc_returns(tmp_path: Path):
         await pilot.press("escape")       # cancel browse -> back to prompt
         await pilot.pause()
         assert isinstance(app.screen, PromptDialog)
+
+
+# ---------------------------------------------------------------------------
+# Scan-dialog cancel-UI: ctx-chunked populate + gated expansion
+# ---------------------------------------------------------------------------
+
+from datetime import datetime
+
+from wtree.sources.base import Entry, Kind
+from wtree.sources.mock import MockSource
+from wtree.widgets.scan_screen import ScanContext
+
+
+def _dir_mock() -> MockSource:
+    now = datetime(2026, 6, 4, 12, 0, 0)
+    return MockSource(
+        contents={
+            "/big": [Entry("sub", Kind.DIR, 4096, now)],
+            "/big/sub": [
+                Entry("x", Kind.DIR, 4096, now),
+                Entry("y", Kind.DIR, 4096, now),
+            ],
+        }
+    )
+
+
+async def _push_mock_picker(app, pilot, results):
+    app.push_screen(
+        DirPickerScreen(app._source, start_root="/big", reveal_target="/big"),
+        callback=results.append,
+    )
+    await pilot.pause()
+    await pilot.pause()
+    return app.screen.query_one(_PickerTree)
+
+
+async def test_picker_populate_cancel_leaves_node_empty():
+    src = _dir_mock()
+    app = WTreeApp(source=src, root_path="/big")
+    results: list = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = await _push_mock_picker(app, pilot, results)
+        sub = tree.root.children[0]
+        assert str(sub.label) == "sub"
+        ctx = ScanContext(path="/big/sub", method_label="mock")
+        ctx.cancelled.set()  # pre-cancelled
+        await tree._populate(sub, ctx=ctx)
+        # Atomic: no children added, marker dropped so a re-expand retries.
+        assert list(sub.children) == []
+        assert sub.id not in tree._loaded
+
+
+async def test_picker_populate_ctx_counts_and_commits():
+    src = _dir_mock()
+    app = WTreeApp(source=src, root_path="/big")
+    results: list = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = await _push_mock_picker(app, pilot, results)
+        sub = tree.root.children[0]
+        ctx = ScanContext(path="/big/sub", method_label="mock")
+        await tree._populate(sub, ctx=ctx)
+        assert ctx.entries_seen == 2
+        assert {str(c.label) for c in sub.children} == {"x", "y"}
+
+
+async def test_picker_expand_routes_through_scan_gate(tmp_path: Path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    app = WTreeApp(root_path=str(tmp_path))
+    results: list = []
+    calls: list = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        orig = app._run_scan_with_dialog
+
+        async def spy(path, source, do_work, **kw):
+            calls.append(path)
+            return await orig(path, source, do_work, **kw)
+
+        app._run_scan_with_dialog = spy
+        await _push_picker(app, pilot, tmp_path, results)
+        await pilot.press("down")     # onto 'a'
+        await pilot.pause()
+        await pilot.press("right")    # expand -> gated populate
+        await pilot.pause()
+        await pilot.pause()
+        # The interactive expand of 'a' went through the gate.
+        assert str(tmp_path / "a") in calls
+        # And it actually populated (child 'b' present).
+        tree = app.screen.query_one(_PickerTree)
+        a_node = tree.root.children[0]
+        assert {str(c.label) for c in a_node.children} == {"b"}

@@ -5398,3 +5398,49 @@ units.
   cancel-UI for huge dirs, files-greyed-for-context.
 - **Cleanup**: extract the dir-populate loop shared by `_PickerTree` and
   `TreePane` into one helper so they don't drift.
+
+---
+
+## 2026-06-04 (cont.) — Picker scan-dialog cancel-UI for slow expands
+
+Closed the phase-2 item deferred when the destination browser shipped: a
+slow directory expand now shows a cancellable scan dialog instead of a
+silent inline populate.
+
+### What changed (`wtree/widgets/dir_picker.py`)
+
+- `_PickerTree._populate` gained the ctx-chunked cancel path (mirrors
+  `TreePane._populate`): with a `ScanContext` it writes `entries_seen`,
+  yields every `SCAN_CHUNK_SIZE` entries, polls `ctx.cancelled`, and on
+  cancel drops the `_loaded` marker and returns **before** adding children
+  (atomic - the node stays empty + re-expandable). Without a ctx it's the
+  legacy one-shot drain (reveal walk, tests).
+- New `_expand_with_dialog(node)`: routes an interactive expand through
+  `WTreeApp._run_scan_with_dialog` (the gate already used by the contents
+  pane / L / Ctrl+R), so a still-scanning dir shows a `ScanScreen` after the
+  short delay; fast expands never flash it. Falls back to a bare populate
+  when `self.app` has no gate (keeps `_PickerTree` usable standalone).
+- `on_tree_node_expanded` now calls `_expand_with_dialog`; the Right-key
+  handler just `node.expand()`s (which posts `NodeExpanded`) and no longer
+  populates inline, so the gate gets its chance. `reveal_path` + the initial
+  root populate stay bare - the cancel-UI is for *interactive* expands.
+
+The gate's own docstring already listed "tree-pane Right-arrow expand" as an
+intended future caller, so this is the sanctioned pattern (and the picker now
+gets cancel-UI that even `TreePane`'s own expand doesn't have yet).
+
+### Results
+
+669 -> **672 / 672** green. 3 new tests in `tests/test_dir_picker.py`:
+pre-cancelled `_populate` leaves the node empty + marker dropped; a ctx scan
+counts `entries_seen` and commits children; an interactive expand routes
+through a spied `_run_scan_with_dialog`.
+
+### Notes for next session
+
+- Picker **phase 2** remaining: drive/share switching (enumeration; ties to
+  Network-discovery), type-to-filter (reuse `/`-search), files-greyed-for-
+  context.
+- **Cleanup**: extract the dir-populate loop now duplicated by `_PickerTree`
+  and `TreePane` into one shared helper - they've drifted a little further
+  apart with this change (the picker's ctx path is a near-copy of TreePane's).
