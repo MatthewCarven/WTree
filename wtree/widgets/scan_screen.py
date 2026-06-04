@@ -28,8 +28,9 @@ here.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -37,6 +38,13 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Label, Static
+
+from wtree.sources.base import Entry, Kind, ScanError
+
+if TYPE_CHECKING:
+    from textual.widgets.tree import TreeNode
+
+    from wtree.sources.base import EntrySource
 
 from wtree.ops.queue import PROGRESS_REDRAW_HZ
 
@@ -230,3 +238,68 @@ def _truncate_path(path: str, *, max_width: int) -> str:
     # Allocate roughly equal halves around the ellipsis.
     half = (max_width - 3) // 2
     return f"{path[:half]}...{path[-half:]}"
+
+
+
+async def populate_dir_node(
+    node: TreeNode[str],
+    source: EntrySource,
+    loaded: set[int],
+    *,
+    ctx: ScanContext | None = None,
+) -> None:
+    """Scan ``node.data`` and add directory children + error leaves (dir-only).
+
+    The shared body of :meth:`wtree.widgets.tree_pane.TreePane._populate` and
+    the destination browser's ``_PickerTree._populate`` - factored here, next
+    to :class:`ScanContext` and :data:`SCAN_CHUNK_SIZE`, so the two dir-tree
+    widgets can't drift. Files and non-directory kinds are excluded (a dir
+    tree); ``node.data`` is the directory path, or ``None`` for an error-
+    placeholder leaf (skipped). ``loaded`` is the caller's set of already-
+    scanned node ids - mutated in place for idempotency.
+
+    Marks ``node.id`` loaded *before* scanning so re-entry during the async
+    scan is a no-op. With a ``ctx`` (the scan-dialog gate) the loop writes
+    ``ctx.entries_seen``, yields every :data:`SCAN_CHUNK_SIZE` entries, and
+    polls ``ctx.cancelled`` - on cancel it drops the ``loaded`` marker and
+    returns **before** adding any children (atomic: the node stays empty and
+    re-expandable, as if the scan never happened). Without a ``ctx`` it is the
+    legacy one-shot drain. Errors are added first (``⚠`` prefix) so they're
+    noticed; directories follow, case-insensitively sorted (XTree / most file
+    managers).
+    """
+    if node.id in loaded:
+        return
+    loaded.add(node.id)
+    path = node.data
+    if path is None:
+        return
+    directories: list[Entry] = []
+    errors: list[ScanError] = []
+    i = 0
+    async for item in source.scan(path):
+        if isinstance(item, Entry):
+            if item.kind is Kind.DIR:
+                directories.append(item)
+        elif isinstance(item, ScanError):
+            errors.append(item)
+        i += 1
+        if ctx is not None:
+            ctx.entries_seen = i
+            if i % SCAN_CHUNK_SIZE == 0:
+                await asyncio.sleep(0)
+                if ctx.cancelled.is_set():
+                    loaded.discard(node.id)
+                    return
+    if ctx is not None and ctx.cancelled.is_set():
+        loaded.discard(node.id)
+        return
+    directories.sort(key=lambda e: e.name.lower())
+    for err in errors:
+        node.add_leaf(f"⚠ {err.message}", data=None)
+    for entry in directories:
+        node.add(
+            entry.name,
+            data=os.path.join(path, entry.name),
+            allow_expand=True,
+        )

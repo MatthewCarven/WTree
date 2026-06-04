@@ -283,3 +283,32 @@ async def test_picker_expand_routes_through_scan_gate(tmp_path: Path):
         tree = app.screen.query_one(_PickerTree)
         a_node = tree.root.children[0]
         assert {str(c.label) for c in a_node.children} == {"b"}
+
+
+async def test_populate_dir_node_helper_direct():
+    """The extracted shared helper, exercised directly: dir-only commit on a
+    fresh node, and an atomic cancel that leaves the node empty + un-marked."""
+    from wtree.widgets.scan_screen import populate_dir_node
+
+    src = _dir_mock()
+    app = WTreeApp(source=src, root_path="/big")
+    results: list = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tree = await _push_mock_picker(app, pilot, results)
+
+        # Commit on a fresh node.
+        node = tree.root.add("probe", data="/big/sub", allow_expand=True)
+        loaded: set[int] = set()
+        await populate_dir_node(node, src, loaded)
+        assert {str(c.label) for c in node.children} == {"x", "y"}
+        assert node.id in loaded
+
+        # Pre-cancelled: atomic - no children, marker dropped.
+        node2 = tree.root.add("probe2", data="/big/sub", allow_expand=True)
+        ctx = ScanContext(path="/big/sub", method_label="mock")
+        ctx.cancelled.set()
+        loaded2: set[int] = set()
+        await populate_dir_node(node2, src, loaded2, ctx=ctx)
+        assert list(node2.children) == []
+        assert node2.id not in loaded2

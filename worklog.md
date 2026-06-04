@@ -5444,3 +5444,44 @@ through a spied `_run_scan_with_dialog`.
 - **Cleanup**: extract the dir-populate loop now duplicated by `_PickerTree`
   and `TreePane` into one shared helper - they've drifted a little further
   apart with this change (the picker's ctx path is a near-copy of TreePane's).
+
+---
+
+## 2026-06-04 (cont.) — Cleanup: extract the shared dir-populate helper
+
+`TreePane._populate` and the picker's `_PickerTree._populate` had become
+near-identical (the scan-dialog cancel-UI work copied the ctx-chunked path
+into the picker). Removed the duplication.
+
+### What changed
+
+- New `scan_screen.populate_dir_node(node, source, loaded, *, ctx=None)` -
+  the dir-only scan-into-tree-node body, lifted verbatim and parked next to
+  `ScanContext` / `SCAN_CHUNK_SIZE` (its natural home). Idempotent via the
+  caller's `loaded` set; ctx-chunked atomic cancel as before.
+- `TreePane._populate` and `_PickerTree._populate` are now one-line
+  delegations to it. The dir-scan logic lives in exactly one place; the two
+  widgets can't drift again.
+- Trimmed now-unused imports (`Entry`/`Kind`/`ScanError` from `tree_pane`,
+  `Entry` from `dir_picker`), pyflakes-confirmed. (`scan_screen` gained
+  `os` + a `from wtree.sources.base import Entry, Kind, ScanError` + a
+  TYPE_CHECKING `TreeNode`/`EntrySource`.)
+
+Pure refactor - behaviour identical, proven by the unchanged TreePane
+navigation / scan-dialog / refresh / recursive-tag and picker suites all
+passing untouched.
+
+### Results
+
+672 -> **673 / 673** green (1 direct `populate_dir_node` test added; the lone
+parallel-run red is the known `test_flash_clears_after_timeout` flake,
+serial-passes). Installed `pyflakes` in the sandbox to verify the import trim.
+
+### Notes for next session
+
+- Picker **phase 2** remaining: drive/share switching, type-to-filter,
+  files-greyed-for-context.
+- Pre-existing pyflakes nits noticed (not touched, out of scope): `app.py`
+  `Resolution`, `properties.py` `field`/`Sequence`, `copy.py` `walked_iter`,
+  `execute.py` `exc`, `sources/base.py` `field`. A future lint-sweep could
+  clear these.

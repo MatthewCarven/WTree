@@ -38,9 +38,9 @@ from textual.widgets.tree import TreeNode
 
 from wtree.ops.base import resolve_relative_leaf, to_posix
 from wtree.ops.execute import _make_new_blocking
-from wtree.sources.base import Entry, EntrySource, Kind, ScanError
+from wtree.sources.base import EntrySource, Kind, ScanError
 from wtree.widgets.prompt import PromptDialog
-from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
+from wtree.widgets.scan_screen import ScanContext, populate_dir_node
 
 
 class _PickerTree(Tree[str]):
@@ -80,42 +80,9 @@ class _PickerTree(Tree[str]):
         re-expandable, exactly as if it never happened). Without a ``ctx`` it
         is the legacy one-shot drain (reveal walk, tests).
         """
-        if node.id in self._loaded:
-            return
-        self._loaded.add(node.id)
-        path = node.data
-        if path is None:
-            return
-        directories: list[Entry] = []
-        errors: list[ScanError] = []
-        i = 0
-        async for item in self._source.scan(path):
-            if isinstance(item, Entry):
-                if item.kind is Kind.DIR:
-                    directories.append(item)
-            elif isinstance(item, ScanError):
-                errors.append(item)
-            i += 1
-            if ctx is not None:
-                ctx.entries_seen = i
-                if i % SCAN_CHUNK_SIZE == 0:
-                    await asyncio.sleep(0)
-                    if ctx.cancelled.is_set():
-                        self._loaded.discard(node.id)
-                        return
-        # Final cancel check (Esc during the last partial chunk).
-        if ctx is not None and ctx.cancelled.is_set():
-            self._loaded.discard(node.id)
-            return
-        directories.sort(key=lambda e: e.name.lower())
-        for err in errors:
-            node.add_leaf(f"⚠ {err.message}", data=None)
-        for entry in directories:
-            node.add(
-                entry.name,
-                data=os.path.join(path, entry.name),
-                allow_expand=True,
-            )
+        # Delegates to the shared dir-populate helper (see scan_screen) so
+        # the picker tree and TreePane stay in lock-step.
+        await populate_dir_node(node, self._source, self._loaded, ctx=ctx)
 
     async def on_tree_node_expanded(
         self, event: Tree.NodeExpanded[str]

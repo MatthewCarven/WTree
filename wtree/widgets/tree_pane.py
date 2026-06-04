@@ -57,9 +57,9 @@ from textual.message import Message
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
-from wtree.sources.base import Entry, EntrySource, Kind, ScanError
+from wtree.sources.base import EntrySource
 from wtree.tagged_set import TaggedSet
-from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
+from wtree.widgets.scan_screen import ScanContext, populate_dir_node
 
 
 # Rich style applied to the rendered label of a tagged tree node.
@@ -257,56 +257,11 @@ class TreePane(Tree[str]):
         Without ``ctx``, the legacy "drain the iterator in one shot"
         behaviour is preserved for tests and small scans.
         """
-        if node.id in self._loaded:
-            return
-        # Mark loaded *before* scanning so re-entry during the async scan is a
-        # no-op. Worst case on a scan failure: the node is "loaded" with no
-        # children, exactly as a real empty directory would look.
-        self._loaded.add(node.id)
-
-        path = node.data
-        if path is None:
-            # Error placeholder leaves carry no path; nothing to expand into.
-            return
-
-        directories: list[Entry] = []
-        errors: list[ScanError] = []
-        i = 0
-        async for item in self._source.scan(path):
-            if isinstance(item, Entry):
-                if item.kind is Kind.DIR:
-                    directories.append(item)
-            elif isinstance(item, ScanError):
-                errors.append(item)
-            i += 1
-            if ctx is not None:
-                ctx.entries_seen = i
-                if i % SCAN_CHUNK_SIZE == 0:
-                    await asyncio.sleep(0)
-                    if ctx.cancelled.is_set():
-                        # Drop the _loaded marker so the next expand
-                        # retries cleanly. No children added; the node
-                        # stays collapsed-but-expandable.
-                        self._loaded.discard(node.id)
-                        return
-
-        # Final cancel check in case Esc landed during the last partial
-        # chunk (entries < SCAN_CHUNK_SIZE).
-        if ctx is not None and ctx.cancelled.is_set():
-            self._loaded.discard(node.id)
-            return
-
-        # Case-insensitive alpha sort, like XTree and most file managers.
-        directories.sort(key=lambda e: e.name.lower())
-
-        # Errors first so the user notices them before scrolling through a
-        # long directory; explicit "⚠ " prefix marks them visually until we
-        # have proper styling.
-        for err in errors:
-            node.add_leaf(f"⚠ {err.message}", data=None)
-        for entry in directories:
-            child_path = os.path.join(path, entry.name)
-            node.add(entry.name, data=child_path, allow_expand=True)
+        # Delegates to the shared dir-populate helper (next to ScanContext /
+        # SCAN_CHUNK_SIZE in scan_screen) so this and the destination
+        # browser's picker tree can't drift. ``_loaded`` is the pane's own
+        # set, mutated in place for idempotency.
+        await populate_dir_node(node, self._source, self._loaded, ctx=ctx)
 
     # ------------------------------------------------------------------
     # Tagged-node visual style (2026-05-23)
