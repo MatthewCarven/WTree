@@ -26,7 +26,7 @@ from wtree.ops.base import (
     WalkedEntry,
     WalkSummary,
 )
-from wtree.ops.conflicts import annotate_conflicts
+from wtree.ops.conflicts import annotate_conflicts, resolve_self_targets
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.tagged_set import Tag
 
@@ -148,6 +148,11 @@ async def plan_copy(
             )
 
     plan = Plan(kind=OperationKind.COPY, items=items, errors=walk.errors)
+    # Self-target pass first: mark the topmost copy-into-own-dir item SELF
+    # so it surfaces in the dialog (duplicate-in-place). annotate_conflicts
+    # then skips every self-targeted item, so the SELF flag survives and
+    # descendants stay NONE for the rename cascade.
+    plan = resolve_self_targets(plan)
     return await annotate_conflicts(plan, registry)
 
 

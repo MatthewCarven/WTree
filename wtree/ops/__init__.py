@@ -49,7 +49,11 @@ from wtree.ops.base import (
     WalkSummary,
     WalkedEntry,
 )
-from wtree.ops.conflicts import resolve_conflicts, suffixed_name
+from wtree.ops.conflicts import (
+    resolve_conflicts,
+    resolve_self_targets,
+    suffixed_name,
+)
 from wtree.ops.copy import plan_copy, walk_tags
 from wtree.ops.delete import plan_delete
 from wtree.ops.execute import apply_plan
@@ -78,6 +82,7 @@ __all__ = [
     "plan_move",
     "plan_rename",
     "resolve_conflicts",
+    "resolve_self_targets",
     "select_range_for_rename",
     "suffixed_name",
     "walk_tags",

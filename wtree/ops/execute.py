@@ -224,7 +224,32 @@ def _normalise_dst(dst_path: str) -> str:
     return os.path.normpath(dst_path) if os.sep == "\\" else dst_path
 
 
-def _remove_existing_blocking(dst: str) -> None:
+def _norm(path: str) -> str:
+    """Case- and separator-normalised absolute path for self-target checks.
+
+    ``normcase`` folds case and slash-to-backslash on Windows; ``normpath``
+    collapses dot / dot-dot / redundant separators. No filesystem I/O (no
+    ``realpath``) - we compare the paths the plan carries, which is the
+    cheap belt-and-suspenders we want, not a symlink-resolving audit.
+    """
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _would_destroy_source(dst: str, src: str) -> bool:
+    """True if removing ``dst`` would also remove the operation's ``src``.
+
+    Two cases: ``dst`` *is* ``src`` (move/copy/rename of an entry onto
+    itself), or ``dst`` is an ancestor *directory* of ``src`` (so an
+    ``rmtree(dst)`` would take ``src`` down with it). Either way the
+    OVERWRITE pre-step must refuse.
+    """
+    ndst, nsrc = _norm(dst), _norm(src)
+    if ndst == nsrc:
+        return True
+    return nsrc.startswith(ndst + os.sep)
+
+
+def _remove_existing_blocking(dst: str, src: str | None = None) -> None:
     """Remove whatever currently occupies ``dst`` (the OVERWRITE pre-step).
 
     Synchronous - call via :func:`asyncio.to_thread`. Symlinks are unlinked
@@ -237,7 +262,21 @@ def _remove_existing_blocking(dst: str) -> None:
     the conflict was detected at plan time and the user explicitly chose to
     replace. "Replace, not merge" - see ``design.md`` -> Conflict resolution
     dialog.
+
+    Defence in depth: when ``src`` is supplied and removing ``dst`` would
+    also destroy it (``dst == src`` or ``dst`` is an ancestor of ``src``),
+    raise ``ValueError`` rather than ``rmtree`` the source. The plan-time
+    self-target pass (:func:`wtree.ops.conflicts.resolve_self_targets`)
+    already rewrites Copy and drops Move/Rename self-targets, so this should
+    be unreachable in normal flow - but a planner bug or a post-plan race
+    must never silently eat the user's data. The raise is caught by
+    :func:`apply_plan` and surfaces as a ``FAILED`` item.
     """
+    if src is not None and _would_destroy_source(dst, src):
+        raise ValueError(
+            f"refusing to overwrite {dst!r}: it is (or contains) the "
+            f"operation source {src!r}"
+        )
     if os.path.islink(dst):
         os.unlink(dst)
     elif os.path.isdir(dst):
@@ -279,7 +318,7 @@ async def _native_copy(
     # existing file, file onto an existing dir); a file-onto-file overwrite
     # would clobber anyway, but removing first keeps the behaviour uniform.
     if item.resolution is Resolution.OVERWRITE:
-        await asyncio.to_thread(_remove_existing_blocking, dst)
+        await asyncio.to_thread(_remove_existing_blocking, dst, src)
 
     if item.kind is Kind.DIR:
         await asyncio.to_thread(os.makedirs, dst, exist_ok=True)
@@ -485,7 +524,7 @@ async def _native_move(
     # TOCTOU race that arrived after planning - fail it.
     if await asyncio.to_thread(os.path.lexists, dst):
         if item.resolution is Resolution.OVERWRITE:
-            await asyncio.to_thread(_remove_existing_blocking, dst)
+            await asyncio.to_thread(_remove_existing_blocking, dst, src)
         else:
             return ItemResult(
                 item=item,
@@ -659,7 +698,7 @@ async def _native_rename(item: PlanItem) -> ItemResult:
     # race and we fail rather than destroy.
     if await asyncio.to_thread(os.path.lexists, dst):
         if item.resolution is Resolution.OVERWRITE:
-            await asyncio.to_thread(_remove_existing_blocking, dst)
+            await asyncio.to_thread(_remove_existing_blocking, dst, src)
         else:
             return ItemResult(
                 item=item,

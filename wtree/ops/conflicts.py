@@ -42,6 +42,77 @@ _MAX_SUFFIX = 9999
 
 
 # ---------------------------------------------------------------------------
+# Self-target detection (same-directory / src == dst)
+# ---------------------------------------------------------------------------
+
+
+def _same_location(item: PlanItem) -> bool:
+    """True when ``item``'s destination is its own source.
+
+    Same source id *and* the POSIX-normalised paths are equal - i.e. the
+    user aimed an entry at the directory it already lives in, so the planner
+    built ``dst_path == src_path``. Normalisation collapses incidental
+    dot / double-slash / trailing-slash differences a typed destination can
+    carry (``/d/./proj/`` == ``/d/proj``). Cross-platform separator
+    unification (a Windows-separator destination vs a POSIX-slash source) is
+    the broader ``dst_path`` normalisation concern parked in ``todo.md``; v0
+    paths are POSIX-style on both sides within a native session.
+    """
+    if item.src_source_id != item.dst_source_id:
+        return False
+    return posixpath.normpath(item.src_path) == posixpath.normpath(
+        item.dst_path
+    )
+
+
+def resolve_self_targets(plan: Plan) -> Plan:
+    """Handle items whose destination is their own source, per operation.
+
+    Runs **before** :func:`annotate_conflicts` in each destination-bearing
+    planner. Pure data in / pure data out - no I/O (the Copy suffix is
+    computed later, only if the user picks Rename, by
+    :func:`resolve_conflicts`).
+
+    * **COPY** - duplicate-in-place. The *topmost* self-targeted item gets
+      ``conflict = SELF`` so it surfaces in
+      :class:`~wtree.widgets.conflict.ConflictDialog` (defaulting to
+      Rename). Descendants of that root are left ``NONE``: if the user
+      renames the root, the resolution transform cascades the new prefix
+      onto them; if they skip it, the skip-prefix logic drops the whole
+      subtree. Marking only the root keeps the dialog to one row per
+      user-tagged entry instead of one per walked leaf.
+    * **MOVE / RENAME** - genuine no-op (the entry is already where it was
+      asked to go). The item is **dropped**. Dropping rather than offering
+      Overwrite is the whole point: an Overwrite on a move-onto-self would
+      ``rmtree`` the destination, which *is* the source. Move emits one
+      item per top-level tag (no descendants in the plan) and Rename is
+      single-entry, so a flat drop suffices - no cascade needed.
+
+    See ``design.md`` -> Conflict resolution dialog -> Same-location
+    (self-target) handling.
+    """
+    if not plan.items:
+        return plan
+
+    if plan.kind is OperationKind.COPY:
+        claimed_roots: list[str] = []
+        new_items: list[PlanItem] = []
+        for it in plan.items:
+            if _same_location(it) and not any(
+                _is_under(it.dst_path, root) for root in claimed_roots
+            ):
+                claimed_roots.append(it.dst_path)
+                new_items.append(replace(it, conflict=ConflictKind.SELF))
+            else:
+                new_items.append(it)
+        return replace(plan, items=new_items)
+
+    # MOVE / RENAME (and any other destination-bearing kind): drop no-ops.
+    new_items = [it for it in plan.items if not _same_location(it)]
+    return replace(plan, items=new_items)
+
+
+# ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
 
@@ -88,6 +159,17 @@ async def _annotate_item(
     item: PlanItem,
     registry: Mapping[str, EntrySource],
 ) -> PlanItem:
+    # Self-target guard: when ``dst_path`` *is* ``src_path`` the entry that
+    # "already exists" at the destination is the operation's own source, not
+    # a real collision. Stating it and flagging FILE/DIR would route the
+    # item into the conflict dialog with replace semantics that could
+    # overwrite (i.e. destroy) the source. Leave it untouched here -
+    # :func:`resolve_self_targets` (run *before* this pass) has already
+    # marked the topmost Copy self-target ``SELF`` and dropped Move/Rename
+    # self-targets. Anything still matching here is a Copy descendant whose
+    # prefix the resolution transform will rewrite, so it must stay NONE.
+    if _same_location(item):
+        return item
     dst_src = registry.get(item.dst_source_id)
     if dst_src is None:
         return item

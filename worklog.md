@@ -4965,3 +4965,118 @@ re-run in chunks, all green.
   growing parallel features.
 - Conflict-detection follow-ups from earlier today still parked: same-dir
   `src==dst` handling, folding Make-new into the conflict flow.
+
+---
+
+## 2026-06-03 (later) — Same-location (self-target) handling
+
+Picked up the parked `src==dst` follow-up from the conflict-detection
+session. The bug: aiming Copy/Move/Rename at the directory an entry
+already lives in builds `dst_path == src_path`. The conflict detector
+stats that destination, finds the entry's *own source*, and flags it as
+a normal collision. The dangerous case was **Move**: a dir-into-own-parent
+got flagged DIR, and choosing **Overwrite** ran the executor's
+`_remove_existing_blocking(dst)` → `shutil.rmtree(dst)` — deleting the
+source before the rename. Data loss.
+
+### Design conversation (design-first, two calls put to Matthew)
+
+Offered the two genuine choices via the question tool:
+
+- **Move/Rename self-target** → *Drop + status nudge*. Silently drop the
+  no-op item; if the plan empties, flash "already there — nothing to
+  move". Mixed plans drop the self-targets quietly. (Rejected: silent
+  drop with no feedback; a red PlanError which reads as alarming for a
+  benign case.)
+- **Copy self-target** → *Confirm via the dialog* (NOT a silent
+  auto-suffix). Surface it in `ConflictDialog` defaulting to Rename so the
+  user sees and can change it.
+
+Committed both to `design.md` (new "Same-location (self-target) handling"
+subsection under Conflict resolution dialog + a decision-log row).
+
+### What landed
+
+- **`ConflictKind.SELF`** — a fifth kind. `ConflictDialog` labels it
+  "(existing: same location)" and **defaults SELF rows to Rename** (real
+  collisions still default to the safe Skip).
+- **`resolve_self_targets(plan)`** in `conflicts.py`, run in `plan_copy` /
+  `plan_move` *before* `annotate_conflicts`. Pure data-in/out, no I/O.
+  **Copy**: mark the *topmost* `_same_location` item `SELF` (descendants
+  left `NONE` so the rename cascade / skip-prefix handles them — keeps the
+  dialog to one row per tagged entry, not one per walked leaf). **Move /
+  Rename**: drop the no-op item.
+- **`annotate_conflicts` skips `_same_location` items** — a self-target's
+  "existing" entry is itself, never a real collision. This keeps Copy
+  descendants `NONE` (so the SELF root's Rename cascade rewrites them) and
+  is defensive even if `resolve_self_targets` weren't called.
+- **`resolve_conflicts` needed no change** — a SELF root resolves through
+  the existing Rename path (`_free_dst` + prefix cascade → `name (1)`) or
+  Skip (drops the subtree via skip-prefix). Overwrite on a SELF row stays
+  technically reachable but is caught by the executor guard below.
+- **Executor defence in depth**: `_remove_existing_blocking(dst, src)`
+  now raises `ValueError` (→ `FAILED` item via `apply_plan`) when `dst`
+  *is* or *contains* `src` (`_would_destroy_source` / `_norm`). The three
+  OVERWRITE call sites (copy/move/rename) pass `src`. Belt-and-suspenders:
+  the plan-time pass should make this unreachable, but a planner bug or a
+  post-plan race must never rmtree the user's source.
+- **App nudge**: `_plan_modal_enqueue` flashes "already there — nothing to
+  <verb>" when the planner returns an empty (items+errors) plan — the only
+  producer is the Move self-target drop. Copy self-targets survive as SELF
+  items so Copy never hits it.
+
+### Mount-flakiness war story (rule 16, again — worse this time)
+
+The project mount silently truncated **multiple** `Edit`/`Write` results
+this session: `wtree/ops/__init__.py` (lost the tail of `__all__`),
+`wtree/widgets/conflict.py` (lost every method past `action_cursor_down`),
+and the bash mount served *stale* content to Python's import machinery so
+`import wtree.ops` failed even though `grep` found the new symbols. The
+Read tool (Windows side) and the bash mount disagreed for minutes at a
+time. **Resolution / hardened workflow**: stopped trusting in-place mount
+edits entirely. Extracted the clean committed tree with
+`git archive HEAD | tar -x -C /tmp/wt2` (reads git's object store, immune
+to mount staleness), re-applied every edit there via anchor-asserting
+Python scripts, ran the suite in the sandbox, then pushed each verified
+file back to the mount with **atomic rename + `md5sum` equality check**
+(staged `$f.wtmp` → `mv -f`). Confirmed every file md5-matched after copy,
+re-ran the executor/conflict suites against the *mount's* actual files
+(post-linter), and grepped the `## Open questions` tail of `design.md` to
+confirm no truncation. Lesson, sharpened: for this mount, the reliable
+authoring path is **sandbox-from-git → verify → atomic-copy-with-checksum**,
+never iterative in-place `Edit` on the mount.
+
+### Results
+
+587 → **611 / 611** green. 24 new tests in `tests/test_self_target.py`:
+`_same_location` (identity, dot/slash normalisation, cross-source);
+`resolve_self_targets` (Copy file→SELF, Copy dir→root-only-SELF, Move
+drop, empty); planner integration on a mock (Copy file/dir into own dir,
+Move drop-all); `resolve_conflicts` (SELF Rename → `proj (1)` with
+descendant cascade and no remaining self-target; SELF Skip → subtree
+dropped); `ConflictDialog` (SELF defaults Rename, mixed rows, "same
+location" label); the executor guard (`_would_destroy_source` parametrised
++ two real-FS OVERWRITE-onto-self refusals leaving the source intact); and
+two app e2e (Move into own dir nudges "already there" with nothing
+enqueued; Copy into own dir surfaces the dialog defaulting to Rename and
+produces `a (1).txt` on disk). 2 pre-existing `test_ops_move.py` action
+tests retargeted to a non-colliding dir — they had accepted the default
+(own-dir) destination and relied on the old self-conflict path.
+
+### Notes for next session
+
+- Still parked from the conflict-detection era: **folding Make-new into
+  the conflict flow** (it keeps its own exclusive-create + bespoke
+  collision message). The SELF machinery is now a natural fit if Make-new's
+  single-typed-name case gets generalised.
+- New parking-lot item surfaced by Matthew's "confirm via dialog" choice:
+  **inline editing / live preview of the suffixed name** in
+  `ConflictDialog`. Today a SELF Rename row shows the resolution + the
+  (pre-rename) dst path; the actual `name (1)` is computed later in
+  `resolve_conflicts`. Showing/editing the concrete target needs either a
+  plan-time precompute passed into the dialog or an in-row text input.
+- **Cross-platform `dst_path` normalisation** (todo.md) now also matters
+  for `_same_location`: a Windows-`\`-separator destination vs a POSIX-`/`
+  source wouldn't compare equal under `posixpath.normpath`. v0 native
+  paths are POSIX-style on both sides so it holds today; worth folding into
+  that broader normalisation pass when it lands.

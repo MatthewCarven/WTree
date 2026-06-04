@@ -215,14 +215,12 @@ async def test_action_move_uses_cursor_when_no_tags(
         await pilot.press("m")
         await pilot.pause()
         from wtree.widgets.prompt import PromptDialog
+        from textual.widgets import Input
         assert isinstance(app.screen, PromptDialog)
-        await pilot.press("enter")
-        await pilot.pause()
-        # Destination collides (copying/moving into the item's own dir);
-        # the conflict dialog appears - overwrite-all keeps every item.
-        from wtree.widgets.conflict import ConflictDialog
-        assert isinstance(app.screen, ConflictDialog)
-        await pilot.press("O")
+        # Move into a separate, non-colliding directory so the plan keeps the
+        # cursor entry. (Moving into its own directory is a self-target no-op
+        # - covered in test_self_target.py.)
+        app.screen.query_one(Input).value = "/landing"
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()
@@ -230,7 +228,7 @@ async def test_action_move_uses_cursor_when_no_tags(
     assert app.last_plan.kind is OperationKind.MOVE
     assert app.last_plan.file_count == 1
     assert app.last_plan.dir_count == 0
-    assert app.last_plan.items[0].dst_path == "/readme.txt"
+    assert app.last_plan.items[0].dst_path == "/landing/readme.txt"
 
 
 async def test_action_move_uses_tagged_set_when_present(
@@ -247,13 +245,12 @@ async def test_action_move_uses_tagged_set_when_present(
         assert len(app.tagged_set) == 2
         await pilot.press("m")
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
-        # Destination collides (copying/moving into the item's own dir);
-        # the conflict dialog appears - overwrite-all keeps every item.
-        from wtree.widgets.conflict import ConflictDialog
-        assert isinstance(app.screen, ConflictDialog)
-        await pilot.press("O")
+        from wtree.widgets.prompt import PromptDialog
+        from textual.widgets import Input
+        assert isinstance(app.screen, PromptDialog)
+        # Separate destination - both tagged dirs land under it as top-level
+        # items (neither is a self-target).
+        app.screen.query_one(Input).value = "/landing"
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()

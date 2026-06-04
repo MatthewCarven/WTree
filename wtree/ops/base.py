@@ -56,6 +56,14 @@ class ConflictKind(str, Enum):
     FILE = "file"
     DIR = "dir"
     OTHER = "other"
+    # The destination *is* the item's own source - the user aimed an entry
+    # at the directory it already lives in (``dst_path == src_path``). Not a
+    # collision with a *different* entry; the resolution semantics differ
+    # (Copy duplicates in place; Move/Rename are no-ops). Surfaced only for
+    # Copy - the Move/Rename planners drop self-targeted items before this
+    # ever reaches the dialog. See ``design.md`` -> Conflict resolution
+    # dialog -> Same-location (self-target) handling.
+    SELF = "self"
 
 
 class Resolution(str, Enum):

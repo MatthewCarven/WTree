@@ -800,6 +800,16 @@ class WTreeApp(App):
 
         destination = Tag(source_id=self._source.source_id, path=typed)
         plan = await planner(tags, destination, self.sources)
+        if not plan.items and not plan.errors:
+            # Every item resolved to a no-op. The only producer of this is
+            # the self-target drop in plan_move (Move/Rename of an entry into
+            # the directory it already lives in). Copy self-targets survive
+            # as SELF items, so Copy never lands here. Give the user a gentle
+            # nudge instead of silently doing nothing.
+            self.flash(
+                f"{verb}: already there - nothing to {verb.lower()}."
+            )
+            return
         plan = await self._resolve_plan_conflicts(plan, verb)
         if plan is None:
             return

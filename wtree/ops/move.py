@@ -30,7 +30,7 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
 )
-from wtree.ops.conflicts import annotate_conflicts
+from wtree.ops.conflicts import annotate_conflicts, resolve_self_targets
 from wtree.sources.base import EntrySource, ScanError
 from wtree.tagged_set import Tag
 
@@ -111,6 +111,11 @@ async def plan_move(
         )
 
     plan = Plan(kind=OperationKind.MOVE, items=items, errors=errors)
+    # Drop self-targeted moves (entry into its own directory) - a genuine
+    # no-op. Critically this happens *before* annotate_conflicts so such an
+    # item can never be flagged and offered Overwrite, which would rmtree
+    # the destination that is also the source.
+    plan = resolve_self_targets(plan)
     return await annotate_conflicts(plan, registry)
 
 

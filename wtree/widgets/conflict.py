@@ -51,6 +51,10 @@ _EXISTING_LABEL = {
     ConflictKind.FILE: "file",
     ConflictKind.DIR: "dir",
     ConflictKind.OTHER: "other",
+    # Self-target: the destination is the item's own location. Labelled
+    # distinctly so the user reads "duplicate in place" rather than
+    # "something is in the way".
+    ConflictKind.SELF: "same location",
 }
 
 
@@ -119,8 +123,19 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
         """
         super().__init__()
         self._items = list(items)
-        # Default every row to the safe choice.
-        self._res = [Resolution.SKIP for _ in self._items]
+        # Default per row. A real collision defaults to the safe,
+        # non-destructive Skip (Enter loses nothing). A SELF row - the user
+        # copying an entry into its own directory - defaults to Rename: the
+        # duplicate-in-place idiom is what they almost certainly want, and
+        # Skip on a self-target would silently do nothing. They can still
+        # flip it to Skip, or Overwrite (which the executor's self-destruct
+        # guard refuses, failing the item rather than eating the source).
+        self._res = [
+            Resolution.RENAME
+            if it.conflict is ConflictKind.SELF
+            else Resolution.SKIP
+            for it in self._items
+        ]
         self._cursor = 0
         self._row_labels: list[Label] = []
 
