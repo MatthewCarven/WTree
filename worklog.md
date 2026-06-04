@@ -5334,3 +5334,67 @@ e2e (edit-to-custom-name, reject-existing-then-accept, relative-subpath) in
 - The conflict-resolution UX is now feature-complete for v0.x: Skip /
   Overwrite / Rename (auto-suffix), live preview, and custom-name editing
   with verify-free, across Copy / Move / Rename / Make-new.
+
+---
+
+## 2026-06-04 (cont.) — Destination browser for Copy/Move (BUILT)
+
+Built the picker designed earlier today (committed `c6807c4`). Lets the user
+browse to a Copy/Move destination instead of typing it.
+
+### What shipped
+
+- **`wtree/widgets/dir_picker.py`** (new): `DirPickerScreen(ModalScreen[str |
+  None])` + `_PickerTree(Tree[str])`. Dir-only navigable tree; Enter on a dir
+  dismisses with its path; Esc -> None. `_PickerTree` ports TreePane's lazy
+  `_populate` (dir-only), Left/Right (collapse/parent, expand/drill),
+  Backspace-to-parent, and `reveal_path`/`_walk_to_node`, dropping tagging /
+  ascend. `n` is a `@work` worker: prompt -> shared `resolve_relative_leaf`
+  (relative subpath OK) -> verify-free re-prompt -> create via the executor's
+  `_make_new_blocking` (intermediate dirs) -> repopulate + reveal + select.
+  Footer shows the dir under the cursor as the prospective target + the
+  tagged-item count.
+- **`PromptDialog`**: `browse=True` mode + `BROWSE` sentinel; **Ctrl+B**
+  (refined from the design's `b` — a plain `b` would be eaten by the focused
+  `Input`; Ctrl+B is not an `Input` binding) dismisses with `BROWSE`. Inert
+  for every other PromptDialog caller.
+- **`ops/base.drive_anchor(path)`**: drive/share root (`/` POSIX, `C:\` etc.
+  via `splitdrive`), re-exported from `wtree.ops`.
+- **`app._plan_modal_enqueue`**: the destination prompt is now a loop —
+  Ctrl+B -> push `DirPickerScreen(start_root=drive_anchor(current),
+  reveal_target=current)` -> picked dir becomes the prompt's prefill ->
+  reopen. Single confirm point; everything downstream (same-location,
+  conflicts, preview, inline-edit, normalisation, executor) is untouched
+  because the picker only supplies a path.
+
+### Scope realised vs designed
+
+- **Ctrl+B not `b`** (Input would swallow `b`). Noted in design.md.
+- **Scan-*dialog* (cancel UI for slow dirs) deferred to phase 2** for the
+  picker: the first cut populates inline like TreePane's drill-in; the
+  chunked async scan keeps it responsive. Avoided pushing a ScanScreen over
+  the picker modal for now. Still phase 2: drive/share switching, type-to-
+  filter, files-greyed-for-context, and extracting a shared dir-populate
+  helper so picker/TreePane don't drift.
+
+### Testing notes
+
+`tests/test_dir_picker.py` drives the picker through a real `WTreeApp` +
+`NativeSource` on `tmp_path`, pushed via `app.push_screen(..., callback=...)`
+(no worker dance) with `start_root=tmp_path` for deterministic small trees;
+the app browse-loop wiring test goes through the real Copy flow (Ctrl+B opens
+the picker, Esc returns to the prompt). 8 picker tests + 2 `drive_anchor`
+units.
+
+### Results
+
+659 -> **669 / 669** green (the lone parallel-run red is the known
+`test_flash_clears_after_timeout` timing flake; passes serially).
+
+### Notes for next session
+
+- Picker **phase 2**: drive/share switching (enumeration; ties to the parked
+  Network-discovery item), type-to-filter (reuse `/`-search), scan-dialog
+  cancel-UI for huge dirs, files-greyed-for-context.
+- **Cleanup**: extract the dir-populate loop shared by `_PickerTree` and
+  `TreePane` into one helper so they don't drift.

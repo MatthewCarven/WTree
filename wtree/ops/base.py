@@ -430,3 +430,17 @@ def _human_bytes(n: int) -> str:
             return f"{n_kb:.1f} {unit}"
         n = int(n_kb)  # type: ignore[assignment]
     return f"{n:.1f} PB"
+
+
+def drive_anchor(path: str) -> str:
+    """The drive / share root of ``path`` - where the destination browser
+    starts so the user can roam the whole current drive.
+
+    ``/`` on POSIX, ``C:\\`` (or ``\\\\server\\share\\``) on Windows, via
+    ``os.path.splitdrive``. Used by the Copy/Move browse affordance to root
+    the :class:`~wtree.widgets.dir_picker.DirPickerScreen` at the top of the
+    drive the current destination lives on. (Switching to *another* drive is
+    a parked phase-2 stretch - see design.md.)
+    """
+    drive, _ = os.path.splitdrive(path)
+    return drive + os.sep if drive else os.sep

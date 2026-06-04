@@ -70,6 +70,7 @@ from wtree.ops import (
     select_range_for_rename,
     to_posix,
 )
+from wtree.ops.base import drive_anchor
 from wtree.ops.queue import (
     PROGRESS_MODAL_BYTES,
     PROGRESS_MODAL_DELAY_SECONDS,
@@ -81,6 +82,7 @@ from wtree.tagged_set import Tag, TaggedSet
 from wtree.widgets.confirm import ConfirmDialog
 from wtree.widgets.conflict import ConflictDialog
 from wtree.widgets.contents_pane import ContentsPane
+from wtree.widgets.dir_picker import DirPickerScreen
 from wtree.widgets.help import HelpScreen
 from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
@@ -793,21 +795,42 @@ class WTreeApp(App):
             f"{verb} {len(tags)} tagged item(s) to:" if len(tags) > 1
             else f"{verb} {tags[0].path} to:"
         )
-        typed = await self.push_screen_wait(
-            PromptDialog(
-                title=title,
-                initial=default_dest,
-                placeholder="destination directory path",
-                hint="Enter to confirm  -  Esc to cancel",
+        # Destination prompt with a browse affordance. Ctrl+B opens the
+        # DirPickerScreen rooted at the current drive/share; the chosen dir is
+        # fed back as the prompt's prefill, so there is a single confirm point
+        # (Enter) and the picked path stays editable. Loop so
+        # browse -> pick -> prompt cycles until the user confirms or cancels.
+        current = default_dest
+        while True:
+            typed = await self.push_screen_wait(
+                PromptDialog(
+                    title=title,
+                    initial=current,
+                    placeholder="destination directory path",
+                    hint="Enter confirm  -  Ctrl+B browse  -  Esc cancel",
+                    browse=True,
+                )
             )
-        )
-        if typed is None:
-            self.flash(f"{verb}: cancelled.")
-            return
-        typed = typed.strip()
-        if not typed:
-            self.flash(f"{verb}: cancelled (empty destination).")
-            return
+            if typed is None:
+                self.flash(f"{verb}: cancelled.")
+                return
+            if typed is PromptDialog.BROWSE:
+                picked = await self.push_screen_wait(
+                    DirPickerScreen(
+                        self._source,
+                        start_root=drive_anchor(current),
+                        reveal_target=current,
+                        tagged_count=len(tags),
+                    )
+                )
+                if picked is not None:
+                    current = picked
+                continue
+            typed = typed.strip()
+            if not typed:
+                self.flash(f"{verb}: cancelled (empty destination).")
+                return
+            break
 
         # Canonicalise the typed destination to the POSIX-flavoured internal
         # convention (flip native '\\' to '/') so dst_path stays single-

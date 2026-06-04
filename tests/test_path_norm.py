@@ -20,6 +20,7 @@ from wtree.app import WTreeApp
 from wtree.ops.base import (
     PlanItem,
     canonical_path,
+    drive_anchor,
     resolve_relative_leaf,
     to_posix,
 )
@@ -239,3 +240,17 @@ def test_resolve_relative_leaf_rejects_only_dots():
     leaf, err = resolve_relative_leaf("/d", "./.")
     assert leaf is None
     assert "no path components" in err
+
+
+# ---------------------------------------------------------------------------
+# drive_anchor - where the destination browser roots
+# ---------------------------------------------------------------------------
+
+
+def test_drive_anchor_posix_path():
+    # POSIX host: splitdrive yields no drive, so the anchor is "/".
+    assert drive_anchor("/a/b/c") == "/"
+
+
+def test_drive_anchor_posix_root_itself():
+    assert drive_anchor("/") == "/"

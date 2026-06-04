@@ -26,13 +26,27 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Label
 
 
+# Sentinel dismiss value: the user asked to switch to the directory browser
+# (Ctrl+B) rather than type a path. The Copy/Move caller checks
+# ``result is PromptDialog.BROWSE`` and pushes the DirPickerScreen. Only the
+# Copy/Move destination prompt enables this (``browse=True``); for every other
+# caller Ctrl+B is inert.
+class _Browse:
+    __slots__ = ()
+    def __repr__(self) -> str:  # pragma: no cover - debug aid only
+        return "PromptDialog.BROWSE"
+
+
 class PromptDialog(ModalScreen[str | None]):
     """A modal asking for one string.
 
     The generic type parameter ``str | None`` ties the dismiss type to the
     caller's ``await``: ``await push_screen_wait(PromptDialog(...))``
-    statically narrows to ``str | None``.
+    statically narrows to ``str | None``. In ``browse=True`` mode the dialog
+    may instead dismiss with the :data:`BROWSE` sentinel (see above).
     """
+
+    BROWSE = _Browse()
 
     DEFAULT_CSS = """
     PromptDialog {
@@ -62,6 +76,7 @@ class PromptDialog(ModalScreen[str | None]):
 
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
+        ("ctrl+b", "browse", "Browse"),
     ]
 
     def __init__(
@@ -72,6 +87,7 @@ class PromptDialog(ModalScreen[str | None]):
         placeholder: str = "",
         hint: str = "",
         select_initial: tuple[int, int] | None = None,
+        browse: bool = False,
     ) -> None:
         """``title`` is the question (e.g. "Copy 3 items to:"). ``initial``
         prefills the input. ``hint`` is a quiet line below the input —
@@ -91,6 +107,10 @@ class PromptDialog(ModalScreen[str | None]):
         self._placeholder = placeholder
         self._hint = hint
         self._select_initial = select_initial
+        # When True, Ctrl+B dismisses with the BROWSE sentinel so the caller
+        # can open the directory browser. Ctrl+B is not an Input binding, so
+        # it never steals a typed character.
+        self._browse = browse
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -135,3 +155,9 @@ class PromptDialog(ModalScreen[str | None]):
     def action_cancel(self) -> None:
         # Esc cancels.
         self.dismiss(None)
+
+    def action_browse(self) -> None:
+        # Ctrl+B: only the Copy/Move destination prompt opts in; elsewhere
+        # the key is inert (no browse affordance offered).
+        if self._browse:
+            self.dismiss(self.BROWSE)

@@ -49,6 +49,7 @@ from wtree.ops.base import (
     WalkSummary,
     WalkedEntry,
     canonical_path,
+    drive_anchor,
     resolve_relative_leaf,
     to_posix,
 )
@@ -80,6 +81,7 @@ __all__ = [
     "WalkSummary",
     "WalkedEntry",
     "canonical_path",
+    "drive_anchor",
     "resolve_relative_leaf",
     "to_posix",
     "apply_plan",
