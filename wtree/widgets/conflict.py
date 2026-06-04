@@ -30,6 +30,7 @@ choice, so a user who just presses Enter loses nothing.
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Sequence
 
 from textual.app import ComposeResult
@@ -116,13 +117,26 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
         ("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, items: Sequence[PlanItem]) -> None:
+    def __init__(
+        self,
+        items: Sequence[PlanItem],
+        previews: Sequence[str] | None = None,
+    ) -> None:
         """``items`` is the list of blocking conflict items, in plan order
         (i.e. ``[i for i in plan.items if i.conflict is not NONE]``). The
         returned ``list[Resolution]`` is parallel to it.
+
+        ``previews`` (optional, parallel to ``items``) is the collision-free
+        `` (n)``-suffixed destination each item would land on if Renamed -
+        precomputed at dialog-open time via
+        :func:`wtree.ops.conflicts.preview_renamed_dst`. When supplied, a row
+        set to Rename shows the concrete target basename inline; absent or
+        short, rows render without the preview (back-compatible with callers
+        and tests that construct the dialog items-only).
         """
         super().__init__()
         self._items = list(items)
+        self._previews = list(previews) if previews is not None else []
         # Default per row. A real collision defaults to the safe,
         # non-destructive Skip (Enter loses nothing). A SELF row - the user
         # copying an entry into its own directory - defaults to Rename: the
@@ -164,7 +178,16 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
         marker = ">" if i == self._cursor else " "
         res = _RES_LABEL[self._res[i]]
         existing = _EXISTING_LABEL.get(item.conflict, "?")
-        return f"{marker} [{res:<9}]  {item.dst_path}  (existing: {existing})"
+        line = f"{marker} [{res:<9}]  {item.dst_path}  (existing: {existing})"
+        # Live preview: when this row will Rename, append the concrete
+        # collision-free basename resolve_conflicts will produce (precomputed
+        # and passed in parallel to the items). Only RENAME rows show it -
+        # Skip / Overwrite keep the bare line. Guarded on length so an
+        # items-only construction renders unchanged.
+        preview = self._previews[i] if i < len(self._previews) else None
+        if self._res[i] is Resolution.RENAME and preview:
+            line += f"  -> {posixpath.basename(preview)}"
+        return line
 
     def _hint_text(self) -> str:
         return (

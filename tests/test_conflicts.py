@@ -29,6 +29,7 @@ from wtree.ops import (
     plan_copy,
     plan_move,
     plan_rename,
+    preview_renamed_dst,
     resolve_conflicts,
     suffixed_name,
 )
@@ -509,3 +510,86 @@ async def test_e2e_copy_collision_escape_cancels(tmp_path):
 
     assert app.last_plan is None
     assert (d / "a.txt").read_text() == "old"
+
+
+# ---------------------------------------------------------------------------
+# Rename live-preview (precomputed suffix shown inline in the dialog)
+# ---------------------------------------------------------------------------
+
+
+async def test_preview_renamed_dst_matches_resolve(collide_mock):
+    """preview_renamed_dst returns the exact dst resolve_conflicts lands on
+    for a RENAME - so the dialog preview never lies."""
+    plan = await plan_copy(
+        [Tag("mock", "/src/a.txt")], Tag("mock", "/dest"), _reg(collide_mock)
+    )
+    item = plan.items[0]
+    assert item.conflict is ConflictKind.FILE
+    preview = await preview_renamed_dst(item, _reg(collide_mock))
+    assert preview == "/dest/a (1).txt"
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], _reg(collide_mock)
+    )
+    assert resolved.items[0].dst_path == preview
+
+
+def test_dialog_rename_row_shows_suffix_preview():
+    item = _item("/dest/a.txt", Kind.FILE, ConflictKind.FILE)
+    d = ConflictDialog([item], previews=["/dest/a (1).txt"])
+    # FILE collision defaults to Skip -> no preview yet.
+    assert "->" not in d._row_text(0)
+    d.action_set_current("rename")
+    text = d._row_text(0)
+    assert "-> a (1).txt" in text
+    assert "/dest/a.txt" in text  # original dst still shown
+
+
+def test_dialog_overwrite_row_hides_preview():
+    item = _item("/dest/a.txt", Kind.FILE, ConflictKind.FILE)
+    d = ConflictDialog([item], previews=["/dest/a (1).txt"])
+    d.action_set_current("overwrite")
+    assert "->" not in d._row_text(0)
+
+
+def test_dialog_self_row_shows_duplicate_preview():
+    """SELF rows default to Rename, so the duplicate name shows immediately."""
+    item = _item("/d/proj", Kind.DIR, ConflictKind.SELF)
+    d = ConflictDialog([item], previews=["/d/proj (1)"])
+    assert "-> proj (1)" in d._row_text(0)
+
+
+def test_dialog_without_previews_renders_unchanged():
+    """Items-only construction (no previews) never appends an arrow, even on
+    a Rename row - back-compatible with existing callers/tests."""
+    item = _item("/d/proj", Kind.DIR, ConflictKind.SELF)  # defaults Rename
+    d = ConflictDialog([item])
+    assert "->" not in d._row_text(0)
+
+
+async def test_e2e_copy_collision_dialog_previews_rename(tmp_path):
+    """End-to-end: a real copy collision, set the row to Rename, and the
+    dialog row shows the concrete ' (1)' target."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("new")
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "a.txt").write_text("old")
+
+    app = WTreeApp(root_path=str(src))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        await _press_copy_to(pilot, app, str(d))
+        assert isinstance(app.screen, ConflictDialog)
+        await pilot.press("r")  # rename current row
+        assert "-> a (1).txt" in app.screen._row_text(0)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.op_queue is not None
+        await app.op_queue.wait_until_idle()
+
+    # Original preserved; the duplicate landed at the previewed name.
+    assert (d / "a.txt").read_text() == "old"
+    assert (d / "a (1).txt").read_text() == "new"

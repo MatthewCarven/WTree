@@ -251,6 +251,21 @@ async def _free_dst(
     return cand
 
 
+async def preview_renamed_dst(
+    item: PlanItem,
+    registry: Mapping[str, EntrySource],
+) -> str:
+    """The collision-free `` (n)``-suffixed destination a RENAME of ``item``
+    would produce - identical to what :func:`resolve_conflicts` lands on for a
+    RENAME row, exposed so :class:`~wtree.widgets.conflict.ConflictDialog` can
+    show a live preview of the rename target without re-deriving the suffix
+    logic. Same per-item independence as the resolve pass (no cross-row
+    cascade), so the previewed name matches the committed result when the
+    filesystem is unchanged between dialog-open and apply.
+    """
+    return await _free_dst(item, registry)
+
+
 # ---------------------------------------------------------------------------
 # Resolution transform
 # ---------------------------------------------------------------------------

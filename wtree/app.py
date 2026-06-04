@@ -64,6 +64,7 @@ from wtree.ops import (
     plan_make_new,
     plan_move,
     plan_rename,
+    preview_renamed_dst,
     resolve_conflicts,
     select_range_for_rename,
 )
@@ -841,7 +842,14 @@ class WTreeApp(App):
         ]
         if not conflicts:
             return plan
-        resolutions = await self.push_screen_wait(ConflictDialog(conflicts))
+        # Precompute each conflict's RENAME target so the dialog can show a
+        # live preview when a row is set to Rename (SELF rows default to it).
+        previews = [
+            await preview_renamed_dst(i, self.sources) for i in conflicts
+        ]
+        resolutions = await self.push_screen_wait(
+            ConflictDialog(conflicts, previews=previews)
+        )
         if resolutions is None:
             self.flash(f"{verb}: cancelled.")
             return None

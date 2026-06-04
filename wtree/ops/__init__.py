@@ -50,6 +50,7 @@ from wtree.ops.base import (
     WalkedEntry,
 )
 from wtree.ops.conflicts import (
+    preview_renamed_dst,
     resolve_conflicts,
     resolve_self_targets,
     suffixed_name,
@@ -81,6 +82,7 @@ __all__ = [
     "plan_make_new",
     "plan_move",
     "plan_rename",
+    "preview_renamed_dst",
     "resolve_conflicts",
     "resolve_self_targets",
     "select_range_for_rename",

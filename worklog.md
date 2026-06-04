@@ -5147,3 +5147,60 @@ Skip/Overwrite/Rename keystroke e2e, replacing the old clobber-refused test).
 - **Cross-platform `dst_path` normalisation** (todo.md) still outstanding;
   matters for `_same_location` and now for Make-new's leaf comparison on a
   Windows-`\` vs POSIX-`/` destination.
+
+---
+
+## 2026-06-04 (cont.) — Live preview of the Rename target in ConflictDialog
+
+Took the parked "inline live-preview of the suffixed name" item (Matthew's
+pick; the dst_path normalisation is next after this).
+
+### What changed
+
+Before: a Rename row in `ConflictDialog` showed the *pre-rename* `dst_path`;
+the concrete `name (1)` was only computed later inside `resolve_conflicts`,
+so the user committed a Rename without seeing what they'd get. Now the row
+shows `-> name (1)` inline the moment it's set to Rename.
+
+- `conflicts.py`: new public `preview_renamed_dst(item, registry)` — a thin
+  wrapper over the existing `_free_dst` suffix-hunt, so the preview reuses the
+  exact logic `resolve_conflicts` uses (same per-item independence, no
+  cross-row cascade). Previewed name == committed result when the FS is
+  unchanged between dialog-open and apply. Exported via `wtree/ops/__init__`.
+- `app._resolve_plan_conflicts`: precompute `previews = [await
+  preview_renamed_dst(i, sources) for i in conflicts]` and pass
+  `ConflictDialog(conflicts, previews=previews)`.
+- `widgets/conflict.py`: `__init__` gains optional `previews` (parallel to
+  items, length-guarded — items-only construction still works); `_row_text`
+  appends `  -> {basename(preview)}` **only** on RENAME rows. Toggling a row
+  re-renders through the existing `_refresh_row`, so the preview is live.
+  SELF rows (default Rename) show their duplicate name immediately.
+
+**Scope**: preview only. Inline *editing* of a custom target (an in-row text
+input) stays parked — a bigger feature (validation, re-stat on every
+keystroke) for another day.
+
+### Workflow
+
+Clean run — did the whole thing in the sandbox from `git archive HEAD` from
+the start (no in-place mount Edits this time), anchor-asserting Python +
+`ast.parse` after every patch, suite green in the sandbox, then pushed the 5
+changed files back to the mount with atomic `mv -f` + `md5sum` equality
+(all matched), and re-ran the slice against the mount's own files. No
+truncation gremlin surfaced this session.
+
+### Results
+
+620 → **626 / 626** green. 6 new tests in `tests/test_conflicts.py`:
+`preview_renamed_dst` matches the resolve result; dialog rendering
+(rename-row-shows / overwrite-row-hides / self-row-shows-duplicate /
+items-only-unchanged); and an e2e copy-collision that sets the row to Rename,
+asserts `-> a (1).txt` in the row, commits, and confirms the duplicate landed
+while the original stayed put.
+
+### Notes for next session
+
+- **Cross-platform `dst_path` normalisation** (todo.md) — Matthew's stated
+  next pick. Matters for `_same_location` (Windows `\` vs POSIX `/`), the
+  Make-new leaf comparison, and now the preview's basename split.
+- Inline *editing* of the suffixed name in the dialog remains parked.
