@@ -54,6 +54,7 @@ from wtree.ops.base import (
     Plan,
     PlanItem,
     Resolution,
+    canonical_path,
 )
 from wtree.sources.base import EntrySource, Kind
 
@@ -224,29 +225,24 @@ def _normalise_dst(dst_path: str) -> str:
     return os.path.normpath(dst_path) if os.sep == "\\" else dst_path
 
 
-def _norm(path: str) -> str:
-    """Case- and separator-normalised absolute path for self-target checks.
-
-    ``normcase`` folds case and slash-to-backslash on Windows; ``normpath``
-    collapses dot / dot-dot / redundant separators. No filesystem I/O (no
-    ``realpath``) - we compare the paths the plan carries, which is the
-    cheap belt-and-suspenders we want, not a symlink-resolving audit.
-    """
-    return os.path.normcase(os.path.normpath(path))
-
-
 def _would_destroy_source(dst: str, src: str) -> bool:
     """True if removing ``dst`` would also remove the operation's ``src``.
 
     Two cases: ``dst`` *is* ``src`` (move/copy/rename of an entry onto
     itself), or ``dst`` is an ancestor *directory* of ``src`` (so an
     ``rmtree(dst)`` would take ``src`` down with it). Either way the
-    OVERWRITE pre-step must refuse.
+    OVERWRITE pre-step must refuse. Comparison goes through
+    :func:`~wtree.ops.base.canonical_path` (separator + dot collapse, case
+    fold on Windows) - the same judgement plan-time self-target detection
+    uses - so a typed-``\\`` or different-case ``dst`` is still caught. No
+    filesystem I/O (no ``realpath``): we compare the paths the plan carries,
+    the cheap belt-and-suspenders we want, not a symlink-resolving audit. The
+    canonical form is ``/``-separated, so the ancestor test uses ``/``.
     """
-    ndst, nsrc = _norm(dst), _norm(src)
+    ndst, nsrc = canonical_path(dst), canonical_path(src)
     if ndst == nsrc:
         return True
-    return nsrc.startswith(ndst + os.sep)
+    return nsrc.startswith(ndst + "/")
 
 
 def _remove_existing_blocking(dst: str, src: str | None = None) -> None:

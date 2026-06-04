@@ -48,6 +48,8 @@ from wtree.ops.base import (
     Resolution,
     WalkSummary,
     WalkedEntry,
+    canonical_path,
+    to_posix,
 )
 from wtree.ops.conflicts import (
     preview_renamed_dst,
@@ -76,6 +78,8 @@ __all__ = [
     "Resolution",
     "WalkSummary",
     "WalkedEntry",
+    "canonical_path",
+    "to_posix",
     "apply_plan",
     "plan_copy",
     "plan_delete",

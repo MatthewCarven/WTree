@@ -5204,3 +5204,69 @@ while the original stayed put.
   next pick. Matters for `_same_location` (Windows `\` vs POSIX `/`), the
   Make-new leaf comparison, and now the preview's basename split.
 - Inline *editing* of the suffixed name in the dialog remains parked.
+
+---
+
+## 2026-06-04 (cont.) — Cross-platform dst_path normalisation
+
+Matthew's chosen follow-up after the preview work. Closes the long-parked
+`dst_path` normalisation item and the recurring `_same_location` caveat
+("a Windows-`\`-separator destination vs a POSIX-`/` source wouldn't compare
+equal under `posixpath.normpath`").
+
+### Design (two decisions, both confirmed with Matthew)
+
+1. **Identity comparison = separator + case-insensitive on Windows.** New
+   shared `canonical_path(path, *, case_insensitive=os.name=='nt')` in
+   `ops/base.py` flips `\`->`/` (`to_posix`), collapses dots/redundant
+   slashes (`posixpath.normpath`), and `.lower()`s when case-insensitive
+   (NTFS default; POSIX case-sensitive; macOS treated case-sensitive, a known
+   soft spot). The flag is a *parameter* so the Windows behaviour is unit-
+   testable on this POSIX sandbox.
+2. **Normalise at the boundary too.** Typed Copy/Move destinations are
+   `to_posix`'d in `_plan_modal_enqueue` before becoming the destination
+   `Tag`, so stored `dst_path`, the dialog row, and the rename preview's
+   `posixpath.basename` stay single-separator.
+
+### Code
+
+- `ops/base.py`: `to_posix` + `canonical_path` + `_PATHS_CASE_INSENSITIVE`.
+- `conflicts._same_location`: now `canonical_path(src) == canonical_path(dst)`.
+- `execute`: dropped `_norm`; `_would_destroy_source` routes through
+  `canonical_path` and its ancestor test switches `+ os.sep` -> `+ "/"`
+  (canonical form is `/`-separated). Both guards now judge "same location"
+  identically to plan time.
+- `make_new`: private `_to_posix` folded into the shared `to_posix`.
+- `app`: typed destination canonicalised via `to_posix`; `to_posix` re-
+  exported from `wtree.ops`.
+
+### Workflow
+
+Clean again — whole change built in a sandbox from `git archive HEAD`,
+anchor-assert + `ast.parse` per patch, suite green, atomic `mv -f` +
+`md5sum` push-back, re-ran the slice against the mount's files. One linter
+touch split a `from wtree.ops.base import` in two on the mount; merged it
+back into a single block (re-verified md5) so the import stays tidy. No
+truncation gremlin.
+
+### Results
+
+626 → **641 / 641** green. 15 new tests in `tests/test_path_norm.py`:
+`to_posix` (flip / noop / mixed); `canonical_path` (dot collapse, separator
+unify, case-sensitive keeps case, case-insensitive folds case+separators,
+os-default-flag wiring); `_same_location` separator unification + still-
+distinguishes-real-difference; `_would_destroy_source` identity/ancestor/
+unrelated across separators; and an app e2e typing a `\`-separator own-dir
+destination that surfaces the SELF/duplicate dialog.
+
+### Notes for next session
+
+- **Cross-*source* path translation** (native<->archive, native<->remote)
+  is the remaining normalisation work, deferred until a second source type
+  exists — `canonical_path` is single-convention (POSIX-flavoured) and
+  assumes one filesystem's identity rules.
+- macOS case-insensitivity is still treated as case-sensitive
+  (`_PATHS_CASE_INSENSITIVE = os.name == 'nt'`); revisit if/when macOS
+  becomes a daily-use platform (would need per-volume detection, not just
+  os.name).
+- Inline *editing* of the suffixed name in `ConflictDialog` remains parked.

@@ -15,10 +15,49 @@ methods on it.
 from __future__ import annotations
 
 import os
+import posixpath
 from dataclasses import dataclass, field
 from enum import Enum
 
 from wtree.sources.base import Kind
+
+
+# Path identity is case-insensitive on Windows (NTFS default) and case-
+# sensitive on POSIX. macOS (HFS+/APFS default-insensitive) is treated as
+# case-sensitive for now - a known soft spot, same as the case-only-rename
+# note in todo.md. The ``canonical_path`` flag lets callers (and tests) pin
+# the behaviour explicitly regardless of host OS.
+_PATHS_CASE_INSENSITIVE = os.name == "nt"
+
+
+def to_posix(path: str) -> str:
+    """Flip native backslashes to forward slashes.
+
+    The internal path convention is POSIX-flavoured: typed destinations and
+    the segment-walk planners funnel through here so every downstream
+    ``posixpath`` op (join / basename / normpath) and string comparison sees
+    one separator style. :func:`wtree.ops.execute._normalise_dst` flips them
+    back to the native separator on Windows just before the OS call.
+    """
+    return path.replace("\\", "/")
+
+
+def canonical_path(
+    path: str, *, case_insensitive: bool = _PATHS_CASE_INSENSITIVE
+) -> str:
+    """Canonical form for comparing two paths for *identity*.
+
+    Flips separators to ``/`` (:func:`to_posix`), collapses ``.`` / ``..`` /
+    redundant slashes (``posixpath.normpath``), and lowercases when
+    ``case_insensitive`` (the Windows / NTFS default). Deterministic given
+    the flag regardless of host OS, so the cross-platform behaviour is unit-
+    testable anywhere. Used by self-target detection
+    (:func:`wtree.ops.conflicts._same_location`) and the executor's overwrite
+    self-destruct guard (:func:`wtree.ops.execute._would_destroy_source`) so
+    both judge "same location" identically.
+    """
+    p = posixpath.normpath(to_posix(path))
+    return p.lower() if case_insensitive else p
 
 
 class OperationKind(str, Enum):

@@ -33,6 +33,7 @@ from wtree.ops.base import (
     Plan,
     PlanItem,
     Resolution,
+    canonical_path,
 )
 from wtree.sources.base import EntrySource, Kind, ScanError
 
@@ -49,20 +50,18 @@ _MAX_SUFFIX = 9999
 def _same_location(item: PlanItem) -> bool:
     """True when ``item``'s destination is its own source.
 
-    Same source id *and* the POSIX-normalised paths are equal - i.e. the
-    user aimed an entry at the directory it already lives in, so the planner
-    built ``dst_path == src_path``. Normalisation collapses incidental
-    dot / double-slash / trailing-slash differences a typed destination can
-    carry (``/d/./proj/`` == ``/d/proj``). Cross-platform separator
-    unification (a Windows-separator destination vs a POSIX-slash source) is
-    the broader ``dst_path`` normalisation concern parked in ``todo.md``; v0
-    paths are POSIX-style on both sides within a native session.
+    Same source id *and* the canonical paths are equal - i.e. the user aimed
+    an entry at the directory it already lives in, so the planner built
+    ``dst_path == src_path``. :func:`~wtree.ops.base.canonical_path` collapses
+    incidental dot / double-slash / trailing-slash differences a typed
+    destination can carry (``/d/./proj/`` == ``/d/proj``), unifies separators
+    (a typed Windows ``\\`` destination vs a POSIX ``/`` source), and folds
+    case on case-insensitive platforms (Windows/NTFS) - the same judgement the
+    executor's :func:`~wtree.ops.execute._would_destroy_source` guard uses.
     """
     if item.src_source_id != item.dst_source_id:
         return False
-    return posixpath.normpath(item.src_path) == posixpath.normpath(
-        item.dst_path
-    )
+    return canonical_path(item.src_path) == canonical_path(item.dst_path)
 
 
 def resolve_self_targets(plan: Plan) -> Plan:

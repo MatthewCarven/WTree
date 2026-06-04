@@ -53,6 +53,7 @@ from wtree.ops.base import (
     Plan,
     PlanError,
     PlanItem,
+    to_posix,
 )
 from wtree.ops.conflicts import annotate_conflicts
 from wtree.sources.base import EntrySource, Kind
@@ -62,18 +63,6 @@ from wtree.sources.base import EntrySource, Kind
 # excluded - symlinks need a separate "what target?" prompt, and OTHER
 # (sockets, devices, fifos) isn't a sensible filemanager op.
 _MAKEABLE: frozenset[Kind] = frozenset({Kind.DIR, Kind.FILE})
-
-
-def _to_posix(path: str) -> str:
-    """Replace backslashes with forward slashes.
-
-    Mirror of the convention every other planner follows: planner paths
-    are POSIX-flavoured, and :func:`wtree.ops.execute._normalise_dst`
-    flips them back to native separators on Windows. Centralising the
-    flip here keeps the planner readable for the absolute-path /
-    segment-walk checks below.
-    """
-    return path.replace("\\", "/")
 
 
 async def plan_make_new(
@@ -128,7 +117,7 @@ async def plan_make_new(
     # Normalise the typed name. Strip surrounding whitespace (common
     # typo) and trailing slashes (the kind is already chosen via the
     # chooser modal, so "foo/" vs "foo" means the same thing).
-    cleaned = _to_posix(name.strip()).rstrip("/")
+    cleaned = to_posix(name.strip()).rstrip("/")
     if not cleaned:
         return Plan(
             kind=OperationKind.MAKE_NEW,
@@ -201,7 +190,7 @@ async def plan_make_new(
     #   parent_path == ""    -> leaf is relative (just the segments).
     #   parent_path == "/"   -> leaf is "/" + segments.
     #   parent_path == X     -> leaf is X (trailing-slash-trimmed) + "/" + segments.
-    parent_posix = _to_posix(parent_path)
+    parent_posix = to_posix(parent_path)
     name_rel = "/".join(segments)
     if parent_posix == "":
         leaf_path = name_rel

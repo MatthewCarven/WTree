@@ -67,6 +67,7 @@ from wtree.ops import (
     preview_renamed_dst,
     resolve_conflicts,
     select_range_for_rename,
+    to_posix,
 )
 from wtree.ops.queue import (
     PROGRESS_MODAL_BYTES,
@@ -807,7 +808,13 @@ class WTreeApp(App):
             self.flash(f"{verb}: cancelled (empty destination).")
             return
 
-        destination = Tag(source_id=self._source.source_id, path=typed)
+        # Canonicalise the typed destination to the POSIX-flavoured internal
+        # convention (flip native '\\' to '/') so dst_path stays single-
+        # separator for posixpath joins/splits, display, and self-target
+        # detection. The executor flips back to native on Windows at apply.
+        destination = Tag(
+            source_id=self._source.source_id, path=to_posix(typed)
+        )
         plan = await planner(tags, destination, self.sources)
         if not plan.items and not plan.errors:
             # Every item resolved to a no-op. The only producer of this is
