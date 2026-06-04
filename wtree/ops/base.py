@@ -60,6 +60,47 @@ def canonical_path(
     return p.lower() if case_insensitive else p
 
 
+def resolve_relative_leaf(
+    parent_path: str, typed: str
+) -> tuple[str | None, str | None]:
+    """Resolve a user-typed *relative* name to a leaf path under ``parent_path``.
+
+    Returns ``(leaf, None)`` on success or ``(None, error)`` on rejection.
+    Lenient on separators - ``sub/leaf`` implies intermediate directories the
+    caller's executor will create. Rejects absolute paths, ``..`` escapes, and
+    names that collapse to nothing. Shared by the Make-new planner and the
+    :class:`~wtree.widgets.conflict.ConflictDialog` custom-rename editor so
+    both validate a typed relative target identically. POSIX-flavoured
+    throughout (see :func:`to_posix`).
+
+    Three parent shapes: ``""`` -> leaf is the bare segments; ``"/"`` -> leaf
+    is ``"/" + segments``; otherwise ``parent (trailing-slash-trimmed) + "/" +
+    segments``.
+    """
+    cleaned = to_posix(typed.strip()).rstrip("/")
+    if not cleaned:
+        return None, "name is empty"
+    # Absolute is rejected - the target lands under ``parent_path``, not at a
+    # typed root. Catches POSIX-absolute ("/x"), Windows-drive ("C:/x" after
+    # the backslash flip) and UNC ("//srv/x", caught by the leading "/").
+    if cleaned.startswith("/") or (len(cleaned) >= 2 and cleaned[1] == ":"):
+        return None, f"name {cleaned!r} is absolute; use a relative name"
+    segments = [s for s in cleaned.split("/") if s and s != "."]
+    if not segments:
+        return None, "name resolves to no path components"
+    if any(seg == ".." for seg in segments):
+        return None, f"name {cleaned!r} contains a '..' segment"
+    name_rel = "/".join(segments)
+    parent_posix = to_posix(parent_path)
+    if parent_posix == "":
+        leaf = name_rel
+    elif parent_posix == "/":
+        leaf = "/" + name_rel
+    else:
+        leaf = parent_posix.rstrip("/") + "/" + name_rel
+    return leaf, None
+
+
 class OperationKind(str, Enum):
     """The kinds of operations a Plan can describe.
 

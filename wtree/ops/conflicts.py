@@ -296,6 +296,8 @@ async def resolve_conflicts(
     plan: Plan,
     resolutions: Sequence[Resolution],
     registry: Mapping[str, EntrySource],
+    *,
+    custom_dsts: Sequence[str | None] | None = None,
 ) -> Plan:
     """Rebuild ``plan`` according to the user's per-conflict ``resolutions``.
 
@@ -320,6 +322,22 @@ async def resolve_conflicts(
         )
     res_by_id = {id(it): r for it, r in zip(conflict_items, resolutions)}
 
+    # Optional per-conflict custom RENAME destinations (parallel to
+    # ``resolutions``): a fully-resolved, collision-verified dst the user typed
+    # in the ConflictDialog editor. When present for a RENAME item it is used
+    # verbatim instead of the auto `` (n)`` hunt; descendants cascade onto it
+    # through the same rename_map rewrite.
+    custom_by_id: dict[int, str | None] = {}
+    if custom_dsts is not None:
+        if len(custom_dsts) != len(conflict_items):
+            raise ValueError(
+                f"resolve_conflicts: got {len(custom_dsts)} custom dst(s) "
+                f"for {len(conflict_items)} conflict(s)"
+            )
+        custom_by_id = {
+            id(it): c for it, c in zip(conflict_items, custom_dsts)
+        }
+
     # First pass: gather skip prefixes (skipped directories) and compute
     # collision-free destinations for renamed items.
     skip_prefixes: list[str] = []
@@ -330,7 +348,10 @@ async def resolve_conflicts(
             if it.kind is Kind.DIR:
                 skip_prefixes.append(it.dst_path)
         elif r is Resolution.RENAME:
-            rename_map[it.dst_path] = await _free_dst(it, registry)
+            custom = custom_by_id.get(id(it))
+            rename_map[it.dst_path] = (
+                custom if custom else await _free_dst(it, registry)
+            )
 
     # Second pass: rebuild the items list.
     new_items: list[PlanItem] = []

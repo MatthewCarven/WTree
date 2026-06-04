@@ -17,7 +17,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from wtree.app import WTreeApp
-from wtree.ops.base import PlanItem, canonical_path, to_posix
+from wtree.ops.base import (
+    PlanItem,
+    canonical_path,
+    resolve_relative_leaf,
+    to_posix,
+)
 from wtree.ops.conflicts import _same_location
 from wtree.ops.execute import _would_destroy_source
 from wtree.sources.base import Kind
@@ -165,3 +170,72 @@ async def test_e2e_typed_backslash_dest_into_own_dir_is_self(tmp_path: Path):
         from wtree.ops.base import Resolution
 
         assert app.screen._res == [Resolution.RENAME]
+
+
+# ---------------------------------------------------------------------------
+# resolve_relative_leaf - shared by Make-new and the ConflictDialog editor
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_relative_leaf_basename():
+    leaf, err = resolve_relative_leaf("/d/dest", "report.txt")
+    assert err is None
+    assert leaf == "/d/dest/report.txt"
+
+
+def test_resolve_relative_leaf_subpath_lenient():
+    leaf, err = resolve_relative_leaf("/d/dest", "sub/deep/x.txt")
+    assert err is None
+    assert leaf == "/d/dest/sub/deep/x.txt"
+
+
+def test_resolve_relative_leaf_flips_backslashes():
+    leaf, err = resolve_relative_leaf("/d/dest", r"sub\x.txt")
+    assert err is None
+    assert leaf == "/d/dest/sub/x.txt"
+
+
+def test_resolve_relative_leaf_collapses_dots():
+    leaf, err = resolve_relative_leaf("/d/dest", "./a//b")
+    assert err is None
+    assert leaf == "/d/dest/a/b"
+
+
+def test_resolve_relative_leaf_root_parent():
+    leaf, err = resolve_relative_leaf("/", "x")
+    assert (leaf, err) == ("/x", None)
+
+
+def test_resolve_relative_leaf_empty_parent():
+    leaf, err = resolve_relative_leaf("", "x/y")
+    assert (leaf, err) == ("x/y", None)
+
+
+def test_resolve_relative_leaf_rejects_empty():
+    leaf, err = resolve_relative_leaf("/d", "   ")
+    assert leaf is None
+    assert "empty" in err
+
+
+def test_resolve_relative_leaf_rejects_absolute():
+    leaf, err = resolve_relative_leaf("/d", "/etc/passwd")
+    assert leaf is None
+    assert "absolute" in err.lower()
+
+
+def test_resolve_relative_leaf_rejects_drive_absolute():
+    leaf, err = resolve_relative_leaf("/d", r"C:\windows")
+    assert leaf is None
+    assert "absolute" in err.lower()
+
+
+def test_resolve_relative_leaf_rejects_dotdot():
+    leaf, err = resolve_relative_leaf("/d", "../escape")
+    assert leaf is None
+    assert ".." in err
+
+
+def test_resolve_relative_leaf_rejects_only_dots():
+    leaf, err = resolve_relative_leaf("/d", "./.")
+    assert leaf is None
+    assert "no path components" in err

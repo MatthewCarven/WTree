@@ -58,6 +58,7 @@ from wtree.ops import (
     OperationQueue,
     OperationResult,
     Plan,
+    PlanItem,
     Resolution,
     plan_copy,
     plan_delete,
@@ -74,7 +75,7 @@ from wtree.ops.queue import (
     PROGRESS_MODAL_DELAY_SECONDS,
     PROGRESS_MODAL_ITEMS,
 )
-from wtree.sources.base import EntrySource, Kind
+from wtree.sources.base import EntrySource, Kind, ScanError
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag, TaggedSet
 from wtree.widgets.confirm import ConfirmDialog
@@ -854,17 +855,36 @@ class WTreeApp(App):
         previews = [
             await preview_renamed_dst(i, self.sources) for i in conflicts
         ]
-        resolutions = await self.push_screen_wait(
-            ConflictDialog(conflicts, previews=previews)
+        choices = await self.push_screen_wait(
+            ConflictDialog(
+                conflicts,
+                previews=previews,
+                name_exists=self._conflict_target_exists,
+            )
         )
-        if resolutions is None:
+        if choices is None:
             self.flash(f"{verb}: cancelled.")
             return None
-        resolved = await resolve_conflicts(plan, resolutions, self.sources)
+        resolutions, custom_dsts = choices
+        resolved = await resolve_conflicts(
+            plan, resolutions, self.sources, custom_dsts=custom_dsts
+        )
         if not resolved.items:
             self.flash(f"{verb}: nothing to do (all conflicts skipped).")
             return None
         return resolved
+
+    async def _conflict_target_exists(
+        self, item: PlanItem, path: str
+    ) -> bool:
+        """Async existence check the ConflictDialog custom-rename editor uses
+        to verify a typed target is free before accepting it. Stats ``path``
+        in the conflict item's destination source (errors-as-data: a
+        ``ScanError`` means "nothing there" -> free)."""
+        src = self.sources.get(item.dst_source_id)
+        if src is None:
+            return False
+        return not isinstance(await src.entry_at(path), ScanError)
 
     async def _plan_confirm_enqueue(
         self,

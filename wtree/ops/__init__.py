@@ -49,6 +49,7 @@ from wtree.ops.base import (
     WalkSummary,
     WalkedEntry,
     canonical_path,
+    resolve_relative_leaf,
     to_posix,
 )
 from wtree.ops.conflicts import (
@@ -79,6 +80,7 @@ __all__ = [
     "WalkSummary",
     "WalkedEntry",
     "canonical_path",
+    "resolve_relative_leaf",
     "to_posix",
     "apply_plan",
     "plan_copy",

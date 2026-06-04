@@ -1,10 +1,12 @@
 """``ConflictDialog`` - per-conflict resolution modal.
 
-Shown by the Copy / Move / Rename action layer when plan-time conflict
-detection (:func:`wtree.ops.conflicts.annotate_conflicts`) flags one or
-more ``PlanItem``s whose destination already exists. The user picks a
-resolution per row; the returned list feeds
-:func:`wtree.ops.conflicts.resolve_conflicts`.
+Shown by the Copy / Move / Rename / Make-new action layer when plan-time
+conflict detection (:func:`wtree.ops.conflicts.annotate_conflicts`) flags
+one or more ``PlanItem``s whose destination already exists. The user picks
+a resolution per row; the dialog dismisses with a parallel
+``(list[Resolution], list[str | None])`` that feeds
+:func:`wtree.ops.conflicts.resolve_conflicts` - the second list carries a
+custom rename target per row (or ``None`` = use the auto `` (n)`` suffix).
 
 Distinct from :class:`~wtree.widgets.confirm.ConfirmDialog` (a pure
 yes/no gate) - the per-row state needs its own widget. Mirrors the
@@ -19,8 +21,12 @@ resolution dialog):
 * ``s`` / ``o`` / ``r`` set the *current* row to Skip / Overwrite /
   Rename.
 * ``S`` / ``O`` / ``R`` set *all* rows at once (the common case).
-* ``Enter`` commits the current selections - dismisses with the
-  parallel ``list[Resolution]``.
+* ``e`` edits the *current* row's Rename target - pops a
+  :class:`~wtree.widgets.prompt.PromptDialog` pre-filled with the auto
+  `` (n)`` name; the typed value (a relative subpath is allowed) is
+  validated and re-stat'd, re-prompting on a collision so the chosen name
+  is guaranteed free. Editing forces the row to Rename.
+* ``Enter`` commits - dismisses with ``(resolutions, custom_dsts)``.
 * ``Esc`` cancels the *entire* operation - dismisses with ``None``
   (distinct from skipping every row).
 
@@ -31,14 +37,21 @@ choice, so a user who just presses Enter loses nothing.
 from __future__ import annotations
 
 import posixpath
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Label
 
-from wtree.ops.base import ConflictKind, PlanItem, Resolution
+from wtree.ops.base import (
+    ConflictKind,
+    PlanItem,
+    Resolution,
+    resolve_relative_leaf,
+)
+from wtree.widgets.prompt import PromptDialog
 
 
 # Display order / labels for the three user-choosable resolutions.
@@ -58,8 +71,15 @@ _EXISTING_LABEL = {
     ConflictKind.SELF: "same location",
 }
 
+# Async existence check the editor uses to verify a typed custom target is
+# free: ``(item, candidate_dst_path) -> bool``. Supplied by the action layer
+# (it knows the sources); ``None`` disables the check (items-only tests).
+NameExists = Callable[[PlanItem, str], Awaitable[bool]]
 
-class ConflictDialog(ModalScreen[list[Resolution] | None]):
+
+class ConflictDialog(
+    ModalScreen["tuple[list[Resolution], list[str | None]] | None"]
+):
     """A modal letting the user resolve each detected conflict."""
 
     DEFAULT_CSS = """
@@ -113,6 +133,7 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
         ("S", "set_all('skip')", "Skip all"),
         ("O", "set_all('overwrite')", "Overwrite all"),
         ("R", "set_all('rename')", "Rename all"),
+        ("e", "edit_name", "Edit name"),
         ("enter", "commit", "Commit"),
         ("escape", "cancel", "Cancel"),
     ]
@@ -121,22 +142,26 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
         self,
         items: Sequence[PlanItem],
         previews: Sequence[str] | None = None,
+        name_exists: NameExists | None = None,
     ) -> None:
         """``items`` is the list of blocking conflict items, in plan order
         (i.e. ``[i for i in plan.items if i.conflict is not NONE]``). The
-        returned ``list[Resolution]`` is parallel to it.
+        returned lists are parallel to it.
 
         ``previews`` (optional, parallel to ``items``) is the collision-free
         `` (n)``-suffixed destination each item would land on if Renamed -
         precomputed at dialog-open time via
-        :func:`wtree.ops.conflicts.preview_renamed_dst`. When supplied, a row
-        set to Rename shows the concrete target basename inline; absent or
-        short, rows render without the preview (back-compatible with callers
-        and tests that construct the dialog items-only).
+        :func:`wtree.ops.conflicts.preview_renamed_dst`. A Rename row shows the
+        concrete target inline; absent or short, rows render without it.
+
+        ``name_exists`` (optional) is the async checker the ``e`` editor uses
+        to verify a typed custom target is free before accepting it. ``None``
+        disables the check - used by items-only unit tests.
         """
         super().__init__()
         self._items = list(items)
         self._previews = list(previews) if previews is not None else []
+        self._name_exists = name_exists
         # Default per row. A real collision defaults to the safe,
         # non-destructive Skip (Enter loses nothing). A SELF row - the user
         # copying an entry into its own directory - defaults to Rename: the
@@ -150,6 +175,9 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
             else Resolution.SKIP
             for it in self._items
         ]
+        # Custom RENAME target per row (fully-resolved, collision-verified
+        # dst_path), or None = use the auto `` (n)`` suffix.
+        self._custom: list[str | None] = [None] * len(self._items)
         self._cursor = 0
         self._row_labels: list[Label] = []
 
@@ -173,26 +201,50 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
 
     # -- rendering ----------------------------------------------------
 
+    def _parent_of(self, i: int) -> str:
+        """POSIX parent directory of the conflict item's destination."""
+        return posixpath.dirname(self._items[i].dst_path.rstrip("/"))
+
+    def _rel_under_parent(self, i: int, full: str) -> str:
+        """``full`` expressed relative to row ``i``'s parent dir, so a
+        subpath custom target stays legible; falls back to the basename."""
+        parent = self._parent_of(i)
+        sep = parent if parent.endswith("/") else parent + "/"
+        if full.startswith(sep):
+            return full[len(sep):]
+        return posixpath.basename(full)
+
+    def _rename_target_display(self, i: int) -> str | None:
+        """The name shown after ``->`` on a Rename row, or None if unknown.
+
+        A user-edited custom target wins (relative to the parent, tagged
+        ``(edited)``); otherwise the precomputed auto-suffix basename.
+        """
+        custom = self._custom[i]
+        if custom is not None:
+            return f"{self._rel_under_parent(i, custom)} (edited)"
+        preview = self._previews[i] if i < len(self._previews) else None
+        return posixpath.basename(preview) if preview else None
+
     def _row_text(self, i: int) -> str:
         item = self._items[i]
         marker = ">" if i == self._cursor else " "
         res = _RES_LABEL[self._res[i]]
         existing = _EXISTING_LABEL.get(item.conflict, "?")
         line = f"{marker} [{res:<9}]  {item.dst_path}  (existing: {existing})"
-        # Live preview: when this row will Rename, append the concrete
-        # collision-free basename resolve_conflicts will produce (precomputed
-        # and passed in parallel to the items). Only RENAME rows show it -
-        # Skip / Overwrite keep the bare line. Guarded on length so an
-        # items-only construction renders unchanged.
-        preview = self._previews[i] if i < len(self._previews) else None
-        if self._res[i] is Resolution.RENAME and preview:
-            line += f"  -> {posixpath.basename(preview)}"
+        # Live preview: when this row will Rename, append the concrete target
+        # (custom if edited, else the auto-suffix basename). Only RENAME rows
+        # show it - Skip / Overwrite keep the bare line.
+        if self._res[i] is Resolution.RENAME:
+            target = self._rename_target_display(i)
+            if target:
+                line += f"  -> {target}"
         return line
 
     def _hint_text(self) -> str:
         return (
             "Up/Down move  -  s/o/r set row  -  S/O/R set all  -  "
-            "Enter confirm  -  Esc cancel op"
+            "e edit name  -  Enter confirm  -  Esc cancel op"
         )
 
     def _refresh_row(self, i: int) -> None:
@@ -242,8 +294,64 @@ class ConflictDialog(ModalScreen[list[Resolution] | None]):
             self._res[i] = res
         self._refresh_all_rows()
 
+    @work
+    async def action_edit_name(self) -> None:
+        """Edit the current row's Rename target via a PromptDialog.
+
+        A worker (``push_screen_wait`` must run off the message pump). Editing
+        forces the row to Rename. The prompt is pre-filled with the current
+        effective target (prior custom, else the auto-suffix). The typed value
+        may be a relative subpath; it's validated by
+        :func:`wtree.ops.base.resolve_relative_leaf` and re-stat'd via
+        ``name_exists``, re-prompting (with the reason on the hint line) on an
+        invalid or already-existing target. Esc on the prompt keeps whatever
+        was there. No checker -> no existence test.
+        """
+        if not self._items:
+            return
+        i = self._cursor
+        item = self._items[i]
+        self._res[i] = Resolution.RENAME  # editing implies rename
+        parent = self._parent_of(i)
+        prefill = self._edit_prefill(i)
+        hint = "Enter to confirm  -  Esc to keep the auto name"
+        title = f"Rename target under {parent or '/'}:"
+        while True:
+            typed = await self.app.push_screen_wait(
+                PromptDialog(
+                    title=title,
+                    initial=prefill,
+                    placeholder="new name (relative subpath allowed)",
+                    hint=hint,
+                )
+            )
+            if typed is None:
+                break  # keep current (auto suffix or a prior custom)
+            leaf, err = resolve_relative_leaf(parent, typed)
+            if err is not None:
+                prefill, hint = typed, f"! {err}"
+                continue
+            if self._name_exists is not None and await self._name_exists(
+                item, leaf
+            ):
+                prefill, hint = typed, f"! already exists: {leaf}"
+                continue
+            self._custom[i] = leaf
+            break
+        self._refresh_row(i)
+
+    def _edit_prefill(self, i: int) -> str:
+        """The string to pre-fill the edit prompt with."""
+        custom = self._custom[i]
+        if custom is not None:
+            return self._rel_under_parent(i, custom)
+        preview = self._previews[i] if i < len(self._previews) else None
+        if preview:
+            return posixpath.basename(preview)
+        return posixpath.basename(self._items[i].dst_path.rstrip("/"))
+
     def action_commit(self) -> None:
-        self.dismiss(list(self._res))
+        self.dismiss((list(self._res), list(self._custom)))
 
     def action_cancel(self) -> None:
         self.dismiss(None)

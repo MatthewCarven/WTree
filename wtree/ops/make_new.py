@@ -53,7 +53,7 @@ from wtree.ops.base import (
     Plan,
     PlanError,
     PlanItem,
-    to_posix,
+    resolve_relative_leaf,
 )
 from wtree.ops.conflicts import annotate_conflicts
 from wtree.sources.base import EntrySource, Kind
@@ -114,90 +114,23 @@ async def plan_make_new(
             ],
         )
 
-    # Normalise the typed name. Strip surrounding whitespace (common
-    # typo) and trailing slashes (the kind is already chosen via the
-    # chooser modal, so "foo/" vs "foo" means the same thing).
-    cleaned = to_posix(name.strip()).rstrip("/")
-    if not cleaned:
+    # Validate + resolve the typed name to a leaf under ``parent_path``.
+    # Shared with the ConflictDialog custom-rename editor (lenient on
+    # separators, rejects absolute / ``..`` / empty). Make-new wraps the
+    # human message as an ``InvalidName`` PlanError.
+    leaf_path, err = resolve_relative_leaf(parent_path, name)
+    if err is not None:
         return Plan(
             kind=OperationKind.MAKE_NEW,
             errors=[
                 PlanError(
                     source_id=source_id,
                     path=parent_path,
-                    message="new name is empty",
+                    message=f"new {err}",
                     cause="InvalidName",
                 )
             ],
         )
-
-    # Refuse absolute paths - Make-new lands under the displayed parent,
-    # not at the user's typed root. Catches POSIX-absolute ("/etc/...")
-    # and Windows-absolute ("C:\\foo" became "C:/foo" after the
-    # backslash flip; UNC "\\\\srv\\sh\\x" became "//srv/sh/x" which
-    # starts with "/" and is caught by the first check).
-    if cleaned.startswith("/") or (len(cleaned) >= 2 and cleaned[1] == ":"):
-        return Plan(
-            kind=OperationKind.MAKE_NEW,
-            errors=[
-                PlanError(
-                    source_id=source_id,
-                    path=parent_path,
-                    message=(
-                        f"new name {cleaned!r} is absolute; "
-                        "Make-new creates entries under the current pane "
-                        "directory - use a relative name or navigate first"
-                    ),
-                    cause="InvalidName",
-                )
-            ],
-        )
-
-    # Walk the segments. Drop "." silently (noise, not intent); reject
-    # ".." (would escape the parent, contradicts the "create under pane
-    # parent" contract). Collapsing "" between separators handles
-    # double-slash inputs like "foo//bar".
-    segments = [s for s in cleaned.split("/") if s and s != "."]
-    if not segments:
-        return Plan(
-            kind=OperationKind.MAKE_NEW,
-            errors=[
-                PlanError(
-                    source_id=source_id,
-                    path=parent_path,
-                    message="new name resolves to no path components",
-                    cause="InvalidName",
-                )
-            ],
-        )
-    if any(seg == ".." for seg in segments):
-        return Plan(
-            kind=OperationKind.MAKE_NEW,
-            errors=[
-                PlanError(
-                    source_id=source_id,
-                    path=parent_path,
-                    message=(
-                        f"new name {cleaned!r} contains a '..' segment; "
-                        "Make-new cannot escape the current directory"
-                    ),
-                    cause="InvalidName",
-                )
-            ],
-        )
-
-    # Build the leaf path under ``parent_path``. Three shapes:
-    #   parent_path == ""    -> leaf is relative (just the segments).
-    #   parent_path == "/"   -> leaf is "/" + segments.
-    #   parent_path == X     -> leaf is X (trailing-slash-trimmed) + "/" + segments.
-    parent_posix = to_posix(parent_path)
-    name_rel = "/".join(segments)
-    if parent_posix == "":
-        leaf_path = name_rel
-    elif parent_posix == "/":
-        leaf_path = "/" + name_rel
-    else:
-        leaf_path = parent_posix.rstrip("/") + "/" + name_rel
 
     # A leaf that already exists is no longer a hard rejection. Emit the
     # item and let :func:`annotate_conflicts` stat ``dst_path`` and flag the

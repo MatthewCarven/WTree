@@ -593,3 +593,171 @@ async def test_e2e_copy_collision_dialog_previews_rename(tmp_path):
     # Original preserved; the duplicate landed at the previewed name.
     assert (d / "a.txt").read_text() == "old"
     assert (d / "a (1).txt").read_text() == "new"
+
+
+# ---------------------------------------------------------------------------
+# resolve_conflicts - custom RENAME destinations (the inline-edit path)
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_conflicts_uses_custom_dst(collide_mock):
+    plan = await plan_copy(
+        [Tag("mock", "/src/a.txt")], Tag("mock", "/dest"), _reg(collide_mock)
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], _reg(collide_mock),
+        custom_dsts=["/dest/custom.txt"],
+    )
+    assert len(resolved.items) == 1
+    assert resolved.items[0].dst_path == "/dest/custom.txt"
+    assert resolved.items[0].conflict is ConflictKind.NONE
+    assert resolved.items[0].resolution is Resolution.PROCEED
+
+
+async def test_resolve_conflicts_custom_none_falls_back_to_auto(collide_mock):
+    plan = await plan_copy(
+        [Tag("mock", "/src/a.txt")], Tag("mock", "/dest"), _reg(collide_mock)
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], _reg(collide_mock), custom_dsts=[None]
+    )
+    # None per row -> the auto " (n)" hunt still runs.
+    assert resolved.items[0].dst_path == "/dest/a (1).txt"
+
+
+async def test_resolve_conflicts_custom_dst_cascades_to_descendants(
+    collide_mock,
+):
+    # /dest2/proj is a FILE -> copying the dir there flags the dir item
+    # (type mismatch); a custom rename of the dir cascades onto its walked
+    # descendant.
+    plan = await plan_copy(
+        [Tag("mock", "/src/proj")], Tag("mock", "/dest2"), _reg(collide_mock)
+    )
+    resolved = await resolve_conflicts(
+        plan, [Resolution.RENAME], _reg(collide_mock),
+        custom_dsts=["/dest2/archive"],
+    )
+    by_src = {i.src_path: i.dst_path for i in resolved.items}
+    assert by_src["/src/proj"] == "/dest2/archive"
+    assert by_src["/src/proj/inner.txt"] == "/dest2/archive/inner.txt"
+
+
+async def test_resolve_conflicts_custom_dst_length_mismatch_raises(
+    collide_mock,
+):
+    plan = await plan_copy(
+        [Tag("mock", "/src/a.txt")], Tag("mock", "/dest"), _reg(collide_mock)
+    )
+    with pytest.raises(ValueError):
+        await resolve_conflicts(
+            plan, [Resolution.RENAME], _reg(collide_mock), custom_dsts=[]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Inline-edit e2e (press e -> PromptDialog -> custom target)
+# ---------------------------------------------------------------------------
+
+
+async def _open_editor(pilot, app):
+    """Press e on the conflict dialog and wait for the edit PromptDialog."""
+    await pilot.press("e")
+    await pilot.pause()
+    await pilot.pause()
+    assert isinstance(app.screen, PromptDialog), (
+        f"expected edit prompt, got {type(app.screen).__name__}"
+    )
+
+
+async def _type_and_enter(pilot, app, value: str) -> None:
+    from textual.widgets import Input
+
+    app.screen.query_one(Input).value = value
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.pause()
+
+
+async def test_e2e_conflict_edit_custom_name(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("new")
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "a.txt").write_text("old")
+
+    app = WTreeApp(root_path=str(src))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        await _press_copy_to(pilot, app, str(d))
+        assert isinstance(app.screen, ConflictDialog)
+        await _open_editor(pilot, app)
+        await _type_and_enter(pilot, app, "renamed.txt")
+        assert isinstance(app.screen, ConflictDialog)
+        assert "-> renamed.txt (edited)" in app.screen._row_text(0)
+        await pilot.press("enter")  # commit
+        await pilot.pause()
+        await app.op_queue.wait_until_idle()
+
+    assert (d / "renamed.txt").read_text() == "new"
+    assert (d / "a.txt").read_text() == "old"      # original untouched
+    assert not (d / "a (1).txt").exists()           # auto-suffix NOT used
+
+
+async def test_e2e_conflict_edit_rejects_existing_then_accepts(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("new")
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "a.txt").write_text("old")
+    (d / "taken.txt").write_text("nope")
+
+    app = WTreeApp(root_path=str(src))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        await _press_copy_to(pilot, app, str(d))
+        await _open_editor(pilot, app)
+        # Type a name that already exists -> rejected, re-prompted.
+        await _type_and_enter(pilot, app, "taken.txt")
+        assert isinstance(app.screen, PromptDialog)
+        # Now a free name -> accepted.
+        await _type_and_enter(pilot, app, "free.txt")
+        assert isinstance(app.screen, ConflictDialog)
+        assert "-> free.txt (edited)" in app.screen._row_text(0)
+        await pilot.press("enter")
+        await pilot.pause()
+        await app.op_queue.wait_until_idle()
+
+    assert (d / "free.txt").read_text() == "new"
+    assert (d / "taken.txt").read_text() == "nope"  # untouched
+
+
+async def test_e2e_conflict_edit_relative_subpath(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("new")
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "a.txt").write_text("old")
+
+    app = WTreeApp(root_path=str(src))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        await _press_copy_to(pilot, app, str(d))
+        await _open_editor(pilot, app)
+        await _type_and_enter(pilot, app, "sub/b.txt")
+        assert isinstance(app.screen, ConflictDialog)
+        assert "-> sub/b.txt (edited)" in app.screen._row_text(0)
+        await pilot.press("enter")
+        await pilot.pause()
+        await app.op_queue.wait_until_idle()
+
+    assert (d / "sub" / "b.txt").read_text() == "new"

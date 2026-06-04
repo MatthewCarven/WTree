@@ -5270,3 +5270,67 @@ destination that surfaces the SELF/duplicate dialog.
   becomes a daily-use platform (would need per-volume detection, not just
   os.name).
 - Inline *editing* of the suffixed name in `ConflictDialog` remains parked.
+
+---
+
+## 2026-06-04 (cont.) — Inline editing of the Rename target in ConflictDialog
+
+The last parked conflict-flow item, and the close of the whole arc
+(self-target -> Make-new fold -> rename preview -> path normalisation ->
+inline edit).
+
+### Design (two decisions, confirmed with Matthew)
+
+1. **Verify-free with re-prompt.** Pressing `e` on a row pops a PromptDialog
+   pre-filled with the current effective target. The typed value is validated
+   by the shared `resolve_relative_leaf` and **re-stat'd** via an async
+   `name_exists(item, path)` checker the app supplies; an invalid or
+   already-existing target re-prompts with the reason on the hint line, so the
+   accepted name is guaranteed collision-free.
+2. **Relative subpath allowed** (`sub/leaf`), Make-new-style — not
+   basename-only. Intermediate dirs are created by the executor at apply.
+
+### Code
+
+- `ops/base.py`: extracted `resolve_relative_leaf(parent, typed) ->
+  (leaf | None, error | None)` — the lenient segment-walk (flip separators,
+  reject absolute / `..` / empty, build leaf under parent). **Make-new now
+  delegates to it** (wrapping the error as an `InvalidName` PlanError;
+  asserted substrings - "empty"/"absolute"/".." - preserved), killing the
+  duplicate validation.
+- `widgets/conflict.py`: `e` -> `@work action_edit_name` (push_screen_wait
+  must run off the message pump) loops PromptDialog -> validate -> re-stat ->
+  store or re-prompt. New `name_exists` ctor arg; `_custom` per-row list;
+  row shows `-> custom (edited)` (relative to parent so subpaths stay
+  legible). **Return type changed** from `list[Resolution]` to
+  `(list[Resolution], list[str | None])`.
+- `conflicts.resolve_conflicts`: keyword `custom_dsts=`; a RENAME row with a
+  custom dst seeds `rename_map` with it verbatim, so the existing
+  prefix-cascade rewrites descendants onto the custom target. Length-mismatch
+  raises (wiring guard).
+- `app`: `_conflict_target_exists` (stats the dst source); `_resolve_plan_
+  conflicts` passes `name_exists=`, unpacks the tuple, threads `custom_dsts`.
+
+### Workflow
+
+Clean. Whole change in a sandbox from `git archive HEAD`; the dialog was a
+full-file rewrite (too many touch-points for safe anchors) written via
+heredoc since the Write tool can't reach the sandbox path; everything else
+anchor-asserted + `ast.parse`d. Suite green, atomic `mv -f` + `md5sum`
+push-back (all 8 matched), re-ran the slice against the mount's files.
+
+### Results
+
+641 -> **659 / 659** green. 18 new tests: 11 `resolve_relative_leaf` units in
+`tests/test_path_norm.py`; 4 `resolve_conflicts` custom-dst + 3 inline-edit
+e2e (edit-to-custom-name, reject-existing-then-accept, relative-subpath) in
+`tests/test_conflicts.py`.
+
+### Notes for next session
+
+- **Cross-*source* path translation** (native<->archive/remote) is the only
+  remaining normalisation/path item, deferred until a second source type
+  exists.
+- The conflict-resolution UX is now feature-complete for v0.x: Skip /
+  Overwrite / Rename (auto-suffix), live preview, and custom-name editing
+  with verify-free, across Copy / Move / Rename / Make-new.
