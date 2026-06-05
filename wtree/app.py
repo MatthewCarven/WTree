@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import os
 import posixpath
+import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from textual import work
@@ -50,6 +51,10 @@ from textual.containers import Horizontal
 from textual.widgets import DataTable, Header, Tree
 
 from wtree import __version__
+from pathlib import Path
+
+from wtree.crash import build_report, install_crash_redactors, write_crash_log
+from wtree.error_handler import ErrorReport
 from wtree.editor import launch_editor_blocking, resolve_editor
 from wtree.ops import (
     ConflictKind,
@@ -208,6 +213,32 @@ class WTreeApp(App):
         self._tree_find_query: str | None = None
         self._tree_find_matches: list[str] = []
         self._tree_find_idx: int = 0
+
+        # Crash-reporting state. Textual's run() does not re-raise
+        # in-loop crashes, so _handle_exception is the only reliable
+        # interception point; it stashes the report here for main()
+        # to surface a pointer after the app exits. See design.md
+        # "Error handling and crash reporting".
+        self._crash_report: ErrorReport | None = None
+        self._crash_log_path: Path | None = None
+
+    def _handle_exception(self, error: Exception) -> None:
+        """Route in-loop crashes through the reporter, then defer to Textual.
+
+        Textual's ``run()`` does not re-raise; this override is the only
+        reliable interception point for event-loop crashes (see design.md
+        "Error handling and crash reporting"). Build + persist a report,
+        stash it for ``main()`` to surface a pointer post-exit, then call
+        ``super()`` so Textual's own teardown + Rich dump proceed unchanged.
+        Never raises - crash reporting must not mask the crash.
+        """
+        try:
+            report = build_report(error)
+            self._crash_report = report
+            self._crash_log_path = write_crash_log(report)
+        except Exception:  # noqa: BLE001 - reporting must never mask the crash
+            pass
+        super()._handle_exception(error)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1587,7 +1618,7 @@ class WTreeApp(App):
             # we explicitly dismiss to avoid a stale frame.
             for screen in list(self.screen_stack):
                 if isinstance(screen, ScanScreen) and screen._ctx is ctx:
-                    screen.dismiss()
+                    screen.safe_dismiss()
                     break
 
     def _maybe_push_progress_dialog(
@@ -1718,8 +1749,42 @@ class WTreeApp(App):
 
 
 def main() -> None:
-    """Console-script entry point - the ``wtree`` command launches the app."""
-    WTreeApp().run()
+    """Console-script entry point - the ``wtree`` command launches the app.
+
+    Installs the default crash redactors, runs the app, and surfaces a
+    crash report on failure. Two nets (design.md "Error handling and
+    crash reporting"): ``WTreeApp._handle_exception`` catches in-loop
+    crashes (Textual\'s ``run()`` returns normally after printing its own
+    dump), and this outer ``try/except`` catches construction / teardown
+    errors that never reach the loop. Either way: write a log, point the
+    user at it, exit non-zero.
+    """
+    install_crash_redactors()
+    app = WTreeApp()
+    try:
+        app.run()
+    except Exception as error:  # noqa: BLE001 - outermost net for non-loop crashes
+        report = build_report(error)
+        path = write_crash_log(report)
+        print(str(report), file=sys.stderr)
+        if path is not None:
+            print(
+                f"\nWTree hit an error - full report written to {path}",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+    # In-loop crash: Textual already printed its dump on screen; add our
+    # one-line pointer to the persisted report and exit non-zero.
+    if app._crash_report is not None:
+        if app._crash_log_path is not None:
+            print(
+                f"WTree hit an error - full report written to "
+                f"{app._crash_log_path}",
+                file=sys.stderr,
+            )
+        else:
+            print("WTree hit an error during this session.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

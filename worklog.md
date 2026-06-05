@@ -5485,3 +5485,37 @@ serial-passes). Installed `pyflakes` in the sandbox to verify the import trim.
   `Resolution`, `properties.py` `field`/`Sequence`, `copy.py` `walked_iter`,
   `execute.py` `exc`, `sources/base.py` `field`. A future lint-sweep could
   clear these.
+
+## 2026-06-05 — ScanScreen double-dismiss crash fixed (HALTED for user's pending update)
+
+**Bug.** Launching `wtree` crashed with `ScreenStackError: Can't pop screen; there must be at least one screen on the stack` from `ScanScreen._refresh` → `self.dismiss(None)` → `app.pop_screen`, with only `Screen(id='_default')` left on the stack.
+
+**Root cause.** Three callers race to close the scan modal: the redraw timer (`_refresh`, on `ctx.completed`/`ctx.cancelled`), the Esc handler (`action_cancel`), and the gate's `finally` block (`WTreeApp._run_scan_with_dialog`). Textual's `dismiss` pops the stack unconditionally, so whichever caller fires second pops the base `_default` screen and raises. The screen's polling timer (PROGRESS_REDRAW_HZ) had a callback already queued when the gate's `finally` dismissed, so it fired post-pop.
+
+**Fix.** Added `ScanScreen.safe_dismiss()` — idempotent (`self._dismissing` flag) and stack-membership-guarded (`if self in self.app.screen_stack`), wrapped in the existing torn-down `except`. Routed all three callers through it: `_refresh`, `action_cancel`, and the gate's `finally` in `app.py` (`screen.safe_dismiss()`). Files: `wtree/widgets/scan_screen.py`, `wtree/app.py`.
+
+**Verification.** `tests/test_scan_dialog.py` → 29/29 pass. Full suite NOT run to completion: the sandbox mount went flaky again (truncated/stale reads — pyflakes saw a `main()`→`ma` truncation and phantom unused imports that grep disproved) and `pytest-asyncio` had to be reinstalled in the sandbox. **Halted at user's request to apply a pending update before running the full suite.**
+
+**Pickup for next session.**
+- Matthew to run the full suite locally (Python 3.14, Windows) — expect 673 prior + scan-dialog still green; confirm no regression.
+- Consider the same `safe_dismiss` guard for `ProgressScreen` (`progress_screen.py` lines ~166, 182, 195) — same double-dismiss shape, not yet observed crashing but latent.
+- Crash handler: WTree has NO global handler; the Rich traceback seen is Textual's built-in default. Matthew has one in another project to potentially drop in — not yet wired.
+
+## 2026-06-05 — Crash reporter dropped in (vendored `describe_error`)
+
+Design-first pass (signed off by Matthew), then built. WTree had no crash handler — unhandled in-loop exceptions surfaced as Textual's default Rich dump.
+
+**Grounding finding (drove the design):** Textual 8.2.7's `App.run()`/`run_async` does **not** re-raise in-loop exceptions. `_handle_exception` stashes the error, prints its own Rich traceback to the exit screen, sets return code 1, and `run()` returns *normally*; only the test-pilot context re-raises. So a `main()` wrapper alone would miss every event-loop crash (e.g. the same-day `ScanScreen` one). The only reliable hook is `_handle_exception`.
+
+**Built:**
+- Vendored `error_handler.py` → `wtree/error_handler.py` verbatim (pure stdlib, zero deps) with a provenance header (synced from `Python ErrorHandler` @ `23af8d3`).
+- `wtree/crash.py` glue: `install_crash_redactors()` (default scrub set: `sk-…`, `password=…`, `token=…`), `build_report()` (locals gated by `WTREE_DEBUG=1`, off by default), `write_crash_log()` → `~/.wtree/crashes/crash-<UTC>-<pid>.log` (for_claude text + to_dict JSON; never raises, never writes into the flaky project mount).
+- `WTreeApp._handle_exception` override: build+persist report, stash `self._crash_report`/`self._crash_log_path`, then `super()._handle_exception` (Textual's dump + teardown kept — design decision: keep dump + add logfile + pointer; owning the exit screen is parked phase-2).
+- `main()` two nets: outer `try/except` for construction/teardown errors; post-`run()` check surfaces a stashed in-loop crash with a one-line `full report written to <path>` pointer + `sys.exit(1)`.
+- 11 tests in `tests/test_crash_handler.py` (redaction, WTREE_DEBUG locals gate, log write + never-raise, `_handle_exception` stash+delegate, both `main()` nets, clean-exit). **673 → 684/684 green** (run in quarters; the full all-at-once run flaked one timing-sensitive dialog test under the 44s sandbox timeout — green every time in isolation).
+- design.md: new "Error handling and crash reporting" section + dated decision-log entry.
+
+**Follow-ups (next session):**
+- `ProgressScreen` has the same latent double-dismiss shape as the fixed `ScanScreen` — apply the same `safe_dismiss` guard (`progress_screen.py` ~166/182/195).
+- Pre-existing lint (NOT from this work): `wtree/app.py` imports `Resolution` from `wtree.ops` but never uses it — single occurrence at HEAD too. Trivial trim when convenient.
+- Phase-2 option: fully own Textual's exit screen (replace the Rich dump with a clean "WTree hit an error — report at <path>" panel) instead of keeping both.

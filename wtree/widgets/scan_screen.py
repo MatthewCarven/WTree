@@ -156,6 +156,29 @@ class ScanScreen(ModalScreen[None]):
         super().__init__()
         self._ctx = ctx
         self._timer: Optional[Timer] = None
+        self._dismissing = False
+
+    # --- safe dismissal --------------------------------------------------
+
+    def safe_dismiss(self) -> None:
+        """Pop this modal at most once, only while it's still on the stack.
+
+        Three callers race to close this dialog: the redraw timer (on
+        ``completed`` / ``cancelled``), the Esc handler, and the gate's
+        ``finally`` block (:meth:`WTreeApp._run_scan_with_dialog`).
+        Textual's :meth:`dismiss` pops the screen stack unconditionally,
+        so a second call pops the base ``_default`` screen and raises
+        ``ScreenStackError``. Gate on an idempotency flag *and* actual
+        stack membership so whichever caller wins, the rest are no-ops.
+        """
+        if self._dismissing:
+            return
+        self._dismissing = True
+        try:
+            if self in self.app.screen_stack:
+                self.dismiss(None)
+        except Exception:  # noqa: BLE001 - torn down between timer and call
+            pass
 
     # --- compose / mount --------------------------------------------------
 
@@ -186,7 +209,7 @@ class ScanScreen(ModalScreen[None]):
         fires the cancel signal.
         """
         self._ctx.cancelled.set()
-        self.dismiss(None)
+        self.safe_dismiss()
 
     # --- repaint ---------------------------------------------------------
 
@@ -198,7 +221,7 @@ class ScanScreen(ModalScreen[None]):
         as soon as the scan finishes (cancelled or otherwise).
         """
         if self._ctx.completed.is_set() or self._ctx.cancelled.is_set():
-            self.dismiss(None)
+            self.safe_dismiss()
             return
         try:
             body = self.query_one("#scan-body", Static)
