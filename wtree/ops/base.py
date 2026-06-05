@@ -166,6 +166,24 @@ class Resolution(str, Enum):
     RENAME = "rename"
 
 
+# Entries processed between cooperative yields during a long plan build.
+# Mirrors scan_screen.SCAN_CHUNK_SIZE (kept independent to avoid an
+# ops -> widgets import); 500 is the same sweet spot - small enough that
+# Textual gets paint frames during a big plan, large enough that the
+# yield overhead is negligible.
+PLAN_CHUNK_SIZE = 500
+
+
+class ScanCancelled(Exception):
+    """Raised by a planner when its ``should_cancel`` callback fires.
+
+    Lets a long plan build (walk + conflict-annotate) under the scan
+    dialog abort atomically: the partially-built plan is discarded and
+    nothing is enqueued. Caught at the app boundary
+    (:meth:`WTreeApp._plan_modal_enqueue`), which flashes "cancelled".
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class WalkedEntry:
     """One leaf of a tag-tree walk - file or directory, source-side only.
@@ -230,6 +248,11 @@ class WalkSummary:
 
     entries: list[WalkedEntry] = field(default_factory=list)
     errors: list[PlanError] = field(default_factory=list)
+    # One sublist per input tag, in tag order - the entries that tag's
+    # walk produced. Lets plan_copy zip tags->entries in O(n) instead of
+    # re-scanning the flat ``entries`` once per tag. ``entries`` stays the
+    # flat union for the count/size properties and existing callers.
+    entries_by_tag: list[list[WalkedEntry]] = field(default_factory=list)
 
     @property
     def file_count(self) -> int:

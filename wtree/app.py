@@ -44,6 +44,7 @@ import os
 import posixpath
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import TypeVar
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -64,7 +65,7 @@ from wtree.ops import (
     OperationResult,
     Plan,
     PlanItem,
-    Resolution,
+    ScanCancelled,
     plan_copy,
     plan_delete,
     plan_make_new,
@@ -113,11 +114,13 @@ from wtree.widgets.tree_pane import TreePane
 from wtree.widgets.viewer import ViewerScreen
 
 
-# Planner signature for ops with a destination: (tags, dest, registry) -> Plan
-DestPlanner = Callable[
-    [Sequence[Tag], Tag, Mapping[str, EntrySource]],
-    Awaitable[Plan],
-]
+_ScanT = TypeVar("_ScanT")
+
+
+# Planner signature for ops with a destination:
+# (tags, dest, registry, *, on_progress=, should_cancel=) -> Plan.
+# Ellipsis params because the progress/cancel hooks are keyword-only.
+DestPlanner = Callable[..., Awaitable[Plan]]
 # Planner signature for ops without a destination: (tags, registry) -> Plan
 NoDestPlanner = Callable[
     [Sequence[Tag], Mapping[str, EntrySource]],
@@ -870,7 +873,26 @@ class WTreeApp(App):
         destination = Tag(
             source_id=self._source.source_id, path=to_posix(typed)
         )
-        plan = await planner(tags, destination, self.sources)
+        # Build the plan under the scan-dialog gate: walking + conflict-
+        # annotating a large tagged set is O(entries) of I/O, so for big
+        # sets it shows a cancellable 'Planning' dialog instead of
+        # freezing the UI. Esc raises ScanCancelled from the planner.
+        try:
+            plan = await self._run_scan_with_dialog(
+                destination.path,
+                self._source,
+                lambda ctx: planner(
+                    tags,
+                    destination,
+                    self.sources,
+                    on_progress=lambda n: setattr(ctx, "entries_seen", n),
+                    should_cancel=ctx.cancelled.is_set,
+                ),
+                header=f"Planning {verb.lower()}",
+            )
+        except ScanCancelled:
+            self.flash(f"{verb}: cancelled.")
+            return
         if not plan.items and not plan.errors:
             # Every item resolved to a no-op. The only producer of this is
             # the self-target drop in plan_move (Move/Rename of an entry into
@@ -1550,10 +1572,10 @@ class WTreeApp(App):
         self,
         path: str,
         source: EntrySource,
-        do_work: Callable[[ScanContext], Awaitable[None]],
+        do_work: Callable[[ScanContext], Awaitable[_ScanT]],
         *,
         header: str = "Scanning",
-    ) -> None:
+    ) -> _ScanT:
         """Run ``do_work(ctx)`` under the scan-dialog gate.
 
         Builds a fresh :class:`ScanContext` tied to ``path`` and the
@@ -1581,6 +1603,14 @@ class WTreeApp(App):
         * Initial mount - the very first contents-pane scan on app
           launch.
 
+        Also gates Copy/Move plan-building (``_plan_modal_enqueue``):
+        ``plan_copy`` / ``plan_move`` walk + conflict-annotate a large
+        tagged set under this dialog, reporting progress via ``ctx`` and
+        raising :class:`ScanCancelled` on Esc - which propagates out of
+        here (the ``finally`` still runs) for the caller to catch.
+
+        Returns whatever ``do_work`` returns (e.g. the built ``Plan``).
+
         Future call sites (parked on todo.md): tree-pane Right-arrow
         expand of a node with many children; ``focus_dir_under_cursor``
         on Enter into a big dir; ``Ctrl+F`` find-across-tree's walker.
@@ -1607,7 +1637,7 @@ class WTreeApp(App):
             SCAN_MODAL_DELAY_SECONDS, _push_if_still_running
         )
         try:
-            await do_work(ctx)
+            return await do_work(ctx)
         finally:
             ctx.completed.set()
             delay_timer.stop()

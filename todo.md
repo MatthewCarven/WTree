@@ -270,3 +270,7 @@ See `design.md` parking lot section. Summary: inline editor, archive sources, re
 ## Crash handler — DONE 2026-06-05
 
 Vendored `describe_error` (`Python ErrorHandler` @ 23af8d3) wired into `WTreeApp._handle_exception` + a `main()` net; crash logs at `~/.wtree/crashes/`. Locals gated by `WTREE_DEBUG=1`; default secret redactors on. Kept Textual's dump + added a logfile pointer. 684/684 green. Follow-ups: apply the `safe_dismiss` guard to `ProgressScreen` (same double-dismiss shape as the fixed ScanScreen); trim the pre-existing unused `Resolution` import in `app.py`; optional phase-2 = own the exit screen.
+
+## Cancellable O(n) Copy/Move planning — DONE 2026-06-05
+
+Fixed the big-tagged-set copy freeze. plan_copy/plan_move now run under the scan dialog (on_progress/should_cancel callables, await sleep(0) every PLAN_CHUNK_SIZE, raise ScanCancelled on Esc → "cancelled", nothing enqueued). Killed the O(n²) _entries_for_tag (walk_tags now groups entries_by_tag; plan_copy zips). 692/692 green. Parked: collapse redundant tagged descendants (overlapping-tag dedup) — would stop emitting one item per already-included descendant; declined this pass. Also dropped (for now): Ctrl+Break/faulthandler freeze-dump.

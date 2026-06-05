@@ -21,14 +21,17 @@ have happened.
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from wtree.ops.base import (
+    PLAN_CHUNK_SIZE,
     OperationKind,
     Plan,
     PlanError,
     PlanItem,
+    ScanCancelled,
 )
 from wtree.ops.conflicts import annotate_conflicts, resolve_self_targets
 from wtree.sources.base import EntrySource, ScanError
@@ -39,6 +42,9 @@ async def plan_move(
     tags: Sequence[Tag],
     destination: Tag,
     registry: Mapping[str, EntrySource],
+    *,
+    on_progress: Callable[[int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Plan:
     """Build a :class:`Plan` of :attr:`OperationKind.MOVE` from ``tags``
     into ``destination``.
@@ -59,7 +65,15 @@ async def plan_move(
     items: list[PlanItem] = []
     errors: list[PlanError] = []
 
+    seen = 0
     for tag in tags:
+        seen += 1
+        if seen % PLAN_CHUNK_SIZE == 0:
+            if on_progress is not None:
+                on_progress(seen)
+            await asyncio.sleep(0)
+            if should_cancel is not None and should_cancel():
+                raise ScanCancelled()
         src = registry.get(tag.source_id)
         if src is None:
             errors.append(
@@ -116,7 +130,9 @@ async def plan_move(
     # item can never be flagged and offered Overwrite, which would rmtree
     # the destination that is also the source.
     plan = resolve_self_targets(plan)
-    return await annotate_conflicts(plan, registry)
+    return await annotate_conflicts(
+        plan, registry, on_progress=on_progress, should_cancel=should_cancel
+    )
 
 
 def _basename(path: str) -> str:

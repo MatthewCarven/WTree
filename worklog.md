@@ -5519,3 +5519,17 @@ Design-first pass (signed off by Matthew), then built. WTree had no crash handle
 - `ProgressScreen` has the same latent double-dismiss shape as the fixed `ScanScreen` — apply the same `safe_dismiss` guard (`progress_screen.py` ~166/182/195).
 - Pre-existing lint (NOT from this work): `wtree/app.py` imports `Resolution` from `wtree.ops` but never uses it — single occurrence at HEAD too. Trivial trim when convenient.
 - Phase-2 option: fully own Textual's exit screen (replace the Rich dump with a clean "WTree hit an error — report at <path>" panel) instead of keeping both.
+
+## 2026-06-05 (later) — Cancellable O(n) Copy/Move planning (big-tagged-set freeze fix)
+
+Matthew hit a hard freeze copying a recursively-tagged tree (~349,773 tags) to E:. Diagnosed two causes; fixed both. Ctrl+Break/faulthandler freeze-dump was considered but dropped at his call (may not need it).
+
+**Cause 1 — plan-build not gated/chunked.** `plan_copy`/`plan_move` (walk + `annotate_conflicts`) ran to completion off the event loop: no dialog, no Esc. Fix: the planners take optional `on_progress`/`should_cancel` plain callables (NOT a `ScanContext` — the ops layer must not import `widgets`), `await asyncio.sleep(0)` every `PLAN_CHUNK_SIZE` (new constant in `ops/base.py`), and raise `ScanCancelled` (new, `ops/base.py`) when `should_cancel` fires at a chunk boundary. `_plan_modal_enqueue` now runs the planner under `_run_scan_with_dialog` (header "Planning copy/move"; `on_progress`→`ctx.entries_seen`, `should_cancel`→`ctx.cancelled.is_set`) and catches `ScanCancelled` → flash "cancelled", nothing enqueued (atomic). `_run_scan_with_dialog` made generic (returns whatever `do_work` returns — here the `Plan`).
+
+**Cause 2 — O(n²) hotspot.** `plan_copy` called `_entries_for_tag(walk.entries, tag)` once per tag, each a full linear scan of the flat walk = O(tags × entries); at 349k tags that dominated. `walk_tags` now records `WalkSummary.entries_by_tag` (index-parallel sublists, populated as it walks) and `plan_copy` zips `tags`↔groups directly. `_entries_for_tag` deleted. Semantics unchanged for non-overlapping tags; cleaner for overlapping ones (no cross-prefix contamination).
+
+**Declined this pass (Matthew):** collapsing redundant tagged descendants (overlapping-tag dedup) — copying a fully-tagged tree still emits one item per already-included descendant; parked as a separate semantics call. Also trimmed a pre-existing unused `Resolution` import in `app.py`.
+
+Files: `wtree/ops/base.py` (`PLAN_CHUNK_SIZE`, `ScanCancelled`, `WalkSummary.entries_by_tag`), `copy.py`, `move.py`, `conflicts.py`, `ops/__init__.py` (export `ScanCancelled`), `app.py` (gate wiring + generic `_run_scan_with_dialog` + import trim), `design.md`. 8 new tests in `tests/test_plan_cancellable.py`. **684 → 692/692 green** (run in quarters). Clean mount session: git-archive baseline (HEAD `645aae9`) + atomic-md5 pushback.
+
+**Note:** this makes the 349k copy *cancellable and progress-reporting*, and removes the quadratic — but it can still take a while at that scale (it's genuine I/O over a third of a million entries). If that proves annoying in daily use, the parked descendant-collapse is the next lever.

@@ -14,15 +14,18 @@ the matching ``EntrySource``. Whether a specific source pairing can be
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import AsyncIterator
 
 from wtree.ops.base import (
+    PLAN_CHUNK_SIZE,
     OperationKind,
     Plan,
     PlanError,
     PlanItem,
+    ScanCancelled,
     WalkedEntry,
     WalkSummary,
 )
@@ -39,6 +42,9 @@ from wtree.tagged_set import Tag
 async def walk_tags(
     tags: Sequence[Tag],
     registry: Mapping[str, EntrySource],
+    *,
+    on_progress: Callable[[int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> WalkSummary:
     """Expand every tag into a flat list of :class:`WalkedEntry`.
 
@@ -55,7 +61,12 @@ async def walk_tags(
     the files into it.
     """
     summary = WalkSummary()
+    seen = 0
     for tag in tags:
+        # One group per tag, appended up front so ``entries_by_tag`` stays
+        # index-parallel to ``tags`` even when a tag errors out below.
+        group: list[WalkedEntry] = []
+        summary.entries_by_tag.append(group)
         src = registry.get(tag.source_id)
         if src is None:
             summary.errors.append(
@@ -86,6 +97,14 @@ async def walk_tags(
                 summary.errors.append(walked)
             else:
                 summary.entries.append(walked)
+                group.append(walked)
+            seen += 1
+            if seen % PLAN_CHUNK_SIZE == 0:
+                if on_progress is not None:
+                    on_progress(seen)
+                await asyncio.sleep(0)
+                if should_cancel is not None and should_cancel():
+                    raise ScanCancelled()
     return summary
 
 
@@ -93,6 +112,9 @@ async def plan_copy(
     tags: Sequence[Tag],
     destination: Tag,
     registry: Mapping[str, EntrySource],
+    *,
+    on_progress: Callable[[int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Plan:
     """Build a :class:`Plan` of ``OperationKind.COPY`` from ``tags`` into
     ``destination``.
@@ -109,29 +131,23 @@ async def plan_copy(
     will translate to the destination source's native separator when it
     actually applies the plan.
     """
-    walk = await walk_tags(tags, registry)
+    walk = await walk_tags(
+        tags, registry, on_progress=on_progress, should_cancel=should_cancel
+    )
     items: list[PlanItem] = []
+    seen = 0
 
-    # Pre-compute each top-level tag's basename so we can build relative
-    # paths cheaply during the items loop.
-    tag_basenames: dict[tuple[str, str], str] = {
-        (t.source_id, t.path): _basename(t.path) for t in tags
-    }
-
-    # Walk each entry and figure out which top-level tag it came from.
-    # ``_walk_from`` yields in tag order, so a single pointer suffices.
-    walked_iter = iter(walk.entries)
-    for tag in tags:
-        base = tag_basenames[(tag.source_id, tag.path)]
+    # ``walk.entries_by_tag`` is index-parallel to ``tags`` - each sublist is
+    # exactly the entries that tag's walk produced. Zipping is O(total
+    # entries); the old per-tag prefix scan of the flat list was O(tags x
+    # entries) and froze the UI on large tagged sets.
+    for tag, group in zip(tags, walk.entries_by_tag):
+        base = _basename(tag.path)
         if not base:
-            # Unrooted destination — skip; the walk_tags error path already
+            # Unrooted destination - skip; the walk_tags error path already
             # caught unknown-source cases, so this is a true edge.
             continue
-        # Pull all entries belonging to this tag — they share a path prefix.
-        # The prefix test handles both ``tag.path`` itself and descendants.
-        # We can't just count entries per tag because dirs vary in fan-out;
-        # the prefix test is unambiguous.
-        for walked in _entries_for_tag(walk.entries, tag):
+        for walked in group:
             rel = _relative_under(walked.path, tag.path)
             # Destination is dest + base + rel. ``base`` keeps the top-level
             # name; ``rel`` is "" for the top tag itself, deeper for descendants.
@@ -146,6 +162,13 @@ async def plan_copy(
                     size=walked.size,
                 )
             )
+            seen += 1
+            if seen % PLAN_CHUNK_SIZE == 0:
+                if on_progress is not None:
+                    on_progress(seen)
+                await asyncio.sleep(0)
+                if should_cancel is not None and should_cancel():
+                    raise ScanCancelled()
 
     plan = Plan(kind=OperationKind.COPY, items=items, errors=walk.errors)
     # Self-target pass first: mark the topmost copy-into-own-dir item SELF
@@ -153,7 +176,9 @@ async def plan_copy(
     # then skips every self-targeted item, so the SELF flag survives and
     # descendants stay NONE for the rename cascade.
     plan = resolve_self_targets(plan)
-    return await annotate_conflicts(plan, registry)
+    return await annotate_conflicts(
+        plan, registry, on_progress=on_progress, should_cancel=should_cancel
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,25 +228,6 @@ async def _walk_from(
             )
             if child.kind is Kind.DIR:
                 stack.append(child_path)
-
-
-def _entries_for_tag(
-    entries: Sequence[WalkedEntry], tag: Tag
-) -> list[WalkedEntry]:
-    """Return entries whose path is ``tag.path`` or a child of it.
-
-    Linear scan; the walk is small enough in v0 (and almost always in any
-    real session) that an index isn't worth the bookkeeping.
-    """
-    out: list[WalkedEntry] = []
-    prefix = tag.path
-    prefix_with_sep = prefix if prefix.endswith("/") else prefix + "/"
-    for e in entries:
-        if e.source_id != tag.source_id:
-            continue
-        if e.path == prefix or e.path.startswith(prefix_with_sep):
-            out.append(e)
-    return out
 
 
 def _basename(path: str) -> str:

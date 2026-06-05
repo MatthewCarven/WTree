@@ -23,16 +23,19 @@ See ``design.md`` -> User interface -> Conflict resolution dialog.
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 from wtree.ops.base import (
+    PLAN_CHUNK_SIZE,
     ConflictKind,
     OperationKind,
     Plan,
     PlanItem,
     Resolution,
+    ScanCancelled,
     canonical_path,
 )
 from wtree.sources.base import EntrySource, Kind, ScanError
@@ -133,6 +136,9 @@ def _conflict_for(existing_kind: Kind) -> ConflictKind:
 async def annotate_conflicts(
     plan: Plan,
     registry: Mapping[str, EntrySource],
+    *,
+    on_progress: Callable[[int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> Plan:
     """Return a copy of ``plan`` with each item's ``conflict`` field set.
 
@@ -148,8 +154,16 @@ async def annotate_conflicts(
         return plan
 
     new_items: list[PlanItem] = []
+    seen = 0
     for item in plan.items:
         new_items.append(await _annotate_item(plan.kind, item, registry))
+        seen += 1
+        if seen % PLAN_CHUNK_SIZE == 0:
+            if on_progress is not None:
+                on_progress(seen)
+            await asyncio.sleep(0)
+            if should_cancel is not None and should_cancel():
+                raise ScanCancelled()
     return replace(plan, items=new_items)
 
 
