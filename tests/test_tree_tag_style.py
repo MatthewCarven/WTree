@@ -14,7 +14,6 @@ from pathlib import Path
 from rich.text import Text
 
 from wtree.app import WTreeApp
-from wtree.widgets.contents_pane import ContentsPane
 from wtree.widgets.tree_pane import TreePane, _TAGGED_STYLE
 
 

@@ -1657,7 +1657,6 @@ class WTreeApp(App):
         """Threshold gate for the progress modal (design.md 2026-05-25).
 
         Push immediately if the plan trips the size or item-count
-        Push immediately if the plan trips the size or item-count
         threshold; otherwise schedule a delayed-show that pushes only
         if the plan is still running ``PROGRESS_MODAL_DELAY_SECONDS``
         later. Tiny ops never trip and never see a modal.

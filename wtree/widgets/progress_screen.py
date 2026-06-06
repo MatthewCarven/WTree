@@ -127,6 +127,34 @@ class ProgressScreen(ModalScreen[None]):
         # plan, we auto-dismiss; the gate will push a fresh dialog.
         self._plan = queue.running
         self._timer: Optional[Timer] = None
+        self._dismissing = False
+
+    # --- safe dismissal --------------------------------------------------
+
+    def safe_dismiss(self) -> None:
+        """Pop this modal at most once, only while it's still on the stack.
+
+        Three callers race to close this dialog: the redraw timer's
+        plan-moved-on auto-dismiss (:meth:`_refresh`), the Esc path in
+        :meth:`action_cancel_or_dismiss`, and minimize
+        (:meth:`action_minimize`). Textual's :meth:`dismiss` pops the
+        screen stack unconditionally, so a second call pops the base
+        ``_default`` screen and raises ``ScreenStackError``. Gate on an
+        idempotency flag *and* actual stack membership so whichever
+        caller wins, the rest are no-ops.
+
+        Same shape as :meth:`ScanScreen.safe_dismiss` (the 2026-06-05
+        launch-crash fix); ``Ctrl+P`` resume is unaffected because the
+        gate always constructs a fresh instance.
+        """
+        if self._dismissing:
+            return
+        self._dismissing = True
+        try:
+            if self in self.app.screen_stack:
+                self.dismiss(None)
+        except Exception:  # noqa: BLE001 - torn down between timer and call
+            pass
 
     # --- compose / mount --------------------------------------------------
 
@@ -163,7 +191,7 @@ class ProgressScreen(ModalScreen[None]):
             self._queue.request_cancel()
             self._refresh_header()
             return
-        self.dismiss(None)
+        self.safe_dismiss()
 
     def action_minimize(self) -> None:
         """Dismiss the dialog without cancelling the queue.
@@ -179,7 +207,7 @@ class ProgressScreen(ModalScreen[None]):
         ``ProgressScreen`` is on the stack, so the refresh must run
         *after* the dismiss is processed - hence ``call_after_refresh``.
         """
-        self.dismiss(None)
+        self.safe_dismiss()
         try:
             self.app.call_after_refresh(self.app._refresh_status)
         except Exception:  # noqa: BLE001 - defensive; not all hosts are WTreeApp
@@ -192,7 +220,7 @@ class ProgressScreen(ModalScreen[None]):
         # If the queue has moved on (our plan is done, or a different
         # one started), auto-dismiss. The gate handles the next plan.
         if self._queue.running is not self._plan:
-            self.dismiss(None)
+            self.safe_dismiss()
             return
         try:
             body = self.query_one("#progress-body", Static)

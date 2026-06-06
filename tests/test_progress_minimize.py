@@ -19,7 +19,6 @@ Coverage:
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,11 +28,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from wtree.app import WTreeApp
-from wtree.ops import OperationQueue, plan_copy
+from wtree.ops import OperationQueue
 from wtree.ops.base import OperationKind
 from wtree.sources.base import Entry, Kind
 from wtree.sources.mock import MockSource
-from wtree.tagged_set import Tag
 from wtree.widgets.help import _help_content
 from wtree.widgets.menu_bar import MENUS
 from wtree.widgets.progress_screen import ProgressScreen

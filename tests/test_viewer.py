@@ -7,15 +7,11 @@ The unit tests below hit the loader directly (no Textual pilot needed)
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-import pytest
 
 from wtree.widgets.viewer import (
-    MAX_BYTES,
     ViewerScreen,
-    _LoadResult,
     _load_file_sync,
 )
 

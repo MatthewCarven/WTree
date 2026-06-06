@@ -17,9 +17,6 @@ Three surfaces under test, matching the layout of tests/test_help.py:
 from __future__ import annotations
 
 import asyncio
-import os
-import stat
-import time
 from pathlib import Path
 from typing import Any
 

@@ -784,7 +784,7 @@ async def _native_make_new(item: PlanItem) -> ItemResult:
 
     try:
         await asyncio.to_thread(_make_new_blocking, dst, item.kind)
-    except FileExistsError as exc:
+    except FileExistsError:
         # Surface the racy-clobber as FAILED rather than letting the
         # generic Exception branch in apply_plan turn it into a less
         # specific message. Same shape as Rename's lexists pre-check

@@ -33,9 +33,10 @@ from textual import events, work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Label, Tree
+from textual.widgets import Label, Static, Tree
 from textual.widgets.tree import TreeNode
 
+from wtree._drives import list_drive_anchors
 from wtree.ops.base import resolve_relative_leaf, to_posix
 from wtree.ops.execute import _make_new_blocking
 from wtree.sources.base import EntrySource, Kind, ScanError
@@ -200,6 +201,23 @@ class _PickerTree(Tree[str]):
         self._loaded.discard(node.id)
         await self._populate(node)
 
+    async def re_root(self, new_root_path: str) -> None:
+        """Re-root the tree in place at ``new_root_path`` (drive switch).
+
+        Mirrors :meth:`TreePane.re_root`: wipe the subtree, reset the root
+        node's label + data, clear the ``_loaded`` memo (every tracked node
+        ID is gone), re-populate, re-expand. Bare populate - programmatic,
+        like the initial root populate (the scan-dialog cancel-UI is for
+        interactive expands).
+        """
+        new_root_path = os.path.abspath(new_root_path)
+        self.root.remove_children()
+        self.root.set_label(new_root_path)
+        self.root.data = new_root_path
+        self._loaded.clear()
+        await self._populate(self.root)
+        self.root.expand()
+
 
 class DirPickerScreen(ModalScreen[str | None]):
     """Modal dir browser. Dismisses with the chosen directory path (Enter on
@@ -239,6 +257,7 @@ class DirPickerScreen(ModalScreen[str | None]):
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
         ("n", "make_dir", "New folder"),
+        ("ctrl+d", "switch_drive", "Drives"),
     ]
 
     def __init__(
@@ -254,6 +273,11 @@ class DirPickerScreen(ModalScreen[str | None]):
         self._start_root = start_root
         self._reveal_target = reveal_target
         self._tagged_count = tagged_count
+        # Per-location cursor memory, session-lifetime. Keyed by *root
+        # path*, not splitdrive anchor - on POSIX every path's splitdrive
+        # anchor is "/", which would collapse ~ and /mnt/usb into one key
+        # (design.md 2026-06-07). Dies with the modal.
+        self._per_root_cursor: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -279,8 +303,8 @@ class DirPickerScreen(ModalScreen[str | None]):
         items = f"{n} tagged item(s)" if n else "selection"
         return (
             f"-> {target}\n"
-            f"Enter pick  -  n new folder  -  Backspace/Left parent  -  "
-            f"Esc cancel    [{items}]"
+            f"Enter pick  -  n new folder  -  Ctrl+D drives  -  "
+            f"Backspace/Left parent  -  Esc cancel    [{items}]"
         )
 
     def _refresh_footer(self) -> None:
@@ -372,3 +396,116 @@ class DirPickerScreen(ModalScreen[str | None]):
             await tree.reveal_path(native_leaf)
             self._refresh_footer()
             return
+    @work
+    async def action_switch_drive(self) -> None:
+        """``Ctrl+D``: pick a drive / location anchor and re-root the picker.
+
+        Pushes :class:`DriveChooserScreen`; Enter re-roots the tree at the
+        chosen anchor, Esc returns unchanged. The cursor position on the
+        outgoing root is remembered (``_per_root_cursor``) and restored via
+        ``reveal_path`` when the user switches back; first visit lands at
+        the location root. Same-root pick is a no-op.
+        """
+        tree = self.query_one(_PickerTree)
+        current_root = tree.root.data
+        if current_root is None:
+            return
+        anchors = list_drive_anchors(current=current_root)
+        picked = await self.app.push_screen_wait(
+            DriveChooserScreen(anchors, current=current_root)
+        )
+        if picked is None or picked == current_root:
+            return
+        node = tree.cursor_node
+        if node is not None and node.data is not None:
+            self._per_root_cursor[current_root] = node.data
+        await tree.re_root(picked)
+        self._start_root = picked
+        remembered = self._per_root_cursor.get(picked)
+        if remembered is not None:
+            await tree.reveal_path(remembered)
+        self._refresh_footer()
+
+
+class DriveChooserScreen(ModalScreen[str | None]):
+    """Small modal listing drive / location anchors (``Ctrl+D`` from the
+    destination browser). Up/Down move, Enter dismisses with the anchor,
+    Esc dismisses with ``None``.
+
+    Same minimal-modal shape as ``KindChooserDialog``: a Static body
+    rendered from a cursor index; no Tree, no lazy anything - the anchor
+    list is tiny and already enumerated.
+    """
+
+    DEFAULT_CSS = """
+    DriveChooserScreen {
+        align: center middle;
+    }
+
+    DriveChooserScreen > Vertical {
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+        width: auto;
+        min-width: 40;
+        max-width: 80;
+        height: auto;
+        max-height: 20;
+    }
+
+    DriveChooserScreen Label.title {
+        margin-bottom: 1;
+        text-style: bold;
+    }
+
+    DriveChooserScreen Label.hint {
+        margin-top: 1;
+        color: $text-muted;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("up", "cursor_up", "Up"),
+        ("down", "cursor_down", "Down"),
+        ("enter", "choose", "Switch"),
+    ]
+
+    def __init__(self, anchors: list[str], *, current: str | None = None) -> None:
+        super().__init__()
+        self._anchors = anchors
+        self._cursor = (
+            anchors.index(current) if current in anchors else 0
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Switch drive / location", classes="title")
+            yield Static(self._body_text(), id="drive-list")
+            yield Label("Enter switch  -  Esc cancel", classes="hint")
+
+    def _body_text(self) -> str:
+        lines = []
+        for i, anchor in enumerate(self._anchors):
+            marker = ">" if i == self._cursor else " "
+            lines.append(f"{marker} {anchor}")
+        return "\n".join(lines)
+
+    def _refresh_list(self) -> None:
+        self.query_one("#drive-list", Static).update(self._body_text())
+
+    def action_cursor_up(self) -> None:
+        if self._cursor > 0:
+            self._cursor -= 1
+            self._refresh_list()
+
+    def action_cursor_down(self) -> None:
+        if self._cursor < len(self._anchors) - 1:
+            self._cursor += 1
+            self._refresh_list()
+
+    def action_choose(self) -> None:
+        self.dismiss(self._anchors[self._cursor])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

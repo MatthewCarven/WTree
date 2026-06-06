@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from wtree.app import WTreeApp
-from wtree.sources.base import Entry, EntrySource, Kind, ScanError
+from wtree.sources.base import Entry, EntrySource, Kind
 from wtree.sources.mock import MockSource
 from wtree.sources.native import NativeSource
 from wtree.widgets.contents_pane import ContentsPane

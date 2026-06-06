@@ -18,11 +18,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-import pytest
 
 from wtree.app import WTreeApp
-from wtree.sources.base import Entry, Kind
-from wtree.sources.mock import MockSource
 from wtree.widgets.contents_pane import ContentsPane
 from wtree.widgets.search_bar import SearchBar
 from wtree.widgets.status_line import StatusLine

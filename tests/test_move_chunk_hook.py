@@ -28,19 +28,16 @@ Coverage:
 
 from __future__ import annotations
 
-import asyncio
 import errno
 import os
-import shutil
 from pathlib import Path
 
 import pytest
 
 from wtree.ops import OperationQueue, plan_move
-from wtree.ops.base import ItemStatus, OperationKind, PlanItem
+from wtree.ops.base import ItemStatus, PlanItem
 from wtree.ops.execute import _native_move, apply_plan
 from wtree.ops.queue import COPY_CHUNK_SIZE
-from wtree.sources.base import Kind
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag
 

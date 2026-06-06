@@ -224,9 +224,14 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 
 The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-04) shipped its first cut; these are the broken-out remainders.
 
-- [ ] **Drive / share switching in the picker.** v0 roots at the current drive/share anchor and roams down from there; jumping to another drive (`C:` → `D:`) or another network share needs drive enumeration (Windows `GetLogicalDrives` / POSIX mount points) plus a top-level "drives" pseudo-root, and ties into the parked Network-discovery item (`design.md` parking lot). A key like `Ctrl+D` could pop a drive chooser.
+- [x] **Drive / share switching in the picker. DONE 2026-06-07** — Ctrl+D `DriveChooserScreen` + `wtree/_drives.py` enumeration (listdrives → ctypes bitmask → probe on Windows; `/`+`~`+removable bases on POSIX); per-root cursor memory (keyed by root path, session-lifetime); current root always listed (UNC-you're-on covered; share *discovery* still parked). App-level Ctrl+D for the logged tree = new follow-up below. Original item: v0 roots at the current drive/share anchor and roams down from there; jumping to another drive (`C:` → `D:`) or another network share needs drive enumeration (Windows `GetLogicalDrives` / POSIX mount points) plus a top-level "drives" pseudo-root, and ties into the parked Network-discovery item (`design.md` parking lot). A key like `Ctrl+D` could pop a drive chooser.
 - [ ] **Type-to-filter / incremental jump inside the picker.** Pure navigation today; a future variant narrows the visible dirs as you type (reuse the `/`-search machinery). Bound the work so a giant directory doesn't re-filter per keystroke.
 - [ ] **Files greyed-out for context in the picker.** Dir-only today (you pick a directory). Some users want to *see* the files in the target dir — greyed and non-selectable — for orientation before dropping items there. Would extend `scan_screen.populate_dir_node` to optionally include non-dir entries with a disabled style.
+
+## Drive-switching-era follow-ups
+
+- [ ] **App-level Ctrl+D — re-root the logged tree via the drive chooser.** A browsable cousin of `L`. The enumeration helper (`wtree/_drives.py`) and `DriveChooserScreen` are picker-independent by design, so this is bindings + menu + help + a `_do_log`-style handler + tests.
+- [ ] **Sort/label polish in the chooser.** Volume labels on Windows (`GetVolumeInformation` — needs ctypes work), free-space column, friendly `~` display instead of the expanded home path.
 
 ## Normalisation-era follow-ups
 
@@ -234,7 +239,7 @@ The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-
 
 ## Code-health follow-ups
 
-- [ ] **Lint-sweep of pre-existing unused imports / locals.** pyflakes (run 2026-06-04 during the `populate_dir_node` extraction) flags a handful of pre-existing nits, none introduced by recent work: `app.py` `Resolution`; `properties.py` `field` + `Sequence`; `copy.py` `walked_iter` (assigned, never used); `execute.py` `exc` (assigned, never used); `sources/base.py` `field`. Clear them in one pass, and consider wiring pyflakes/ruff into the dev workflow so they don't accrue.
+- [x] **Lint-sweep of pre-existing unused imports / locals. DONE 2026-06-07** — swept package (sources/base.py `field`, properties.py `field`+`Sequence`, execute.py `exc`) + 41 test-file nits (unused imports + 3 unused locals); `wtree/error_handler.py` excluded (vendored verbatim — fixes belong upstream). New `tests/test_lint.py` pyflakes gate (skips if pyflakes missing) keeps it clean. Original item: pyflakes (run 2026-06-04 during the `populate_dir_node` extraction) flags a handful of pre-existing nits, none introduced by recent work: `app.py` `Resolution`; `properties.py` `field` + `Sequence`; `copy.py` `walked_iter` (assigned, never used); `execute.py` `exc` (assigned, never used); `sources/base.py` `field`. Clear them in one pass, and consider wiring pyflakes/ruff into the dev workflow so they don't accrue.
 
 ## Backlog — parking lot
 
@@ -269,8 +274,12 @@ See `design.md` parking lot section. Summary: inline editor, archive sources, re
 
 ## Crash handler — DONE 2026-06-05
 
-Vendored `describe_error` (`Python ErrorHandler` @ 23af8d3) wired into `WTreeApp._handle_exception` + a `main()` net; crash logs at `~/.wtree/crashes/`. Locals gated by `WTREE_DEBUG=1`; default secret redactors on. Kept Textual's dump + added a logfile pointer. 684/684 green. Follow-ups: apply the `safe_dismiss` guard to `ProgressScreen` (same double-dismiss shape as the fixed ScanScreen); trim the pre-existing unused `Resolution` import in `app.py`; optional phase-2 = own the exit screen.
+Vendored `describe_error` (`Python ErrorHandler` @ 23af8d3) wired into `WTreeApp._handle_exception` + a `main()` net; crash logs at `~/.wtree/crashes/`. Locals gated by `WTREE_DEBUG=1`; default secret redactors on. Kept Textual's dump + added a logfile pointer. 684/684 green. Follow-ups: ~~apply the `safe_dismiss` guard to `ProgressScreen`~~ DONE 2026-06-07; ~~trim the pre-existing unused `Resolution` import in `app.py`~~ DONE 2026-06-05; optional phase-2 = own the exit screen.
 
 ## Cancellable O(n) Copy/Move planning — DONE 2026-06-05
 
 Fixed the big-tagged-set copy freeze. plan_copy/plan_move now run under the scan dialog (on_progress/should_cancel callables, await sleep(0) every PLAN_CHUNK_SIZE, raise ScanCancelled on Esc → "cancelled", nothing enqueued). Killed the O(n²) _entries_for_tag (walk_tags now groups entries_by_tag; plan_copy zips). 692/692 green. Parked: collapse redundant tagged descendants (overlapping-tag dedup) — would stop emitting one item per already-included descendant; declined this pass. Also dropped (for now): Ctrl+Break/faulthandler freeze-dump.
+
+## ProgressScreen safe_dismiss — DONE 2026-06-07
+
+Applied the ScanScreen double-dismiss guard to `ProgressScreen` (the flagged same-shape latent crash). New idempotent + stack-membership-guarded `safe_dismiss()`; all three racers route through it (Esc dismiss path, `m` minimize, the redraw timer's plan-moved-on auto-dismiss). First-Esc-cancels semantics untouched. Drive-by: deduped a doubled docstring line in `app.py` `_maybe_push_progress_dialog` (an old committed mount glitch). 8 new tests in `tests/test_progress_safe_dismiss.py` (incl. 2 pins for ScanScreen's guard, which shipped untested, and a source-level pin that no bare `self.dismiss(None)` caller creeps back). 692 → 700/700 green.

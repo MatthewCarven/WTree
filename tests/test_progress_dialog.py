@@ -23,7 +23,6 @@ exercised by the queue / execute layer integration in this file.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from pathlib import Path
@@ -45,7 +44,6 @@ from wtree.sources.base import Kind
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag
 from wtree.widgets.progress_screen import (
-    _BAR_WIDTH,
     _EM_DASH,
     ProgressScreen,
     _current_item,

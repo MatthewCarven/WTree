@@ -13,7 +13,6 @@ from textual.widgets import Input
 
 from wtree.app import WTreeApp
 from wtree.widgets.keybar import KeyBar
-from wtree.widgets.prompt import PromptDialog
 from wtree.widgets.status_line import StatusLine
 
 

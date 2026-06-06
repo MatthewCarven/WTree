@@ -24,15 +24,13 @@ Coverage:
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
 
 from wtree.ops import OperationQueue, plan_copy
-from wtree.ops.base import ItemStatus, OperationKind, PlanItem
+from wtree.ops.base import ItemStatus
 from wtree.ops.execute import apply_plan
-from wtree.sources.base import Kind
 from wtree.sources.native import NativeSource
 from wtree.tagged_set import Tag
 
@@ -213,7 +211,7 @@ async def test_progress_fires_for_skipped_items(
         state["checks"] += 1
         return state["checks"] >= 3
 
-    result = await apply_plan(
+    await apply_plan(
         plan, registry, progress=cb, is_cancelled=is_cancelled
     )
 

@@ -43,9 +43,8 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
 
 from rich.text import Text
 from textual.app import ComposeResult

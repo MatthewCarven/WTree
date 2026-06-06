@@ -14,7 +14,6 @@ from datetime import datetime
 from wtree.app import WTreeApp
 from wtree.sources.base import Entry, Kind, ScanError
 from wtree.sources.mock import MockSource
-from wtree.widgets.contents_pane import ContentsPane
 from wtree.widgets.prompt import PromptDialog
 
 

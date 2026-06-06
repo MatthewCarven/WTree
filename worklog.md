@@ -5533,3 +5533,31 @@ Matthew hit a hard freeze copying a recursively-tagged tree (~349,773 tags) to E
 Files: `wtree/ops/base.py` (`PLAN_CHUNK_SIZE`, `ScanCancelled`, `WalkSummary.entries_by_tag`), `copy.py`, `move.py`, `conflicts.py`, `ops/__init__.py` (export `ScanCancelled`), `app.py` (gate wiring + generic `_run_scan_with_dialog` + import trim), `design.md`. 8 new tests in `tests/test_plan_cancellable.py`. **684 → 692/692 green** (run in quarters). Clean mount session: git-archive baseline (HEAD `645aae9`) + atomic-md5 pushback.
 
 **Note:** this makes the 349k copy *cancellable and progress-reporting*, and removes the quadratic — but it can still take a while at that scale (it's genuine I/O over a third of a million entries). If that proves annoying in daily use, the parked descendant-collapse is the next lever.
+
+## 2026-06-07 — ProgressScreen safe_dismiss guard (flagged follow-up)
+
+Closed the 2026-06-05 follow-up: `ProgressScreen` had the same three-racer double-dismiss shape that crashed `ScanScreen` (Esc path in `action_cancel_or_dismiss`, `m` minimize, and `_refresh`'s plan-moved-on auto-dismiss — any two firing in the same frame and the loser pops the base `_default` screen → `ScreenStackError`). Mirrored the fix: `_dismissing` flag + `safe_dismiss()` (idempotency + `self in self.app.screen_stack` membership + try/except), all three callers routed through it. `Ctrl+P` resume unaffected — the gate always constructs a fresh instance. First-Esc-cancels branch untouched (guard only wraps the actual pop).
+
+Drive-by: deduped the doubled "Push immediately if the plan trips the size or item-count" docstring line in `app.py` `_maybe_push_progress_dialog` — real in HEAD (an old mount glitch that got committed), not a stale read.
+
+8 new tests in `tests/test_progress_safe_dismiss.py`: static surface (method exists; source-level pin that the only bare `self.dismiss(None)` in the module lives inside `safe_dismiss`), pilot races (double safe_dismiss; Esc+timer; minimize+timer — each asserts exactly one pop and base screen intact; minimize race also pins queue.request_cancel not called), first-Esc-cancels regression, and 2 pins for `ScanScreen.safe_dismiss` itself (shipped untested at `645aae9`). **692 → 700/700 green** (quarters; lone `test_flash_clears_after_timeout` flake green in isolation per usual).
+
+Clean session per mount rules: git-archive baseline (HEAD `312a84a`) → anchor-asserted edits + ast.parse in sandbox → suite green → atomic push-back + md5 verify → slice re-run against mount files. NOT committed — Matthew commits Windows-side.
+
+## 2026-06-07 (cont.) — Pyflakes sweep + lint gate
+
+Cleared the Code-health backlog item. Package: `sources/base.py` unused `field`, `properties.py` unused `field`+`Sequence`, `execute.py` `except FileExistsError as exc:` -> bare `except FileExistsError:`. Tests: 41 nits across 20 files — unused imports (autoflake --remove-all-unused-imports, diff-reviewed line by line) + 3 unused locals fixed by hand (`test_log_new_source` dropped the `tree =` binding but kept the `query_one` existence check; `test_midplan_cancel` dropped the `result =` binding, kept the awaited call; `test_tree_arrows` function-level `TreeNode` import removed by autoflake). **`wtree/error_handler.py` deliberately untouched** — vendored verbatim (provenance header); its 4 typing nits belong upstream in Python ErrorHandler.
+
+New `tests/test_lint.py`: pyflakes gate over `wtree/` + `tests/` excluding the vendored file, `pytest.importorskip("pyflakes")` so the suite gains no hard dependency. Nits can't silently accrue between sessions now.
+
+**700 → 701/701 green** (quarters, zero flakes this round). Same clean-mount protocol; push-back md5-verified. NOT committed — Matthew commits Windows-side.
+
+## 2026-06-07 (cont.) — Picker drive / share switching (phase-2 item BUILT)
+
+Design pass first (4 AskUserQuestion forks, all recommendations accepted): **(1)** Ctrl+D **chooser modal** over a drives pseudo-root (synthetic top level would special-case `reveal_path`/anchor logic) and over XTree bare drive-letter keys (letters reserved for the parked type-to-filter; no POSIX analogue); **(2)** POSIX "drives" = `/`, `~`, + existing one-level children of `/mnt`, `/media/$USER`, `/run/media/$USER`, `/Volumes` (full mount-table parsing rejected: noisy, distro-dependent); **(3)** picker-only this pass — app-level Ctrl+D (browsable cousin of `L`) split out as a follow-up; **(4)** per-location cursor memory, session-lifetime. design.md: rooting paragraph updated, new "Drive / share switching" paragraph, decision-log row.
+
+**Key design wrinkle:** memory + identity key on the picker's **root path**, NOT `drive_anchor()` — on POSIX every path's splitdrive anchor is `/`, which would collapse `~` and `/mnt/usb` into one key.
+
+Code: new **`wtree/_drives.py`** platform shim (sibling of `_owner.py`) — `list_drive_anchors(current, *, windows=None, media_bases=..., home=...)`; Windows = `os.listdrives()` (3.12+) → ctypes `GetLogicalDrives()` bitmask (`_bitmask_to_anchors` pure + testable) → exists-probe, no pywin32; POSIX = `_posix_anchors` with parameterised bases/home for tmp-tree testing; order-preserving dedupe; current root prepended when missing. **`dir_picker.py`**: `_PickerTree.re_root` (mirrors TreePane's — bare populate, programmatic like initial root); `DirPickerScreen` gains ctrl+d binding, `_per_root_cursor` dict, `@work action_switch_drive` (push_screen_wait chooser → record outgoing cursor → re_root → reveal remembered), footer hint "Ctrl+D drives"; new **`DriveChooserScreen(ModalScreen[str | None])`** (KindChooser-style minimal: Static list, Up/Down/Enter/Esc, initial cursor on current).
+
+17 new tests in `tests/test_drive_switching.py` (bitmask units, POSIX layout vs tmp tree incl. missing-base skip + file filtering + home=/ dedupe, current-inclusion/dedupe, windows= shape via monkeypatched listdrives, chooser cursor/Enter/Esc, picker Ctrl+D binding, switch-reroots-and-remembers round-trip, same-root no-op, Esc-keeps-state, footer hint). One test-only fix en route: `app.source` → `app._source` (matched test_dir_picker.py convention). **701 → 718/718 green** (eighths — two 13-file batches together now exceed the 45s bash timeout). Same clean-mount protocol. NOT committed — Matthew commits Windows-side.

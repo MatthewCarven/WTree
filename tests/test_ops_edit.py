@@ -10,7 +10,6 @@ validation, suspend(), and pane refresh) is exercised in
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path

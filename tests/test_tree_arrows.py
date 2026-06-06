@@ -112,7 +112,6 @@ async def test_right_on_error_leaf_is_noop(tmp_path: Path) -> None:
     Pressing right should silently no-op rather than fall through to
     Textual's default (which doesn't exist in 8.x anyway).
     """
-    from textual.widgets.tree import TreeNode
 
     app = WTreeApp(root_path=str(tmp_path))
     async with app.run_test() as pilot:

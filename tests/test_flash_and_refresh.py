@@ -27,7 +27,6 @@ from wtree.widgets.status_line import (
     DEFAULT_FLASH_TIMEOUT,
     StatusLine,
 )
-from wtree.widgets.tree_pane import TreePane
 
 
 def _status_text(status: StatusLine) -> str:

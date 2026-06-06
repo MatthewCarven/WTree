@@ -16,14 +16,12 @@ interface -> Conflict resolution dialog):
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
 from wtree.app import WTreeApp
 from wtree.ops import (
     ConflictKind,
-    OperationKind,
     Resolution,
     apply_plan,
     plan_copy,
@@ -33,7 +31,7 @@ from wtree.ops import (
     resolve_conflicts,
     suffixed_name,
 )
-from wtree.ops.base import Plan, PlanItem
+from wtree.ops.base import PlanItem
 from wtree.sources.base import Entry, Kind
 from wtree.sources.mock import MockSource
 from wtree.sources.native import NativeSource

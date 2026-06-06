@@ -177,7 +177,7 @@ async def test_whitespace_only_treated_as_blank(tmp_path: Path) -> None:
     app = WTreeApp(root_path=str(tmp_path / "alpha"))
     async with app.run_test() as pilot:
         await pilot.pause()
-        tree = app.query_one(TreePane)
+        app.query_one(TreePane)
         await _drive_log(pilot, app, "   ")
         assert app._root_path == str(tmp_path)
 
