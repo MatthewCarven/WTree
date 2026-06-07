@@ -18,6 +18,7 @@ from pathlib import Path
 from wtree.error_handler import (
     ErrorReport,
     describe_error,
+    install,
     redact_pattern,
     register_redactor,
 )
@@ -60,9 +61,56 @@ def install_crash_redactors() -> None:
         pass
 
 
+# Frames from these packages are framework plumbing in a WTree crash -
+# the vendored reporter tags + collapses them so the report reads as
+# "your code, with honest [N framework frames hidden] markers". WTREE_DEBUG
+# disables the collapse (debugging posture wants everything).
+_SKIP_MODULES = ("textual", "rich")
+
+# Byte budget for a report. WTREE_DEBUG lifts it: with locals on, a big
+# tagged-set crash can legitimately need the space, and the debugging
+# posture prefers completeness over log hygiene.
+_REPORT_BYTE_BUDGET = 512 * 1024
+
+
 def build_report(error: BaseException) -> ErrorReport:
-    """``describe_error`` with WTree's locals policy applied."""
-    return describe_error(error, include_locals=locals_enabled())
+    """``describe_error`` with WTree's policies applied.
+
+    Default posture (no ``WTREE_DEBUG``): no frame locals, textual/rich
+    frames collapsed, 512 KiB report budget (drops locals first, then
+    source context, with honest markers - the vendored budget rule).
+    ``WTREE_DEBUG=1``: locals on, nothing collapsed, no budget.
+    """
+    debug = locals_enabled()
+    return describe_error(
+        error,
+        include_locals=debug,
+        skip_modules=() if debug else _SKIP_MODULES,
+        max_report_bytes=None if debug else _REPORT_BYTE_BUDGET,
+    )
+
+
+_hooks_installed = False
+
+
+def install_thread_hooks() -> None:
+    """Wire the vendored ``threading`` + ``unraisable`` hooks (idempotent).
+
+    Covers the errors neither net sees today: a stray worker thread
+    raising outside the event loop, and unraisables (``__del__`` and
+    friends). Concise report to stderr - these are diagnostics, not
+    app-fatal; Textual's loop crashes stay with ``_handle_exception``
+    and the ``sys.excepthook`` slot is deliberately left alone
+    (``main()``'s outer try/except owns that layer).
+    """
+    global _hooks_installed
+    if _hooks_installed:
+        return
+    try:
+        install(hooks=("threading", "unraisable"), style="concise")
+        _hooks_installed = True
+    except Exception:  # noqa: BLE001 - setup must never break app startup
+        pass
 
 
 def write_crash_log(

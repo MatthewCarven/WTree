@@ -54,7 +54,12 @@ from textual.widgets import DataTable, Header, Tree
 from wtree import __version__
 from pathlib import Path
 
-from wtree.crash import build_report, install_crash_redactors, write_crash_log
+from wtree.crash import (
+    build_report,
+    install_crash_redactors,
+    install_thread_hooks,
+    write_crash_log,
+)
 from wtree.error_handler import ErrorReport
 from wtree.editor import launch_editor_blocking, resolve_editor
 from wtree.ops import (
@@ -244,6 +249,72 @@ class WTreeApp(App):
         except Exception:  # noqa: BLE001 - reporting must never mask the crash
             pass
         super()._handle_exception(error)
+
+    def _fatal_error(self) -> None:
+        """Own the exit screen (crash-handler phase 2, design.md 2026-06-07).
+
+        Textual's default appends a full Rich traceback (with locals) to
+        ``_exit_renderables``. WTree replaces it with a clean one-panel
+        summary - exception type + message, the crash-log pointer, and
+        the ``WTREE_DEBUG`` hint - because the full report is already on
+        disk. ``WTREE_DEBUG=1`` appends Textual's traceback inside the
+        same renderable (``_print_error_renderables`` only shows the
+        first entry outside debug mode, so both ride one ``Group``).
+        Never raises; falls back to Textual's default on any failure.
+        """
+        try:
+            from rich.console import Group
+            from rich.panel import Panel
+            from rich.text import Text as RichText
+
+            error = self._exception
+            head = (
+                f"{type(error).__name__}: {error}"
+                if error is not None
+                else "WTree hit an unexpected error."
+            )
+            lines = [RichText(head, style="bold red")]
+            if self._crash_log_path is not None:
+                lines.append(
+                    RichText(f"Full report: {self._crash_log_path}")
+                )
+            else:
+                lines.append(
+                    RichText("(crash log could not be written)", style="dim")
+                )
+            lines.append(
+                RichText(
+                    "Set WTREE_DEBUG=1 for frame locals and the full "
+                    "traceback.",
+                    style="dim",
+                )
+            )
+            parts: list[object] = [
+                Panel.fit(Group(*lines), title="WTree crashed", border_style="red")
+            ]
+            if os.environ.get("WTREE_DEBUG", "") == "1":
+                import rich
+                from rich.traceback import Traceback
+                from rich.segment import Segments
+
+                parts.append(
+                    Segments(
+                        self.console.render(
+                            Traceback(
+                                show_locals=True,
+                                width=None,
+                                locals_max_length=5,
+                                suppress=[rich],
+                            ),
+                            self.console.options,
+                        )
+                    )
+                )
+            self.bell()
+            self._exit_renderables.append(Group(*parts))
+            self._close_messages_no_wait()
+        except Exception:  # noqa: BLE001 - never mask the crash; use default
+            super()._fatal_error()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1832,6 +1903,7 @@ def main() -> None:
     user at it, exit non-zero.
     """
     install_crash_redactors()
+    install_thread_hooks()
     app = WTreeApp()
     try:
         app.run()

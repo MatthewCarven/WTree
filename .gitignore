@@ -48,3 +48,9 @@ desktop.ini
 # Textual writes its devtools console log here when running with `textual run --dev`
 .textual.log
 *.log
+
+# --- Vendoring drops ------------------------------------------------------
+# Upstream error-handler drops for re-vendoring into wtree/error_handler.py
+# (see design.md "Error handling and crash reporting" -> Vendoring). The
+# drop is synced verbatim, then the folder stays untracked.
+Python Errorhandler New/
