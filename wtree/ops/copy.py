@@ -23,6 +23,7 @@ from wtree.ops.base import (
     PLAN_CHUNK_SIZE,
     OperationKind,
     Plan,
+    collapse_nested_tags,
     PlanError,
     PlanItem,
     ScanCancelled,
@@ -131,6 +132,7 @@ async def plan_copy(
     will translate to the destination source's native separator when it
     actually applies the plan.
     """
+    tags, collapsed = collapse_nested_tags(tags)
     walk = await walk_tags(
         tags, registry, on_progress=on_progress, should_cancel=should_cancel
     )
@@ -170,7 +172,7 @@ async def plan_copy(
                 if should_cancel is not None and should_cancel():
                     raise ScanCancelled()
 
-    plan = Plan(kind=OperationKind.COPY, items=items, errors=walk.errors)
+    plan = Plan(kind=OperationKind.COPY, collapsed_tags=collapsed, items=items, errors=walk.errors)
     # Self-target pass first: mark the topmost copy-into-own-dir item SELF
     # so it surfaces in the dialog (duplicate-in-place). annotate_conflicts
     # then skips every self-targeted item, so the SELF flag survives and

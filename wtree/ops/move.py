@@ -26,6 +26,7 @@ import posixpath
 from collections.abc import Callable, Mapping, Sequence
 
 from wtree.ops.base import (
+    collapse_nested_tags,
     PLAN_CHUNK_SIZE,
     OperationKind,
     Plan,
@@ -62,6 +63,8 @@ async def plan_move(
     regardless of the source platform; the execute dispatcher
     translates to native separators when applying the plan.
     """
+    tags, collapsed = collapse_nested_tags(tags)
+
     items: list[PlanItem] = []
     errors: list[PlanError] = []
 
@@ -124,7 +127,12 @@ async def plan_move(
             )
         )
 
-    plan = Plan(kind=OperationKind.MOVE, items=items, errors=errors)
+    plan = Plan(
+        kind=OperationKind.MOVE,
+        collapsed_tags=collapsed,
+        items=items,
+        errors=errors,
+    )
     # Drop self-targeted moves (entry into its own directory) - a genuine
     # no-op. Critically this happens *before* annotate_conflicts so such an
     # item can never be flagged and offered Overwrite, which would rmtree

@@ -1017,6 +1017,16 @@ class WTreeApp(App):
             self.tagged_set.clear()
             self._refresh_tag_visuals()
 
+        # Overlapping-tag dedup surfacing (design.md 2026-06-07): a
+        # recursively-tagged folder collapses to its topmost root(s) at
+        # plan time, so the item count can be drastically smaller than
+        # the tag count - say why.
+        if plan.collapsed_tags:
+            self.flash(
+                f"{verb}: {plan.collapsed_tags} nested tag(s) collapsed "
+                f"into their tagged parent(s)."
+            )
+
         body_paths = [t.path for t in tags[:3]]
         body = ", ".join(body_paths)
         if len(tags) > 3:

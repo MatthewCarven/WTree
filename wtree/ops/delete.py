@@ -17,6 +17,7 @@ import posixpath
 from collections.abc import Mapping, Sequence
 
 from wtree.ops.base import (
+    collapse_nested_tags,
     OperationKind,
     Plan,
     PlanError,
@@ -41,6 +42,8 @@ async def plan_delete(
     a whole source root is almost certainly not what the user meant,
     and refusing here keeps the executor honest.
     """
+    tags, collapsed = collapse_nested_tags(tags)
+
     items: list[PlanItem] = []
     errors: list[PlanError] = []
 
@@ -94,7 +97,12 @@ async def plan_delete(
             )
         )
 
-    return Plan(kind=OperationKind.DELETE, items=items, errors=errors)
+    return Plan(
+        kind=OperationKind.DELETE,
+        collapsed_tags=collapsed,
+        items=items,
+        errors=errors,
+    )
 
 
 def _basename(path: str) -> str:

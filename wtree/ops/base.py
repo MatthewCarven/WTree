@@ -21,6 +21,11 @@ from enum import Enum
 
 from wtree.sources.base import Kind
 
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from wtree.tagged_set import Tag
+
 
 # Path identity is case-insensitive on Windows (NTFS default) and case-
 # sensitive on POSIX. macOS (HFS+/APFS default-insensitive) is treated as
@@ -286,6 +291,11 @@ class Plan:
     kind: OperationKind
     items: list[PlanItem] = field(default_factory=list)
     errors: list[PlanError] = field(default_factory=list)
+    # How many tags the planner collapsed as nested duplicates of another
+    # tagged ancestor (design.md 2026-06-07 overlapping-tag dedup). Purely
+    # informational - the app flashes it so a 349k-tag recursive copy
+    # showing "1 item" is explained. 0 when nothing was collapsed.
+    collapsed_tags: int = 0
 
     @property
     def file_count(self) -> int:
@@ -467,3 +477,66 @@ def drive_anchor(path: str) -> str:
     """
     drive, _ = os.path.splitdrive(path)
     return drive + os.sep if drive else os.sep
+def collapse_nested_tags(
+    tags: "Sequence[Tag]",
+    *,
+    case_insensitive: bool | None = None,
+) -> "tuple[list[Tag], int]":
+    """Drop tags nested inside another tagged ancestor (same source).
+
+    The recursive-tag + operate idiom (Space on a folder tags it AND
+    every descendant) used to make the per-tag planners emit one item
+    per descendant: Copy produced *flattened duplicate siblings* at the
+    destination (``dest/foo`` plus ``dest/bar`` plus ``dest/baz.txt``
+    for a fully-tagged ``foo/bar/baz.txt``), Move emitted items whose
+    source had already moved away, Delete emitted already-gone items
+    (design.md 2026-06-07). Operating on the topmost tagged roots is
+    both the correct semantics and the perf lever - the redundant
+    subtree walks disappear with the redundant items.
+
+    Containment is judged on :func:`canonical_path` (separator + the
+    platform case rule - ``case_insensitive`` is a parameter for
+    testability, the ``canonical_path`` precedent) and only within the
+    same ``source_id``. A tag whose canonical path equals an
+    already-kept tag (mixed-separator duplicate) collapses too. The
+    tagged *set* is never touched - this is a plan-time transform.
+
+    Returns ``(kept_tags_in_original_order, collapsed_count)``.
+    """
+    if case_insensitive is None:
+        case_insensitive = os.name == "nt"
+    canon = [
+        canonical_path(t.path, case_insensitive=case_insensitive)
+        for t in tags
+    ]
+    # Process in segment-depth-sorted order so every tagged ancestor of a
+    # path is decided before the path itself; membership in ``kept`` is
+    # then checked by walking the dirname chain (O(depth), immune to the
+    # lexicographic sibling trap where "/a-x" sorts between "/a" and
+    # "/a/b").
+    order = sorted(
+        range(len(tags)),
+        key=lambda i: (tags[i].source_id, tuple(canon[i].split("/"))),
+    )
+    kept_by_source: dict[str, set[str]] = {}
+    keep_flags = [False] * len(tags)
+    for i in order:
+        sid = tags[i].source_id
+        kept = kept_by_source.setdefault(sid, set())
+        c = canon[i]
+        nested = c in kept
+        if not nested:
+            probe = posixpath.dirname(c)
+            while probe and probe != "/":
+                if probe in kept:
+                    nested = True
+                    break
+                probe = posixpath.dirname(probe)
+            if not nested and "/" in kept:
+                nested = True
+        if nested:
+            continue
+        kept.add(c)
+        keep_flags[i] = True
+    kept_tags = [t for t, f in zip(tags, keep_flags) if f]
+    return kept_tags, len(tags) - len(kept_tags)
