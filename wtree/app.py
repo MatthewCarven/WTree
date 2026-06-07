@@ -109,7 +109,7 @@ from wtree.widgets.properties import (
     PropertiesScreen,
     TaggedProps,
 )
-from wtree.widgets.search_bar import SearchBar
+from wtree.widgets.search_bar import SearchBar, compute_matches
 from wtree.widgets.status_line import StatusLine
 from wtree.widgets.tree_pane import TreePane
 from wtree.widgets.viewer import ViewerScreen
@@ -1277,23 +1277,17 @@ class WTreeApp(App):
             bar.update_match_info(0, 0)
             return
 
-        needle = query.lower()
-        matches = [
-            row
-            for row, label in self._search_target.iter_searchable()
-            if needle in label.lower()
-        ]
+        matches, idx_after = compute_matches(
+            self._search_target.iter_searchable(),
+            query,
+            anchor=self._search_cursor_pre or 0,
+        )
         self._search_matches = matches
         if not matches:
             self._search_match_idx = 0
             bar.update_match_info(0, 0)
             return
 
-        anchor = self._search_cursor_pre or 0
-        idx_after = next(
-            (i for i, row in enumerate(matches) if row >= anchor),
-            0,
-        )
         self._search_match_idx = idx_after
         self._search_target.set_search_cursor(matches[idx_after])
         bar.update_match_info(len(matches), idx_after + 1)

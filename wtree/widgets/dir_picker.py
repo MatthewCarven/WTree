@@ -42,6 +42,7 @@ from wtree.ops.execute import _make_new_blocking
 from wtree.sources.base import EntrySource, Kind, ScanError
 from wtree.widgets.prompt import PromptDialog
 from wtree.widgets.scan_screen import ScanContext, populate_dir_node
+from wtree.widgets.search_bar import SearchBar, compute_matches
 
 
 class _PickerTree(Tree[str]):
@@ -62,6 +63,13 @@ class _PickerTree(Tree[str]):
         super().__init__(label=root_path, data=root_path)
         self._source = source
         self._loaded: set[int] = set()
+        # Files-greyed toggle (f). Consulted by _populate; flipping it
+        # rebuilds via set_show_files.
+        self.show_files = False
+        # Filter dim-state: None = no active filter; else the node ids
+        # that MATCH (everything else renders dim). Set by the screen's
+        # SearchBar handlers, consulted by render_label.
+        self._filter_match_ids: set[int] | None = None
 
     async def on_mount(self) -> None:
         await self._populate(self.root)
@@ -83,7 +91,10 @@ class _PickerTree(Tree[str]):
         """
         # Delegates to the shared dir-populate helper (see scan_screen) so
         # the picker tree and TreePane stay in lock-step.
-        await populate_dir_node(node, self._source, self._loaded, ctx=ctx)
+        await populate_dir_node(
+            node, self._source, self._loaded,
+            ctx=ctx, include_files=self.show_files,
+        )
 
     async def on_tree_node_expanded(
         self, event: Tree.NodeExpanded[str]
@@ -201,6 +212,121 @@ class _PickerTree(Tree[str]):
         self._loaded.discard(node.id)
         await self._populate(node)
 
+    # ------------------------------------------------------------------
+    # SearchTarget protocol + filter dim-state (picker type-to-filter)
+    # ------------------------------------------------------------------
+    #
+    # Same three-method shape as TreePane/ContentsPane so the screen's
+    # SearchBar handlers mirror the app's. Scope = visible rows only
+    # (pane-`/` consistency). Line numbering counts EVERY visible row
+    # (files + error leaves included - Textual numbers them) but only
+    # selectable dir rows are yielded, so greyed files and error
+    # placeholders never match (they carry data=None).
+
+    def iter_searchable(self):
+        yield from self._walk_visible(self.root, [0])
+
+    def _walk_visible(self, node, line):
+        if not (node is self.root and not self.show_root):
+            # The root row is counted but never yielded: its label is the
+            # full anchor path, which would substring-match almost any
+            # query and pollute every filter. (TreePane's pane-search
+            # includes its root; the picker diverges deliberately -
+            # design.md 2026-06-07.)
+            if node.data is not None and node is not self.root:
+                yield line[0], str(node.label)
+            line[0] += 1
+        if node.is_expanded:
+            for child in node.children:
+                yield from self._walk_visible(child, line)
+
+    def get_search_cursor(self) -> int:
+        return self.cursor_line
+
+    def set_search_cursor(self, line: int) -> None:
+        self.cursor_line = line
+
+    def set_filter_matches(self, match_lines: "set[int] | None") -> None:
+        """Install the dim-state: rows NOT in ``match_lines`` render dim.
+
+        ``None`` clears the filter (everything renders normal). Lines are
+        translated to node ids here (ids are stable across repaints;
+        lines shift when nodes expand - but the filter is recomputed on
+        every query change, so line-time translation is safe).
+        """
+        if match_lines is None:
+            self._filter_match_ids = None
+        else:
+            ids: set[int] = set()
+            line = [0]
+            self._collect_match_ids(self.root, line, match_lines, ids)
+            self._filter_match_ids = ids
+        self.refresh()
+
+    def _collect_match_ids(self, node, line, match_lines, ids) -> None:
+        if not (node is self.root and not self.show_root):
+            if line[0] in match_lines:
+                ids.add(node.id)
+            line[0] += 1
+        if node.is_expanded:
+            for child in node.children:
+                self._collect_match_ids(child, line, match_lines, ids)
+
+    def render_label(self, node, base_style, style):
+        """Dim non-matching rows while a filter query is active.
+
+        The tagged-styling pattern: consult live state on every paint.
+        Greyed files are pre-dimmed at populate time; this hook only
+        adds filter-dimming for selectable rows outside the match set.
+        """
+        label = super().render_label(node, base_style, style)
+        if (
+            self._filter_match_ids is not None
+            and node.id not in self._filter_match_ids
+        ):
+            label = label.copy()
+            label.stylize("dim")
+        return label
+
+    async def set_show_files(self, show: bool) -> None:
+        """Flip the files-greyed overlay and rebuild in place.
+
+        Snapshot expanded dir paths + cursor path, re-root (wipes +
+        repopulates with the new flag), re-expand shallowest-first,
+        reveal the cursor again. Cursor-on-file falls back to the root
+        row (files carry data=None - nothing to restore to).
+        """
+        if show == self.show_files:
+            return
+        self.show_files = show
+        root_path = self.root.data
+        if root_path is None:
+            return
+        expanded = [
+            n.data for n in self._walk_all_nodes(self.root)
+            if n.is_expanded and n.data is not None and n is not self.root
+        ]
+        expanded.sort(key=len)  # shallowest first
+        cursor = self.cursor_node
+        cursor_path = (
+            cursor.data if cursor is not None and cursor.data is not None
+            else None
+        )
+        await self.re_root(root_path)
+        for path in expanded:
+            node = await self._walk_to_node(path)
+            if node is not None and not node.is_expanded:
+                node.expand()
+                await self._populate(node)
+        await asyncio.sleep(0)
+        if cursor_path is not None:
+            await self.reveal_path(cursor_path)
+
+    def _walk_all_nodes(self, node):
+        yield node
+        for child in node.children:
+            yield from self._walk_all_nodes(child)
+
     async def re_root(self, new_root_path: str) -> None:
         """Re-root the tree in place at ``new_root_path`` (drive switch).
 
@@ -258,6 +384,8 @@ class DirPickerScreen(ModalScreen[str | None]):
         ("escape", "cancel", "Cancel"),
         ("n", "make_dir", "New folder"),
         ("ctrl+d", "switch_drive", "Drives"),
+        ("slash", "filter", "Filter"),
+        ("f", "toggle_files", "Files"),
     ]
 
     def __init__(
@@ -278,6 +406,10 @@ class DirPickerScreen(ModalScreen[str | None]):
         # anchor is "/", which would collapse ~ and /mnt/usb into one key
         # (design.md 2026-06-07). Dies with the modal.
         self._per_root_cursor: dict[str, str] = {}
+        # Type-to-filter state (mirrors WTreeApp's pane-search trio).
+        self._search_cursor_pre: int | None = None
+        self._search_matches: list[int] = []
+        self._search_match_idx = 0
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -288,6 +420,7 @@ class DirPickerScreen(ModalScreen[str | None]):
                 classes="hint",
                 id="picker-hint",
             )
+            yield SearchBar(id="picker-search")
 
     async def on_mount(self) -> None:
         tree = self.query_one(_PickerTree)
@@ -303,8 +436,8 @@ class DirPickerScreen(ModalScreen[str | None]):
         items = f"{n} tagged item(s)" if n else "selection"
         return (
             f"-> {target}\n"
-            f"Enter pick  -  n new folder  -  Ctrl+D drives  -  "
-            f"Backspace/Left parent  -  Esc cancel    [{items}]"
+            f"Enter pick  -  n new folder  -  / filter  -  f files  -  "
+            f"Ctrl+D drives  -  Left parent  -  Esc cancel    [{items}]"
         )
 
     def _refresh_footer(self) -> None:
@@ -424,6 +557,98 @@ class DirPickerScreen(ModalScreen[str | None]):
         remembered = self._per_root_cursor.get(picked)
         if remembered is not None:
             await tree.reveal_path(remembered)
+        self._refresh_footer()
+
+
+    # -- type-to-filter (design.md 2026-06-07) --------------------------
+
+    def action_filter(self) -> None:
+        """``/``: activate the picker's SearchBar (jump + dim filter)."""
+        tree = self.query_one(_PickerTree)
+        self._search_cursor_pre = tree.get_search_cursor()
+        self._search_matches = []
+        self._search_match_idx = 0
+        self.query_one("#picker-search", SearchBar).activate()
+
+    def on_search_bar_query_changed(
+        self, event: SearchBar.QueryChanged
+    ) -> None:
+        event.stop()
+        tree = self.query_one(_PickerTree)
+        bar = self.query_one("#picker-search", SearchBar)
+        if not event.query:
+            self._search_matches = []
+            self._search_match_idx = 0
+            tree.set_filter_matches(None)
+            bar.update_match_info(0, 0)
+            return
+        matches, idx = compute_matches(
+            tree.iter_searchable(),
+            event.query,
+            anchor=self._search_cursor_pre or 0,
+        )
+        self._search_matches = matches
+        tree.set_filter_matches(set(matches))
+        if not matches:
+            self._search_match_idx = 0
+            bar.update_match_info(0, 0)
+            return
+        self._search_match_idx = idx
+        tree.set_search_cursor(matches[idx])
+        bar.update_match_info(len(matches), idx + 1)
+
+    def on_search_bar_next_match(self, event: SearchBar.NextMatch) -> None:
+        event.stop()
+        self._step_match(1)
+
+    def on_search_bar_prev_match(self, event: SearchBar.PrevMatch) -> None:
+        event.stop()
+        self._step_match(-1)
+
+    def _step_match(self, direction: int) -> None:
+        if not self._search_matches:
+            return
+        tree = self.query_one(_PickerTree)
+        n = len(self._search_matches)
+        self._search_match_idx = (self._search_match_idx + direction) % n
+        tree.set_search_cursor(self._search_matches[self._search_match_idx])
+        self.query_one("#picker-search", SearchBar).update_match_info(
+            n, self._search_match_idx + 1
+        )
+
+    def on_search_bar_committed(self, event: SearchBar.Committed) -> None:
+        event.stop()
+        self._exit_filter(restore=False)
+
+    def on_search_bar_cancelled(self, event: SearchBar.Cancelled) -> None:
+        event.stop()
+        self._exit_filter(restore=True)
+
+    def _exit_filter(self, *, restore: bool) -> None:
+        """Hide the bar, clear the dim-state, return focus to the tree.
+
+        ``restore=True`` (Esc) puts the cursor back where it was when
+        ``/`` was pressed; commit (Enter) leaves it on the match - the
+        pane-search contract.
+        """
+        tree = self.query_one(_PickerTree)
+        self.query_one("#picker-search", SearchBar).deactivate()
+        tree.set_filter_matches(None)
+        if restore and self._search_cursor_pre is not None:
+            tree.set_search_cursor(self._search_cursor_pre)
+        self._search_cursor_pre = None
+        self._search_matches = []
+        self._search_match_idx = 0
+        tree.focus()
+        self._refresh_footer()
+
+    # -- files-greyed toggle (design.md 2026-06-07) ----------------------
+
+    @work
+    async def action_toggle_files(self) -> None:
+        """``f``: overlay / hide dim non-selectable files for context."""
+        tree = self.query_one(_PickerTree)
+        await tree.set_show_files(not tree.show_files)
         self._refresh_footer()
 
 

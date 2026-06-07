@@ -30,10 +30,36 @@ indirection - we just hand Rich a ``Text`` object every frame.
 from __future__ import annotations
 
 from rich.text import Text
+
+from typing import Iterable
 from textual import events
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
+
+
+def compute_matches(
+    rows: "Iterable[tuple[int, str]]",
+    query: str,
+    anchor: int = 0,
+) -> tuple[list[int], int]:
+    """Substring-CI match over ``(row, label)`` pairs -> (matches, idx).
+
+    The match rule both `/`-search surfaces share (the app's pane search
+    and the destination browser's filter - extracted 2026-06-07 so they
+    can't drift). ``matches`` is the row indices whose label contains
+    ``query`` case-insensitively; ``idx`` is the index *into matches* of
+    the first match at-or-after ``anchor`` (wrapping to 0), i.e. where
+    the cursor should land first. ``(matches=[], idx=0)`` when nothing
+    matches; callers handle the empty-query case themselves (it means
+    "no filter", not "no matches").
+    """
+    needle = query.lower()
+    matches = [row for row, label in rows if needle in label.lower()]
+    if not matches:
+        return matches, 0
+    idx = next((i for i, row in enumerate(matches) if row >= anchor), 0)
+    return matches, idx
 
 
 class SearchBar(Widget):

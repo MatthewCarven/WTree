@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+
+from rich.text import Text
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -270,6 +272,7 @@ async def populate_dir_node(
     loaded: set[int],
     *,
     ctx: ScanContext | None = None,
+    include_files: bool = False,
 ) -> None:
     """Scan ``node.data`` and add directory children + error leaves (dir-only).
 
@@ -290,6 +293,12 @@ async def populate_dir_node(
     legacy one-shot drain. Errors are added first (``⚠`` prefix) so they're
     noticed; directories follow, case-insensitively sorted (XTree / most file
     managers).
+
+    ``include_files=True`` (the picker's files-greyed toggle, design.md
+    2026-06-07) appends the directory's non-dir entries after the dirs as
+    dim, non-selectable, non-expandable leaves with ``data=None`` - the
+    same data convention as error placeholders, so selection handlers and
+    search walks skip them with no extra checks. TreePane never passes it.
     """
     if node.id in loaded:
         return
@@ -298,12 +307,15 @@ async def populate_dir_node(
     if path is None:
         return
     directories: list[Entry] = []
+    files: list[Entry] = []
     errors: list[ScanError] = []
     i = 0
     async for item in source.scan(path):
         if isinstance(item, Entry):
             if item.kind is Kind.DIR:
                 directories.append(item)
+            elif include_files:
+                files.append(item)
         elif isinstance(item, ScanError):
             errors.append(item)
         i += 1
@@ -326,3 +338,7 @@ async def populate_dir_node(
             data=os.path.join(path, entry.name),
             allow_expand=True,
         )
+    if include_files:
+        files.sort(key=lambda e: e.name.lower())
+        for entry in files:
+            node.add_leaf(Text(entry.name, style="dim"), data=None)
