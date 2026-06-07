@@ -88,7 +88,8 @@ from wtree.tagged_set import Tag, TaggedSet
 from wtree.widgets.confirm import ConfirmDialog
 from wtree.widgets.conflict import ConflictDialog
 from wtree.widgets.contents_pane import ContentsPane
-from wtree.widgets.dir_picker import DirPickerScreen
+from wtree._drives import list_drive_anchors
+from wtree.widgets.dir_picker import DirPickerScreen, DriveChooserScreen
 from wtree.widgets.help import HelpScreen
 from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
@@ -177,6 +178,7 @@ class WTreeApp(App):
         ("ctrl+f", "find_tree", "Find tree"),
         ("ctrl+g", "next_match", "Next match"),
         ("l", "log_new_source", "Log new source"),
+        ("ctrl+d", "switch_drive", "Switch drive"),
         ("ctrl+r", "refresh_source", "Refresh source"),
         ("ctrl+i", "properties", "Properties"),
         ("ctrl+p", "show_progress", "Show progress"),
@@ -1197,6 +1199,43 @@ class WTreeApp(App):
             lambda ctx: tree.re_root(candidate, ctx=ctx),
         )
         self.flash(f"Logged: {candidate}")
+        self._refresh_status()
+
+    @work
+    async def action_switch_drive(self) -> None:
+        """Ctrl+D - switch drive / location via the chooser.
+
+        The browsable cousin of ``L`` (design.md 2026-06-07): pushes the
+        same :class:`DriveChooserScreen` the destination browser uses,
+        listing the anchors from :mod:`wtree._drives` with the current
+        root always included. Picking an entry re-roots the logged tree
+        there - the ``L`` path with the typing replaced by a list. Tags
+        survive (absolute paths). Esc and a same-root pick change
+        nothing. An anchor that stopped existing (e.g. an unplugged
+        removable drive enumerated moments earlier) flashes a nudge
+        without re-rooting.
+        """
+        old_root = self._root_path
+        anchors = list_drive_anchors(current=old_root)
+        picked = await self.push_screen_wait(
+            DriveChooserScreen(anchors, current=old_root)
+        )
+        if picked is None:
+            self.flash("Switch drive: cancelled.")
+            return
+        if picked == old_root:
+            return
+        if not os.path.isdir(picked):
+            self.flash(f"Switch drive: not available: {picked}")
+            return
+        self._root_path = picked
+        tree = self.query_one(TreePane)
+        await self._run_scan_with_dialog(
+            picked,
+            self._source,
+            lambda ctx: tree.re_root(picked, ctx=ctx),
+        )
+        self.flash(f"Logged: {picked} (switched from {old_root})")
         self._refresh_status()
 
     # ------------------------------------------------------------------

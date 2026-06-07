@@ -136,6 +136,7 @@ def _help_content() -> Text:
     row("Left (on root)", "Ascend - re-root tree at parent")
     row("Left / Right", "Collapse / expand (tree pane)")
     row("L", "Log new source (prompt for path; re-roots)")
+    row("Ctrl+D", "Switch drive / location (chooser; re-roots)")
     t.append("\n")
 
     section("Tagging")

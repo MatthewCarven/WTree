@@ -45,7 +45,8 @@ async def test_menus_definition_has_expected_items() -> None:
 
     File: New, View, Edit, Copy, Move, Rename, Delete, Properties,
           separator, Quit.
-    Commands: Search, Find tree, Next match, Log new source, Refresh
+    Commands: Search, Find tree, Next match, Log new source, Switch
+    drive, Refresh
               source, Untag all.
     Help: About.
 
@@ -67,6 +68,7 @@ async def test_menus_definition_has_expected_items() -> None:
         "Find tree",
         "Next match",
         "Log new source",
+        "Switch drive",
         "Refresh source",
         "Progress dialog",
         "Untag all",
@@ -275,10 +277,10 @@ async def test_untag_all_from_commands_menu(tmp_path: Path) -> None:
         await pilot.press("right")  # Commands
         await pilot.pause()
         # Commands menu items: Search (0), Find tree (1), Next match (2),
-        # Log new source (3), Refresh source (4), Progress dialog (5),
-        # Untag all (6). The cursor starts on Search; press Down six
-        # times to reach Untag all.
-        for _ in range(6):
+        # Log new source (3), Switch drive (4), Refresh source (5),
+        # Progress dialog (6), Untag all (7). The cursor starts on
+        # Search; press Down seven times to reach Untag all.
+        for _ in range(7):
             await pilot.press("down")
             await pilot.pause()
         await pilot.press("enter")

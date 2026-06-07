@@ -230,7 +230,7 @@ The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-
 
 ## Drive-switching-era follow-ups
 
-- [ ] **App-level Ctrl+D — re-root the logged tree via the drive chooser.** A browsable cousin of `L`. The enumeration helper (`wtree/_drives.py`) and `DriveChooserScreen` are picker-independent by design, so this is bindings + menu + help + a `_do_log`-style handler + tests.
+- [x] **App-level Ctrl+D — re-root the logged tree via the drive chooser. DONE 2026-06-07** — `action_switch_drive` re-roots through the L machinery (scan gate, tags survive); vanished-anchor nudge; Commands menu + Help rows; 10 new tests.
 - [ ] **Sort/label polish in the chooser.** Volume labels on Windows (`GetVolumeInformation` — needs ctypes work), free-space column, friendly `~` display instead of the expanded home path.
 
 ## Normalisation-era follow-ups
