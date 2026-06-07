@@ -36,7 +36,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Label, Static, Tree
 from textual.widgets.tree import TreeNode
 
-from wtree._drives import list_drive_anchors
+from wtree._drives import (
+    anchor_details,
+    friendly_anchor_name,
+    list_drive_anchors,
+)
+from wtree.ops.base import _human_bytes
 from wtree.ops.base import resolve_relative_leaf, to_posix
 from wtree.ops.execute import _make_new_blocking
 from wtree.sources.base import EntrySource, Kind, ScanError
@@ -702,6 +707,10 @@ class DriveChooserScreen(ModalScreen[str | None]):
         self._cursor = (
             anchors.index(current) if current in anchors else 0
         )
+        # anchor -> (label, free, total). Filled asynchronously after
+        # mount (anchor_details can block on dead network shares - the
+        # list must paint immediately, details arrive when they arrive).
+        self._details: dict[str, tuple[str | None, int | None, int | None]] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -709,11 +718,40 @@ class DriveChooserScreen(ModalScreen[str | None]):
             yield Static(self._body_text(), id="drive-list")
             yield Label("Enter switch  -  Esc cancel", classes="hint")
 
+    async def on_mount(self) -> None:
+        """Kick off the async decoration pass (labels + free space).
+
+        One ``to_thread`` per anchor, awaited in order; each arrival
+        repaints. A dead share's multi-second stat delays only its own
+        row's details - the list itself painted at compose time and
+        stays fully navigable.
+        """
+        for anchor in self._anchors:
+            try:
+                details = await asyncio.to_thread(anchor_details, anchor)
+            except Exception:  # noqa: BLE001 - bare row beats a crash
+                continue
+            self._details[anchor] = details
+            self._refresh_list()
+
     def _body_text(self) -> str:
+        names = [friendly_anchor_name(a) for a in self._anchors]
+        width = max((len(n) for n in names), default=0)
         lines = []
-        for i, anchor in enumerate(self._anchors):
+        for i, (anchor, name) in enumerate(zip(self._anchors, names)):
             marker = ">" if i == self._cursor else " "
-            lines.append(f"{marker} {anchor}")
+            row = f"{marker} {name:<{width}}"
+            details = self._details.get(anchor)
+            if details is not None:
+                label, free, total = details
+                if label:
+                    row += f"  [{label}]"
+                if free is not None and total is not None:
+                    row += (
+                        f"  {_human_bytes(free)} free"
+                        f" of {_human_bytes(total)}"
+                    )
+            lines.append(row.rstrip())
         return "\n".join(lines)
 
     def _refresh_list(self) -> None:

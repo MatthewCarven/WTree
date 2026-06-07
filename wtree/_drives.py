@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import string
 
-__all__ = ["list_drive_anchors"]
+__all__ = ["anchor_details", "friendly_anchor_name", "list_drive_anchors"]
 
 
 # Removable-media bases probed on POSIX/macOS, in display order.
@@ -130,3 +130,62 @@ def list_drive_anchors(
     if current and current not in seen:
         unique.insert(0, current)
     return unique
+
+
+def friendly_anchor_name(anchor: str, *, home: str | None = None) -> str:
+    """Display name for an anchor - ``~`` for the home dir, else as-is.
+
+    Display-only (the chooser still returns the real path); ``home`` is
+    a parameter for tests, defaulting to the live ``~`` expansion.
+    """
+    home = home if home is not None else os.path.expanduser("~")
+    if home and home not in ("/",) and anchor == home:
+        return "~"
+    return anchor
+
+
+def anchor_details(anchor: str) -> "tuple[str | None, int | None, int | None]":
+    """Best-effort ``(volume_label, free_bytes, total_bytes)`` for an anchor.
+
+    Everything degrades to ``None`` rather than raising: an unmounted
+    drive letter, a permission wall, or a dead network share yields a
+    bare row, not a crash. Called off the event loop (the chooser
+    decorates asynchronously) because ``disk_usage`` on a dead UNC
+    share can block for seconds.
+
+    Volume labels are Windows-only (``GetVolumeInformationW`` via
+    ctypes - no pywin32, per the owner-lookup precedent); POSIX mount
+    points are their own label.
+    """
+    label: str | None = None
+    if os.name == "nt":  # pragma: no cover - exercised on real Windows
+        try:
+            import ctypes
+
+            buf = ctypes.create_unicode_buffer(261)
+            fsbuf = ctypes.create_unicode_buffer(261)
+            root = anchor if anchor.endswith("\\") else anchor + "\\"
+            ok = ctypes.windll.kernel32.GetVolumeInformationW(  # type: ignore[attr-defined]
+                ctypes.c_wchar_p(root),
+                buf,
+                ctypes.sizeof(buf),
+                None,
+                None,
+                None,
+                fsbuf,
+                ctypes.sizeof(fsbuf),
+            )
+            if ok and buf.value:
+                label = buf.value
+        except Exception:  # noqa: BLE001 - label is a nicety
+            label = None
+    free: int | None = None
+    total: int | None = None
+    try:
+        import shutil
+
+        usage = shutil.disk_usage(anchor)
+        free, total = usage.free, usage.total
+    except Exception:  # noqa: BLE001 - bare row beats a crash
+        pass
+    return label, free, total

@@ -231,7 +231,7 @@ The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-
 ## Drive-switching-era follow-ups
 
 - [x] **App-level Ctrl+D — re-root the logged tree via the drive chooser. DONE 2026-06-07** — `action_switch_drive` re-roots through the L machinery (scan gate, tags survive); vanished-anchor nudge; Commands menu + Help rows; 10 new tests.
-- [ ] **Sort/label polish in the chooser.** Volume labels on Windows (`GetVolumeInformation` — needs ctypes work), free-space column, friendly `~` display instead of the expanded home path.
+- [x] **Sort/label polish in the chooser. DONE 2026-06-07** — `anchor_details` (ctypes volume label on Windows, `shutil.disk_usage` free-of-total, all best-effort) + `friendly_anchor_name` ~ fold (display-only); decoration loads async after the modal paints so a dead share can't freeze it. Drive-switching era closed.
 
 ## Normalisation-era follow-ups
 
