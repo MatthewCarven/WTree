@@ -345,12 +345,14 @@ class TreePane(Tree[str]):
         set, so a tagged dir that just moved keeps its bold-yellow
         marker without any extra wiring.
 
-        Cursor preservation is best-effort: Textual decides where the
-        cursor lands when a node's children are wiped + repopulated,
-        and for v0 we accept "cursor goes wherever Textual puts it"
-        rather than snapshotting line numbers. A future polish pass
-        could remember the previous cursor's backing path and try to
-        restore it.
+        Cursor preservation (design.md 2026-06-07): the cursor's
+        backing path is snapshotted before the rebuild and restored
+        via :meth:`reveal_path` afterwards. If the entry is gone
+        (deleted), the cursor falls back to its nearest surviving
+        ancestor - the tree analogue of the contents pane's
+        same-row-index clamp (a flat row index has no stable meaning
+        after subtree wipes; the parent dir is where the deleted
+        entry *was*).
 
         ``paths`` is an iterable rather than a set so callers don't
         need to materialise one — typically
@@ -359,6 +361,13 @@ class TreePane(Tree[str]):
         targets = set(paths)
         if not targets:
             return
+
+        cursor = self.cursor_node
+        cursor_path = (
+            cursor.data
+            if cursor is not None and cursor.data is not None
+            else None
+        )
 
         # Collect matching nodes in a single pass so the mutation below
         # doesn't interfere with iteration. ``self.root`` itself is
@@ -388,6 +397,21 @@ class TreePane(Tree[str]):
         # Trigger a re-render so the new tag styling, if any, takes
         # effect against the rebuilt subtree.
         self.refresh()
+
+        # Restore the cursor (only if something was actually rebuilt -
+        # otherwise the cursor never moved). reveal_path needs the line
+        # indexer to have caught up with the freshly-added children
+        # (the .line == -1 trap), hence the yield first.
+        if matches and cursor_path is not None:
+            await asyncio.sleep(0)
+            candidate = cursor_path
+            while True:
+                if await self.reveal_path(candidate):
+                    break
+                parent = os.path.dirname(candidate)
+                if not parent or parent == candidate:
+                    break  # ran past the tree root - leave the cursor be
+                candidate = parent
 
     def _walk_all_nodes(self, node: TreeNode[str]) -> Iterator[TreeNode[str]]:
         """Yield ``node`` then every descendant, depth-first.

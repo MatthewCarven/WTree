@@ -224,6 +224,17 @@ class ContentsPane(DataTable):
             self._current_path = None
             return
 
+        # Cursor preservation (design.md 2026-06-07): re-showing the SAME
+        # path is a refresh (auto-refresh after ops, Ctrl+R, editor
+        # return) - the cursor should stay put. Showing a DIFFERENT path
+        # is navigation - the cursor belongs at row 0. Snapshot before
+        # the scan; the commit block below decides.
+        preserving = path == self._current_path
+        old_cursor_row = max(self.cursor_row, 0)
+        old_cursor_path: str | None = None
+        if preserving and 0 <= self.cursor_row < len(self._row_paths):
+            old_cursor_path = self._row_paths[self.cursor_row] or None
+
         entries: list[Entry] = []
         errors: list[ScanError] = []
         i = 0
@@ -287,11 +298,25 @@ class ContentsPane(DataTable):
             self._row_paths.append(full_path)
             self._row_kinds.append(entry.kind)
 
-        # DataTable's cursor defaults to (0, 0) but pin it explicitly so
-        # ``action_toggle_tag`` has a valid ``cursor_row`` even right after
-        # a pane refresh.
+        # Cursor placement. Navigation pins row 0 explicitly (DataTable
+        # defaults to (0, 0), but pin it so ``action_toggle_tag`` has a
+        # valid ``cursor_row`` right after a pane refresh). A same-path
+        # refresh restores the cursor: to the same entry if it still
+        # exists (survives reorderings/insertions above it), else to the
+        # same row index clamped to the new length - delete row 5 and
+        # the cursor lands on what is now row 5, i.e. the next entry
+        # (the Explorer/MC convention; design.md 2026-06-07).
         if self.row_count > 0:
-            self.move_cursor(row=0, column=0)
+            target = 0
+            if preserving:
+                if (
+                    old_cursor_path is not None
+                    and old_cursor_path in self._row_paths
+                ):
+                    target = self._row_paths.index(old_cursor_path)
+                else:
+                    target = min(old_cursor_row, self.row_count - 1)
+            self.move_cursor(row=target, column=0)
 
     def refresh_tag_markers(self) -> None:
         """Refresh the leading "T" column **and** the row's style from
