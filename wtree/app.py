@@ -98,7 +98,7 @@ from wtree.widgets.dir_picker import DirPickerScreen, DriveChooserScreen
 from wtree.widgets.help import HelpScreen
 from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
-from wtree.widgets.menu_bar import MenuBar
+from wtree.widgets.menu_bar import MENUS, MenuBar
 from wtree.widgets.menu_screen import MenuScreen
 from wtree.widgets.progress_screen import ProgressScreen
 from wtree.widgets.prompt import PromptDialog
@@ -188,6 +188,9 @@ class WTreeApp(App):
         ("ctrl+i", "properties", "Properties"),
         ("ctrl+p", "show_progress", "Show progress"),
         ("f9", "menu_bar", "Menu"),
+        ("alt+f", "open_menu(0)", "File menu"),
+        ("alt+c", "open_menu(1)", "Commands menu"),
+        ("alt+h", "open_menu(2)", "Help menu"),
     ]
 
     TITLE = "WTree"
@@ -231,6 +234,10 @@ class WTreeApp(App):
         # "Error handling and crash reporting".
         self._crash_report: ErrorReport | None = None
         self._crash_log_path: Path | None = None
+        # Last-menu-wins (design.md 2026-06-07 menu polish): F9 reopens
+        # the menu the user was in when the modal last closed. Alt+letter
+        # jumps override it for that opening (and update it on close).
+        self._menu_memory = 0
 
     def _handle_exception(self, error: Exception) -> None:
         """Route in-loop crashes through the reporter, then defer to Textual.
@@ -1555,14 +1562,47 @@ class WTreeApp(App):
 
     @work
     async def action_menu_bar(self) -> None:
-        """F9 - open the menu modal and dispatch the chosen action.
+        """F9 - open the menu modal (at the last-used menu) and dispatch.
 
-        Push :class:`MenuScreen`; await its dismiss. ``None`` =
-        cancelled (Esc); otherwise dispatch ``action_<name>`` to
-        execute the chosen menu item. Menu items map 1:1 to
-        keyboard shortcuts the user could've pressed directly - the
-        menu is a discoverability surface, not a parallel control
-        path.
+        ``@work`` because ``push_screen_wait`` (inside ``_menu_flow``)
+        requires a worker context - parameterised binding actions are
+        dispatched without one, and uniformity beats relying on the
+        plain-binding dispatch path that happened to provide it.
+        """
+        await self._menu_flow(self._menu_memory)
+
+    @work
+    async def action_open_menu(self, index: int) -> None:
+        """Alt+letter - open a specific top-level menu from anywhere.
+
+        ``Alt+F`` / ``Alt+C`` / ``Alt+H`` jump straight to File /
+        Commands / Help without the F9 + Right dance. Alt is the
+        optional accelerator tier (design.md cross-platform modifier
+        strategy - macOS Option-as-Meta caveat applies; F9 remains
+        the canonical path).
+        """
+        await self._menu_flow(index)
+
+    def on_menu_bar_menu_requested(
+        self, event: "MenuBar.MenuRequested"
+    ) -> None:
+        """A menu name was clicked on the passive bar - open it.
+
+        Clicking is a proxy for F9 + Left/Right (the pre-decided
+        mouse semantics). Delegates to the ``@work`` action so the
+        modal flow gets its worker context.
+        """
+        self.action_open_menu(event.index)
+
+    async def _menu_flow(self, initial_menu: int) -> None:
+        """Open the menu modal at ``initial_menu``; dispatch the choice.
+
+        Shared by F9 (last-used menu), Alt+letter jumps, and bar
+        clicks. ``None`` = cancelled (Esc); otherwise dispatch
+        ``action_<name>`` - menu items map 1:1 to keyboard shortcuts
+        the user could've pressed directly. The screen instance
+        outlives its dismissal, so the active menu at close time is
+        read back for last-menu-wins.
 
         Unknown action names (which shouldn't happen if MENUS in
         ``menu_bar.py`` stays in sync with the action methods) flash
@@ -1570,7 +1610,10 @@ class WTreeApp(App):
         new menu item is as simple as adding a ``MenuItem`` with
         the right ``action`` string.
         """
-        chosen = await self.push_screen_wait(MenuScreen())
+        initial_menu = max(0, min(initial_menu, len(MENUS) - 1))
+        screen = MenuScreen(initial_menu=initial_menu)
+        chosen = await self.push_screen_wait(screen)
+        self._menu_memory = screen.active_menu
         if chosen is None:
             return
         method = getattr(self, f"action_{chosen}", None)

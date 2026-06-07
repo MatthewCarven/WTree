@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from rich.text import Text
+from textual import events
+from textual.message import Message
 from textual.widget import Widget
 
 
@@ -119,6 +121,31 @@ MENUS: tuple[Menu, ...] = (
 )
 
 
+def menu_name_spans() -> list[tuple[int, int]]:
+    """``[(start_col, end_col_exclusive)]`` of each menu name in the row.
+
+    Derived from the same layout :func:`render_menu_row` produces
+    (two leading spaces, two spaces between names) so the dropdown
+    x-offset, the bar's click hit-testing, and the modal top row's
+    click hit-testing all share one source of truth. If the row
+    layout changes, change it here and in render_menu_row together.
+    """
+    spans = []
+    col = 2
+    for menu in MENUS:
+        spans.append((col, col + len(menu.name)))
+        col += len(menu.name) + 2
+    return spans
+
+
+def menu_index_at(x: int) -> int | None:
+    """Which menu name (index) the column ``x`` falls inside, else None."""
+    for idx, (start, end) in enumerate(menu_name_spans()):
+        if start <= x < end:
+            return idx
+    return None
+
+
 def render_menu_row(active_idx: int | None = None) -> Text:
     """Render the top menu row as Rich Text.
 
@@ -174,6 +201,26 @@ class MenuBar(Widget):
     # focus, but the visually-matching MenuScreen top row does when
     # it's pushed.
     can_focus = False
+
+    class MenuRequested(Message):
+        """Posted when a top-level menu name is clicked on the passive bar.
+
+        The app opens :class:`MenuScreen` at ``index`` - the mouse is a
+        clickable proxy for F9 + Left/Right, per the pre-decided mouse
+        semantics (design.md parking lot: "MenuBar entries become
+        clickable proxies for their key bindings").
+        """
+
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+
+    def on_click(self, event: events.Click) -> None:
+        """Click on a menu name opens that menu; elsewhere is a no-op."""
+        idx = menu_index_at(event.x)
+        if idx is not None:
+            event.stop()
+            self.post_message(self.MenuRequested(idx))
 
     def render(self) -> Text:
         """Render the passive bar - no menu highlighted as active."""

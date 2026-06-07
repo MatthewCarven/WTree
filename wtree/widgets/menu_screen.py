@@ -35,7 +35,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
 
-from wtree.widgets.menu_bar import MENUS, render_menu_row
+from wtree.widgets.menu_bar import MENUS, menu_index_at, menu_name_spans, render_menu_row
 
 
 class _DropdownPanel(Widget):
@@ -64,6 +64,37 @@ class _DropdownPanel(Widget):
 
     active_menu: reactive[int] = reactive(0)
     cursor_idx: reactive[int] = reactive(0)
+
+    def _item_index_at(self, widget_y: int) -> int | None:
+        """Map a widget-relative click row to an item index.
+
+        The panel renders one item per content line; the click event's
+        ``y`` is widget-relative, so subtract the top gutter (border +
+        vertical padding) computed live from the layout regions rather
+        than hardcoding the CSS numbers.
+        """
+        try:
+            gutter_top = self.content_region.y - self.region.y
+        except Exception:  # noqa: BLE001 - pre-layout safety
+            gutter_top = 1
+        idx = widget_y - gutter_top
+        menu = MENUS[self.active_menu]
+        if 0 <= idx < len(menu.items):
+            return idx
+        return None
+
+    def on_click(self, event: events.Click) -> None:
+        """Click an item row to activate it (separators no-op)."""
+        idx = self._item_index_at(event.y)
+        screen = self.screen
+        if idx is None or not isinstance(screen, MenuScreen):
+            return
+        event.stop()
+        if MENUS[self.active_menu].items[idx].separator:
+            return
+        screen._cursor_idx = idx
+        screen._sync_children()
+        screen._activate_current()
 
     def render(self) -> Text:
         """Render the items of the current menu, one per row."""
@@ -173,6 +204,14 @@ class MenuScreen(ModalScreen[str | None]):
             panel = self.query_one(_DropdownPanel)
             panel.active_menu = self.active_menu
             panel.cursor_idx = self._cursor_idx
+            # Position the dropdown under its menu name (MC-style).
+            # Name starts at column ``start``; the panel has a 1-cell
+            # border + 1-cell horizontal padding, so margin-left of
+            # ``start - 2`` puts the panel's CONTENT column under the
+            # name's first letter. File's span starts at 2 -> margin 0
+            # (exactly the old fixed top-left), deeper menus shift.
+            start, _end = menu_name_spans()[self.active_menu]
+            panel.styles.margin = (0, 0, 0, max(0, start - 2))
             panel.refresh()
         except Exception:  # noqa: BLE001 - early-mount safety
             pass
@@ -301,6 +340,14 @@ class _MenuTopRow(Widget):
     """
 
     active_menu: reactive[int] = reactive(0)
+
+    def on_click(self, event: events.Click) -> None:
+        """Click a menu name to make it the active dropdown."""
+        idx = menu_index_at(event.x)
+        screen = self.screen
+        if idx is not None and isinstance(screen, MenuScreen):
+            event.stop()
+            screen.active_menu = idx
 
     def render(self) -> Text:
         """Render the row mirroring :class:`MenuBar` with one menu active."""
