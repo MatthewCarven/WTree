@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING
 from textual.timer import Timer
 from textual.widgets import Static
 
+from rich.markup import escape as _escape_markup
+
 from wtree.ops.base import _human_bytes
 from wtree.sources.base import Kind
 
@@ -61,6 +63,14 @@ class StatusLine(Static):
     }
     """
 
+    # Severity -> Rich markup style for the flash line (design.md
+    # 2026-06-07, todo "Severity-styled flash"). info renders unstyled.
+    _SEVERITY_STYLES = {
+        "info": None,
+        "warning": "yellow",
+        "error": "bold red",
+    }
+
     def __init__(self) -> None:
         super().__init__("", markup=True)
         # Flash state. ``_flash_message`` is the text currently being
@@ -68,6 +78,7 @@ class StatusLine(Static):
         # the Textual timer that will clear the flash; we keep the
         # reference so a new flash() call can cancel and replace it.
         self._flash_message: str | None = None
+        self._flash_severity: str = "info"
         self._flash_timer: Timer | None = None
 
     # ------------------------------------------------------------------
@@ -79,6 +90,7 @@ class StatusLine(Static):
         message: str,
         *,
         timeout: float = DEFAULT_FLASH_TIMEOUT,
+        severity: str = "info",
     ) -> None:
         """Show ``message`` for ``timeout`` seconds, then revert.
 
@@ -88,18 +100,33 @@ class StatusLine(Static):
         line reverts to its normal app-state render via
         :meth:`refresh_from`.
 
-        Markup is supported via Rich tags (``[b]X[/b]``, ``[dim]Y[/dim]``)
-        because the underlying ``Static`` was constructed with
-        ``markup=True``.
+        ``severity`` styles the line: ``"info"`` (default) renders
+        plain, ``"warning"`` yellow, ``"error"`` bold red. The message
+        itself is rendered **literally** - it is markup-escaped before
+        the severity wrapper is applied, so a path containing ``[i]``
+        can't style (or break) the line. Callers wanting decorated
+        text use the severity channel, not inline tags. Unknown
+        severities render as info rather than raising (a bad flash
+        must never crash the caller).
         """
         # Cancel any in-flight timer so the new flash gets its full
         # timeout window, not whatever was left on the old one.
         if self._flash_timer is not None:
             self._flash_timer.stop()
         self._flash_message = message
+        self._flash_severity = severity
         self._flash_timer = self.set_timer(timeout, self._clear_flash)
         # Show immediately - don't wait for the next refresh_from.
-        self.update(message)
+        self.update(self._styled_flash(message, severity))
+
+    @classmethod
+    def _styled_flash(cls, message: str, severity: str) -> str:
+        """Escape ``message`` and wrap it in the severity style tags."""
+        body = _escape_markup(message)
+        style = cls._SEVERITY_STYLES.get(severity)
+        if style is None:
+            return body
+        return f"[{style}]{body}[/{style}]"
 
     def _clear_flash(self) -> None:
         """Timer callback - clear flash state and revert to app render.

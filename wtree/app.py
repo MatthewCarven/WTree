@@ -451,7 +451,7 @@ class WTreeApp(App):
         contents = self.query_one(ContentsPane)
         paths = contents.row_paths()
         if not paths:
-            self.flash("Tag all: nothing to tag.")
+            self.flash("Tag all: nothing to tag.", severity="warning")
             return
         sid = self._source.source_id
         delta = self.tagged_set.add_many((sid, p) for p in paths)
@@ -459,7 +459,7 @@ class WTreeApp(App):
         self._update_subtitle()
         self._refresh_status()
         if delta == 0:
-            self.flash(f"Tag all: {len(paths)} entries already tagged.")
+            self.flash(f"Tag all: {len(paths)} entries already tagged.", severity="warning")
         else:
             self.flash(f"Tagged {delta} entries.")
 
@@ -485,7 +485,7 @@ class WTreeApp(App):
         contents = self.query_one(ContentsPane)
         paths = contents.row_paths()
         if not paths:
-            self.flash(("Tag" if add else "Untag") + " pattern: nothing here.")
+            self.flash(("Tag" if add else "Untag") + " pattern: nothing here.", severity="warning")
             return
 
         verb = "Tag" if add else "Untag"
@@ -509,7 +509,7 @@ class WTreeApp(App):
             (sid, p) for p in paths if fnmatch(posixpath.basename(p), pattern)
         ]
         if not matches:
-            self.flash(f"{verb} pattern: no matches for {pattern!r}.")
+            self.flash(f"{verb} pattern: no matches for {pattern!r}.", severity="warning")
             return
 
         if add:
@@ -658,13 +658,19 @@ class WTreeApp(App):
     # Flash convenience - route user-immediate feedback to StatusLine
     # ------------------------------------------------------------------
 
-    def flash(self, message: str, *, timeout: float = 3.0) -> None:
+    def flash(
+        self,
+        message: str,
+        *,
+        timeout: float = 3.0,
+        severity: str = "info",
+    ) -> None:
         """Show a transient status-line message ("X rejected", "Logged: Y")."""
         try:
             status = self.query_one(StatusLine)
         except Exception:  # noqa: BLE001 - early-mount safety
             return
-        status.flash(message, timeout=timeout)
+        status.flash(message, timeout=timeout, severity=severity)
 
     @work
     async def action_copy(self) -> None:
@@ -696,14 +702,15 @@ class WTreeApp(App):
 
         if self.tagged_set:
             self.flash(
-                "Rename works on one entry; clear tags first (Ctrl+U)."
+                "Rename works on one entry; clear tags first (Ctrl+U).",
+                severity="warning",
             )
             return
 
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
-            self.flash("Rename: nothing under the cursor.")
+            self.flash("Rename: nothing under the cursor.", severity="warning")
             return
         path, kind = cursor
         tag = Tag(source_id=self._source.source_id, path=path)
@@ -731,11 +738,11 @@ class WTreeApp(App):
 
         plan = await plan_rename(tag, typed, self.sources)
         if plan.is_empty:
-            self.flash("Rename: planner produced no items.")
+            self.flash("Rename: planner produced no items.", severity="warning")
             return
         if plan.errors and not plan.items:
             err = plan.errors[0]
-            self.flash(f"Rename: {err.message}")
+            self.flash(f"Rename: {err.message}", severity="error")
             self.last_plan = plan
             return
 
@@ -750,18 +757,19 @@ class WTreeApp(App):
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
-            self.flash("View: nothing under the cursor.")
+            self.flash("View: nothing under the cursor.", severity="warning")
             return
         path, kind = cursor
 
         if kind is Kind.DIR:
             self.flash(
-                "View: that's a directory. Press Enter to navigate into it."
+                "View: that's a directory. Press Enter to navigate into it.",
+                severity="warning",
             )
             return
 
         if kind not in (Kind.FILE, Kind.SYMLINK):
-            self.flash(f"View: cannot view a {kind.value}.")
+            self.flash(f"View: cannot view a {kind.value}.", severity="warning")
             return
 
         self.push_screen(ViewerScreen(path))
@@ -772,18 +780,19 @@ class WTreeApp(App):
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
-            self.flash("Edit: nothing under the cursor.")
+            self.flash("Edit: nothing under the cursor.", severity="warning")
             return
         path, kind = cursor
 
         if kind is Kind.DIR:
             self.flash(
-                "Edit: that's a directory. Press Enter to navigate into it."
+                "Edit: that's a directory. Press Enter to navigate into it.",
+                severity="warning",
             )
             return
 
         if kind not in (Kind.FILE, Kind.SYMLINK):
-            self.flash(f"Edit: cannot edit a {kind.value}.")
+            self.flash(f"Edit: cannot edit a {kind.value}.", severity="warning")
             return
 
         argv = resolve_editor()
@@ -794,15 +803,16 @@ class WTreeApp(App):
         except FileNotFoundError:
             self.flash(
                 f"Edit: editor not found ({argv[0]!r}). "
-                "Set $VISUAL or $EDITOR."
+                "Set $VISUAL or $EDITOR.",
+                severity="error",
             )
             return
         except Exception as exc:  # noqa: BLE001 - surface any spawn error
-            self.flash(f"Edit: {type(exc).__name__}: {exc}")
+            self.flash(f"Edit: {type(exc).__name__}: {exc}", severity="error")
             return
 
         if rc != 0:
-            self.flash(f"Edit: {argv[0]} exited with status {rc}.")
+            self.flash(f"Edit: {argv[0]} exited with status {rc}.", severity="error")
 
         if contents.current_path is not None:
             await contents.show_path(contents.current_path)
@@ -823,7 +833,7 @@ class WTreeApp(App):
         contents = self.query_one(ContentsPane)
         parent_path = contents.current_path
         if parent_path is None:
-            self.flash("Make-new: no directory under the contents pane.")
+            self.flash("Make-new: no directory under the contents pane.", severity="warning")
             return
 
         kind = await self.push_screen_wait(KindChooserDialog())
@@ -856,11 +866,11 @@ class WTreeApp(App):
         )
         if plan.errors and not plan.items:
             err = plan.errors[0]
-            self.flash(f"Make-new: {err.message}")
+            self.flash(f"Make-new: {err.message}", severity="error")
             self.last_plan = plan
             return
         if plan.is_empty:
-            self.flash("Make-new: planner produced no items.")
+            self.flash("Make-new: planner produced no items.", severity="warning")
             return
 
         # A leaf-already-exists collision is now annotated on the item (not a
@@ -892,7 +902,8 @@ class WTreeApp(App):
         if not tags:
             self.flash(
                 f"{verb}: nothing to {verb.lower()} "
-                "(no tags, no cursor entry)."
+                "(no tags, no cursor entry).",
+                severity="warning",
             )
             return
 
@@ -973,7 +984,8 @@ class WTreeApp(App):
             # as SELF items, so Copy never lands here. Give the user a gentle
             # nudge instead of silently doing nothing.
             self.flash(
-                f"{verb}: already there - nothing to {verb.lower()}."
+                f"{verb}: already there - nothing to {verb.lower()}.",
+                severity="warning",
             )
             return
         plan = await self._resolve_plan_conflicts(plan, verb)
@@ -1019,7 +1031,7 @@ class WTreeApp(App):
             plan, resolutions, self.sources, custom_dsts=custom_dsts
         )
         if not resolved.items:
-            self.flash(f"{verb}: nothing to do (all conflicts skipped).")
+            self.flash(f"{verb}: nothing to do (all conflicts skipped).", severity="warning")
             return None
         return resolved
 
@@ -1048,7 +1060,8 @@ class WTreeApp(App):
         if not tags:
             self.flash(
                 f"{verb}: nothing to {verb.lower()} "
-                "(no tags, no cursor entry)."
+                "(no tags, no cursor entry).",
+                severity="warning",
             )
             return
 
@@ -1080,7 +1093,7 @@ class WTreeApp(App):
         self.last_plan = plan
 
         if plan.is_empty:
-            self.flash(f"{verb}: planner produced no items.")
+            self.flash(f"{verb}: planner produced no items.", severity="warning")
             return
 
         self.op_queue.enqueue(plan)
@@ -1151,7 +1164,7 @@ class WTreeApp(App):
         old_root = self._root_path
         new_root = os.path.dirname(old_root)
         if not new_root or new_root == old_root:
-            self.flash(f"Already at the filesystem root ({old_root}).")
+            self.flash(f"Already at the filesystem root ({old_root}).", severity="warning")
             return
 
         self._root_path = new_root
@@ -1261,10 +1274,10 @@ class WTreeApp(App):
         candidate = os.path.abspath(candidate)
 
         if not os.path.exists(candidate):
-            self.flash(f"Log: path doesn't exist: {candidate}")
+            self.flash(f"Log: path doesn't exist: {candidate}", severity="error")
             return
         if not os.path.isdir(candidate):
-            self.flash(f"Log: not a directory: {candidate}")
+            self.flash(f"Log: not a directory: {candidate}", severity="error")
             return
 
         # Re-root. ``re_root`` wipes the existing tree subtree and
@@ -1307,7 +1320,7 @@ class WTreeApp(App):
         if picked == old_root:
             return
         if not os.path.isdir(picked):
-            self.flash(f"Switch drive: not available: {picked}")
+            self.flash(f"Switch drive: not available: {picked}", severity="error")
             return
         self._root_path = picked
         tree = self.query_one(TreePane)
@@ -1331,7 +1344,7 @@ class WTreeApp(App):
         elif isinstance(self.focused, TreePane):
             target = self.focused
         if target is None:
-            self.flash("Search: focus a pane first (Tab to switch).")
+            self.flash("Search: focus a pane first (Tab to switch).", severity="warning")
             return
 
         self._search_target = target
@@ -1490,7 +1503,7 @@ class WTreeApp(App):
         self._tree_find_idx = 0
 
         if not matches:
-            self.flash(f"Find: no matches for {query!r}.")
+            self.flash(f"Find: no matches for {query!r}.", severity="warning")
             return
 
         tree = self.query_one(TreePane)
@@ -1525,7 +1538,7 @@ class WTreeApp(App):
                     "Press Ctrl+F to search again."
                 )
             else:
-                self.flash("Find: no active search (press Ctrl+F first).")
+                self.flash("Find: no active search (press Ctrl+F first).", severity="warning")
             return
         n = len(self._tree_find_matches)
         self._tree_find_idx = (self._tree_find_idx + 1) % n
@@ -1562,7 +1575,7 @@ class WTreeApp(App):
             return
         method = getattr(self, f"action_{chosen}", None)
         if method is None:
-            self.flash(f"Menu: unknown action {chosen!r}.")
+            self.flash(f"Menu: unknown action {chosen!r}.", severity="error")
             return
         result = method()
         # Some actions are sync (action_view, action_untag_all);
@@ -1621,7 +1634,7 @@ class WTreeApp(App):
                 path, kind = cursor
 
         if path is None or kind is None:
-            self.flash("Properties: nothing to inspect.")
+            self.flash("Properties: nothing to inspect.", severity="warning")
             return
 
         if kind is Kind.DIR:
@@ -1654,7 +1667,7 @@ class WTreeApp(App):
         """
         queue = self.op_queue
         if queue is None or queue.running is None:
-            self.flash("No operation in progress")
+            self.flash("No operation in progress", severity="warning")
             return
         for screen in self.screen_stack:
             if isinstance(screen, ProgressScreen):
