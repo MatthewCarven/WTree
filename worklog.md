@@ -5631,3 +5631,11 @@ Matthew asked for the menu polish items + at least one mouse-interaction unit te
 **Deliberately left open:** greyed-out unimplemented items (todo itself leans "only-implemented is cleaner for now") and sub-menus (big; parking-lot adjacent).
 
 11 new tests in `tests/test_menu_polish.py` (span/hit-test units vs the actual rendered row; margin follows menu; both wrap directions; F9 memory; Alt+C jump; click-bar-opens, click-gap-noop, click-top-row-switches, click-item-dispatches — asserts the severity-styled idle flash, nice cross-feature check — and click-separator-keeps-open). **782 → 793/793 green** (zero flakes). NOT committed — Matthew commits Windows-side.
+
+## 2026-06-07 (cont.) — Ctrl+R coalescing + Refreshing header (refresh-era follow-ups closed)
+
+Grounding pass first: the "progress indicator for large-tree refreshes" item was **90% stale** — `action_refresh_source` has run both panes under the cancellable scan-dialog gate since the 2026-05-25 scan-dialog work. The missing 10%: the dialog said "Scanning"; both gate calls now pass `header="Refreshing"` (the header param existed since the recursive-tag session).
+
+The throttle: `REFRESH_THROTTLE_SECONDS = 0.2` module constant + two-part guard at the top of `action_refresh_source` — a press while `_refresh_running` (in-flight refresh absorbs re-presses regardless of window age; matters on big trees) or within the window of `_last_refresh_started` is a **silent** no-op (a flash here would clobber the "Source refreshed." confirmation). Throttle not true-debounce: delaying the first press 200ms to wait for quiet would tax the common single press for nothing. Flag cleared via `finally`, body extracted to `_refresh_both_panes`.
+
+6 new tests in `tests/test_refresh_throttle.py` (constant; rapid-double coalesces via refresh_all spy; aged window runs again; in-flight guard absorbs even with aged window + finally-clears flag, via an Event-gated slow refresh_all; both gate calls get header="Refreshing"; confirmation flash unchanged + info severity). **793 → 799/799 green** (zero flakes). Refresh-source era closed except refresh-on-focus (separate idea, stays open). NOT committed — Matthew commits Windows-side.

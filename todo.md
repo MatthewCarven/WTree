@@ -202,8 +202,8 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 ## Refresh-source-era follow-ups
 
 - [x] **`Ctrl+R` refresh source. DONE 2026-05-23 (seventh session).** Forces a re-scan of both panes against the source. Contents pane re-runs `show_path(current_path)`; tree pane runs new `TreePane.refresh_all()` which snapshots expanded paths + cursor backing path, calls `re_root(current_root)` to wipe + repopulate, then re-walks the snapshot via new `_walk_to_node` helper to re-expand each path and restore the cursor. `reveal_path` refactored on top of `_walk_to_node`. Paths missing on disk silently skipped. New BINDING, new "Refresh source" Commands menu item, new entry in Help Application section. 12 new tests in `tests/test_refresh_source.py`. **405/405 green**.
-- [ ] **Throttle / debounce rapid Ctrl+R presses.** Two presses in quick succession both run a full re-scan. For large trees this is wasted work. A 200ms debounce would coalesce.
-- [ ] **Progress indicator for large-tree refreshes.** Walking a 10k-entry tree blocks the UI briefly. A "Refreshing..." flash would help.
+- [x] **Throttle / debounce rapid Ctrl+R presses. DONE 2026-06-07** — 200ms coalesce window + in-flight guard (finally-cleared), silent no-op (a nudge would clobber the confirmation flash). Original item: Two presses in quick succession both run a full re-scan. For large trees this is wasted work. A 200ms debounce would coalesce.
+- [x] **Progress indicator for large-tree refreshes. DONE 2026-06-07** — found 90% stale: the scan-dialog gate has covered Ctrl+R since 2026-05-25; the missing 10% was the header, which now says "Refreshing" instead of "Scanning". Original item: Walking a 10k-entry tree blocks the UI briefly. A "Refreshing..." flash would help.
 - [ ] **Refresh-on-focus.** Some apps re-scan when the terminal regains focus. Worth considering as an alternative to manual Ctrl+R for daily-driver use.
 
 ## Log-new-source-era follow-ups

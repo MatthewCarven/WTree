@@ -40,6 +40,7 @@ discoverability chrome, not a parallel control path.
 from __future__ import annotations
 
 import asyncio
+import time
 import os
 import posixpath
 import sys
@@ -132,6 +133,13 @@ NoDestPlanner = Callable[
     [Sequence[Tag], Mapping[str, EntrySource]],
     Awaitable[Plan],
 ]
+
+
+# Ctrl+R presses inside this window coalesce into one re-scan (plus an
+# in-flight guard - a refresh that's still running absorbs re-presses
+# regardless of the window). Wasted full re-walks on large trees are
+# the cost being avoided; 200ms is imperceptible as a limiter.
+REFRESH_THROTTLE_SECONDS = 0.2
 
 
 class WTreeApp(App):
@@ -238,6 +246,9 @@ class WTreeApp(App):
         # the menu the user was in when the modal last closed. Alt+letter
         # jumps override it for that opening (and update it on close).
         self._menu_memory = 0
+        # Ctrl+R throttle state (REFRESH_THROTTLE_SECONDS).
+        self._refresh_running = False
+        self._last_refresh_started = 0.0
 
     def _handle_exception(self, error: Exception) -> None:
         """Route in-loop crashes through the reporter, then defer to Textual.
@@ -1202,7 +1213,29 @@ class WTreeApp(App):
         one pane doesn't block the other and never propagates back
         to the action loop. Mirrors the structure of
         :meth:`_refresh_panes_after_op`.
+
+        Rapid re-presses coalesce: a press while a refresh is still
+        running, or within ``REFRESH_THROTTLE_SECONDS`` of the last
+        one starting, is a silent no-op - the refresh already under
+        way (or just finished) IS the result the user asked for.
+        Silent rather than flashed: a nudge here would clobber the
+        "Source refreshed." confirmation.
         """
+        now = time.monotonic()
+        if (
+            self._refresh_running
+            or (now - self._last_refresh_started) < REFRESH_THROTTLE_SECONDS
+        ):
+            return
+        self._refresh_running = True
+        self._last_refresh_started = now
+        try:
+            await self._refresh_both_panes()
+        finally:
+            self._refresh_running = False
+
+    async def _refresh_both_panes(self) -> None:
+        """The actual two-pane re-scan body of :meth:`action_refresh_source`."""
         try:
             contents = self.query_one(ContentsPane)
             path = contents.current_path
@@ -1213,6 +1246,7 @@ class WTreeApp(App):
                     path,
                     self._source,
                     lambda ctx: contents.show_path(path, ctx=ctx),
+                    header="Refreshing",
                 )
         except Exception:  # noqa: BLE001 - per-pane isolation
             pass
@@ -1222,6 +1256,7 @@ class WTreeApp(App):
                 self._root_path,
                 self._source,
                 lambda ctx: tree.refresh_all(ctx=ctx),
+                header="Refreshing",
             )
         except Exception:  # noqa: BLE001 - per-pane isolation
             pass
