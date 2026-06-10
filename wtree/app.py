@@ -52,7 +52,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Header, Tree
 
-from wtree import __version__
+from wtree import __version__, oplog
 from pathlib import Path
 
 from wtree.crash import (
@@ -1146,12 +1146,32 @@ class WTreeApp(App):
         self._refresh_status()
 
     def _resolve_selection_tags(self) -> list[Tag]:
-        """Apply the design's Selection rule (NOT used by Rename)."""
+        """Apply the design's Selection rule (NOT used by Rename).
+
+        Tagged set wins. Otherwise the cursor entry of the FOCUSED pane
+        (2026-06-11 fix): previously this always read the contents pane,
+        so pressing D / C / M with the *tree* pane focused acted on the
+        first row of the highlighted dir's listing instead of the
+        highlighted dir itself - Matthew's field report was a Delete
+        dialog naming a child he'd never selected. Now mirrors
+        ``action_properties``' focused-pane convention (which already
+        documented itself as "the existing op convention"). Tree cursor
+        entries are always directories; an error-placeholder node
+        (``data is None``) resolves to nothing - flashing "nothing to
+        <verb>" beats silently acting on the other pane's cursor.
+        """
         if self.tagged_set:
             return sorted(
                 (Tag(t.source_id, t.path) for t in self.tagged_set),
                 key=lambda t: (t.source_id, t.path),
             )
+        if isinstance(self.focused, TreePane):
+            node = self.focused.cursor_node
+            if node is None or node.data is None:
+                return []
+            return [
+                Tag(source_id=self._source.source_id, path=node.data)
+            ]
         contents = self.query_one(ContentsPane)
         cursor = contents.cursor_entry()
         if cursor is None:
@@ -1914,14 +1934,25 @@ class WTreeApp(App):
     def _on_plan_complete(
         self, result: OperationResult, queue: OperationQueue
     ) -> None:
-        """Toast the result and schedule a pane auto-refresh."""
+        """Toast the result, persist it to the op log, and schedule a
+        pane auto-refresh.
+
+        The op log (2026-06-11) exists because this toast is the ONLY
+        surface that says anything about per-item failures, and it
+        fades. ``oplog.write_result`` is best-effort (never raises -
+        a logging failure must not take down the queue callback); when
+        it does land, the done-with-errors toast names the path so the
+        user knows where to read the per-item detail.
+        """
         self.last_result = result
+        log_path = oplog.write_result(result)
         verb = result.plan.kind.value.capitalize()
         if result.all_succeeded:
             self.notify(result.summary(), title=f"{verb} (done)")
         else:
+            detail = "" if log_path is None else f"\nDetails: {log_path}"
             self.notify(
-                result.summary(),
+                f"{result.summary()}{detail}",
                 title=f"{verb} (done with errors)",
                 severity="warning",
             )

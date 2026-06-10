@@ -44,6 +44,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import stat
+import sys
 from collections.abc import Callable, Mapping
 
 from wtree.ops.base import (
@@ -274,11 +276,11 @@ def _remove_existing_blocking(dst: str, src: str | None = None) -> None:
             f"operation source {src!r}"
         )
     if os.path.islink(dst):
-        os.unlink(dst)
+        _unlink_force(dst)
     elif os.path.isdir(dst):
-        shutil.rmtree(dst)
+        _rmtree_force(dst)
     elif os.path.lexists(dst):
-        os.unlink(dst)
+        _unlink_force(dst)
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +630,63 @@ async def _native_move(
 
 
 # ---------------------------------------------------------------------------
+# Read-only-tolerant removal (the Windows git-objects problem)
+# ---------------------------------------------------------------------------
+
+
+def _clear_readonly_and_retry(func, path: str, exc: BaseException) -> None:
+    """``shutil.rmtree`` error handler: clear the read-only bit and retry.
+
+    Field bug (2026-06-11): deleting a copied git repo on Windows failed
+    with ``WinError 5`` on ``.git/objects/...`` - git marks object/pack
+    files read-only by design, and Windows refuses to unlink a read-only
+    file. POSIX never trips this (deletion rights live on the parent
+    dir), which is why the Linux-run suite couldn't see it.
+
+    Strategy: for a ``PermissionError`` only, OR the owner-write bit onto
+    the failing path AND its parent dir (covers the POSIX read-only-dir
+    analogue, harmless on Windows), then retry the failed call once.
+    Anything else - or a retry that fails again - re-raises the original
+    error so it surfaces as a FAILED item with the true message.
+    """
+    if not isinstance(exc, PermissionError):
+        raise exc
+    try:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        parent = os.path.dirname(path)
+        if parent:
+            os.chmod(parent, os.stat(parent).st_mode | stat.S_IWRITE)
+        func(path)
+    except OSError:
+        raise exc
+
+
+def _rmtree_force(path: str) -> None:
+    """``shutil.rmtree`` that survives read-only entries (git objects).
+
+    ``onexc`` is the 3.12+ spelling; ``onerror`` (exc-info triple) is
+    the pre-3.12 one and is slated for removal, so pick per runtime.
+    """
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:  # pragma: no cover - exercised only on 3.10/3.11 runtimes
+        shutil.rmtree(
+            path,
+            onerror=lambda func, p, ei: _clear_readonly_and_retry(
+                func, p, ei[1]
+            ),
+        )
+
+
+def _unlink_force(path: str) -> None:
+    """``os.unlink`` that clears a read-only bit and retries once."""
+    try:
+        os.unlink(path)
+    except PermissionError as exc:
+        _clear_readonly_and_retry(os.unlink, path, exc)
+
+
+# ---------------------------------------------------------------------------
 # Native delete
 # ---------------------------------------------------------------------------
 
@@ -646,11 +705,11 @@ async def _native_delete(item: PlanItem) -> ItemResult:
     src = item.src_path
 
     if item.kind is Kind.DIR:
-        await asyncio.to_thread(shutil.rmtree, src)
+        await asyncio.to_thread(_rmtree_force, src)
         return ItemResult(item=item, status=ItemStatus.SUCCESS)
 
     if item.kind in (Kind.FILE, Kind.SYMLINK):
-        await asyncio.to_thread(os.unlink, src)
+        await asyncio.to_thread(_unlink_force, src)
         return ItemResult(item=item, status=ItemStatus.SUCCESS)
 
     return ItemResult(

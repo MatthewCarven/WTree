@@ -29,6 +29,7 @@ from wtree.ops.base import (
     ScanCancelled,
     WalkedEntry,
     WalkSummary,
+    to_posix,
 )
 from wtree.ops.conflicts import annotate_conflicts, resolve_self_targets
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
@@ -144,13 +145,19 @@ async def plan_copy(
     # entries); the old per-tag prefix scan of the flat list was O(tags x
     # entries) and froze the UI on large tagged sets.
     for tag, group in zip(tags, walk.entries_by_tag):
-        base = _basename(tag.path)
+        # Normalise to the POSIX-flavoured internal convention BEFORE any
+        # path math. Tag paths arrive native-backslashed on Windows
+        # (2026-06-11 field bug: ``posixpath.basename`` on ``"C:\\a\\b"``
+        # returns the WHOLE string, so every dst became dest + the full
+        # source path -> WinError 123 on each item).
+        tag_posix = to_posix(tag.path)
+        base = _basename(tag_posix)
         if not base:
             # Unrooted destination - skip; the walk_tags error path already
             # caught unknown-source cases, so this is a true edge.
             continue
         for walked in group:
-            rel = _relative_under(walked.path, tag.path)
+            rel = _relative_under(to_posix(walked.path), tag_posix)
             # Destination is dest + base + rel. ``base`` keeps the top-level
             # name; ``rel`` is "" for the top tag itself, deeper for descendants.
             dst_path = posixpath.join(destination.path, base, rel) if rel else posixpath.join(destination.path, base)
@@ -237,6 +244,10 @@ def _basename(path: str) -> str:
     first so ``"/foo/bar/"`` → ``"bar"`` (and not ``""``).
     """
     stripped = path.rstrip("/")
+    if stripped.endswith(":"):
+        # Bare drive anchor ("C:" after the strip) - treat as unrooted
+        # rather than hand back a name Windows would refuse mid-path.
+        return ""
     return posixpath.basename(stripped)
 
 

@@ -32,6 +32,7 @@ import posixpath
 from collections.abc import Mapping
 
 from wtree.ops.base import (
+    to_posix,
     OperationKind,
     Plan,
     PlanError,
@@ -162,7 +163,11 @@ async def plan_rename(
             ],
         )
 
-    current_basename = _basename(tag.path)
+    # POSIX-flavour before any path math (2026-06-11 Windows fix:
+    # posixpath.dirname on a native-backslash path returns "" -> the
+    # rename target degraded to a bare CWD-relative name).
+    path_posix = to_posix(tag.path)
+    current_basename = _basename(path_posix)
     if name == current_basename:
         return Plan(
             kind=OperationKind.RENAME,
@@ -176,7 +181,7 @@ async def plan_rename(
             ],
         )
 
-    parent = _parent(tag.path)
+    parent = _parent(path_posix)
     # POSIX-style join in the planner - executor normalises on Windows.
     dst_path = posixpath.join(parent, name) if parent else name
 

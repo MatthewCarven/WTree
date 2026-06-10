@@ -33,6 +33,7 @@ from wtree.ops.base import (
     PlanError,
     PlanItem,
     ScanCancelled,
+    to_posix,
 )
 from wtree.ops.conflicts import annotate_conflicts, resolve_self_targets
 from wtree.sources.base import EntrySource, ScanError
@@ -101,7 +102,9 @@ async def plan_move(
             )
             continue
 
-        base = _basename(tag.path)
+        # POSIX-flavour the tag before path math (same 2026-06-11
+        # Windows-backslash fix as plan_copy).
+        base = _basename(to_posix(tag.path))
         if not base:
             # Unrooted - tag was the bare source root (e.g. "/"). Skip
             # rather than produce a garbage destination.
@@ -148,4 +151,8 @@ def _basename(path: str) -> str:
     first so ``"/foo/bar/"`` -> ``"bar"`` (and not ``""``).
     """
     stripped = path.rstrip("/")
+    if stripped.endswith(":"):
+        # Bare drive anchor ("C:" after the strip) - treat as unrooted
+        # rather than hand back a name Windows would refuse mid-path.
+        return ""
     return posixpath.basename(stripped)
