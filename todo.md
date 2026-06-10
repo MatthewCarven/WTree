@@ -126,7 +126,7 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 
 ## View-era follow-ups
 
-- [ ] **In-viewer incremental search** (`/`). Local to the viewer; reuses the modal-input pattern from `PromptDialog` or a non-modal inline form. Highlight matches; `n` / `N` to step through.
+- [x] **In-viewer incremental search** (`/`). DONE 2026-06-10 — the pager hosts its own `SearchBar`; new `viewer.find_matches` (absolute `(line, start, end)` spans via `re.finditer(IGNORECASE)`); incremental jump to the first match at-or-after the on-screen line (wrap); Down/Ctrl+G/Up step while the bar is open; **Enter commits** (highlights + position stay, `n`/`N` step pager-style); **two-stage Esc** (open = restore scroll; committed = first clears, second / `q` dismiss); `/` no-op on refusal bodies; body now a literal Rich `Text`. 22 new tests in `tests/test_viewer_search.py`; 799 → 821 green. See worklog 2026-06-10 + design.md decision row.
 - [ ] **Syntax highlighting.** Would require switching the body widget from `Static` to Textual's `TextArea` (read-only mode) or a `Syntax` rich renderable. Adds a dependency on Pygments and noticeable load latency for big files. Worth a dedicated session.
 - [ ] **Line-number gutter.** Trivial visual win once `Static` is swapped for `TextArea`.
 - [ ] **Streamed / paged read for huge files.** v0 refuses anything over 10 MB; a friendlier behaviour would be "load the first N lines, lazy-load on scroll". Needs Textual's `LazyList` or equivalent.

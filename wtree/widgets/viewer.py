@@ -4,7 +4,7 @@ Per ``design.md`` Keymap: ``V`` / F3 is the built-in pager. Read-only,
 modal, opens on the cursor entry. Operates on a single file (no
 Selection rule - viewing a tagged set doesn't make sense).
 
-What v0 handles:
+What the viewer handles:
 
 * **Text files** decoded as UTF-8, with a latin-1 fallback that decodes
   any byte sequence (so the viewer never crashes on funny encodings).
@@ -17,18 +17,34 @@ What v0 handles:
 * **Directories / other kinds** never reach the viewer; the action
   layer rejects them before pushing this screen.
 
+Incremental search (``/``, design.md 2026-06-10):
+
+* ``/`` opens the in-viewer :class:`~wtree.widgets.search_bar.SearchBar`
+  (same widget the panes and the destination picker use). Substring,
+  case-insensitive - the rule shared with every other ``/`` surface.
+* As the query is typed the viewer jumps to the first match at or after
+  the line that was on screen when ``/`` was pressed (wrapping), styles
+  every match, and brightens the current one.
+* While the bar is open, Down / Ctrl+G step to the next match and Up to
+  the previous (wrap). Enter commits - the bar closes but the highlights
+  and position stay, and ``n`` / ``N`` step forward / back pager-style.
+* Esc abandons an open search (restores the pre-search scroll position);
+  with a *committed* search, the first Esc clears the highlights and the
+  second Esc - or ``q`` at any time - closes the viewer.
+* Search is available only once a text load has succeeded; on a refusal
+  body (binary / too-large / unreadable) ``/`` is a no-op.
+
 What stays parking-lot for now:
 
-* In-viewer incremental search (``/``).
 * Syntax highlighting (would require Textual's ``TextArea``).
 * Line-number column.
-* Streaming paged read for huge files - v0 reads the whole file
+* Streaming paged read for huge files - the viewer reads the whole file
   into memory after the size guard passes.
 * Hex mode for binary files.
 
 Modal contract:
 
-* ``Esc`` or ``Q`` dismisses with ``None``.
+* ``Esc`` (no committed search) or ``Q`` dismisses with ``None``.
 * Scrolling is handled by the ``VerticalScroll`` container - arrow
   keys, PgUp/PgDn, Home/End all just work.
 * The viewer never mutates the file or the underlying source.
@@ -38,14 +54,19 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
+
+from rich.text import Text
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Label, Static
+
+from wtree.widgets.search_bar import SearchBar
 
 
 # Hard ceiling - reads above this size are refused. 10 MB is generous
@@ -54,6 +75,24 @@ MAX_BYTES: int = 10 * 1024 * 1024
 
 # How many bytes to peek at for the binary-detection heuristic.
 _PEEK_BYTES: int = 8 * 1024
+
+# Search-highlight styles. Provisional palette - a future theme pass can
+# swap these. Every match shares ``_MATCH_STYLE``; the current match (the
+# one ``n`` / ``N`` is sitting on) gets ``_CURRENT_MATCH_STYLE`` so it
+# stands out from the rest.
+_MATCH_STYLE: str = "black on yellow"
+_CURRENT_MATCH_STYLE: str = "black on cyan"
+
+# Lines of context to keep above the current match when scrolling it into
+# view, so the match doesn't sit jammed against the top edge.
+_SCROLL_CONTEXT: int = 2
+
+_HINT_DEFAULT: str = (
+    "Esc / Q close   -   arrows / PgUp PgDn / Home End scroll   -   / search"
+)
+_HINT_SEARCH: str = (
+    "n / N next / prev match   -   Esc clear search   -   Q close"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +110,51 @@ class _LoadResult:
     byte_size: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _Match:
+    """One substring match.
+
+    ``line`` is the 0-based line index (for scroll-into-view);
+    ``start`` / ``end`` are absolute character offsets into the full
+    text (for Rich ``Text.stylize``).
+    """
+
+    line: int
+    start: int
+    end: int
+
+
+def find_matches(text: str, query: str) -> "list[_Match]":
+    """All case-insensitive substring matches of ``query`` in ``text``.
+
+    Same substring-CI *rule* as
+    :func:`wtree.widgets.search_bar.compute_matches` (the pane / picker
+    filter) - kept in spirit so the ``/``-search surfaces don't drift -
+    but the viewer needs every occurrence as an absolute ``(start, end)``
+    span (a single line can hold several matches) plus the line number
+    for scroll-into-view, which the row-index model doesn't carry.
+
+    ``re.finditer`` with ``re.IGNORECASE`` matches against the *original*
+    string, so the offsets stay valid even for text whose case-fold would
+    change length (``str.lower()`` can desync offsets - e.g. a few Unicode
+    code points lower to two characters). Matches are non-overlapping, in
+    document order. An empty query yields no matches.
+    """
+    if not query:
+        return []
+    out: "list[_Match]" = []
+    line = 0
+    scanned = 0
+    for m in re.finditer(re.escape(query), text, re.IGNORECASE):
+        i = m.start()
+        # Count only the newlines between the previous match and this one.
+        # ``str.count`` is C-level, so this stays cheap even on big files.
+        line += text.count("\n", scanned, i)
+        scanned = i
+        out.append(_Match(line=line, start=i, end=m.end()))
+    return out
+
+
 class ViewerScreen(ModalScreen[None]):
     """Read-only pager modal.
 
@@ -78,6 +162,12 @@ class ViewerScreen(ModalScreen[None]):
     :meth:`~wtree.app.WTreeApp.action_view`. The screen owns its own
     async file load in ``on_mount`` so the action handler can return
     immediately and the user sees the modal frame before bytes arrive.
+
+    Incremental ``/`` search is hosted on the screen itself (the modal
+    composes its own :class:`SearchBar`, mirroring the destination
+    picker). The five ``on_search_bar_*`` handlers are each ``stop()``ed
+    so they never bubble to the app's pane-search handlers behind the
+    modal.
     """
 
     DEFAULT_CSS = """
@@ -120,25 +210,37 @@ class ViewerScreen(ModalScreen[None]):
     """
 
     BINDINGS = [
-        Binding("escape", "dismiss_screen", "Close"),
+        Binding("escape", "escape", "Close"),
         Binding("q", "dismiss_screen", "Close"),
+        Binding("slash", "search", "Search"),
+        Binding("n", "next_match", "Next match"),
+        Binding("N", "prev_match", "Prev match"),
     ]
 
     def __init__(self, path: str) -> None:
         super().__init__()
         self._path = path
         self._loaded: Optional[_LoadResult] = None
+        # Search state. ``_matches`` is the live match list; ``_match_idx``
+        # the current one. ``_committed`` is True once Enter has been
+        # pressed with matches - that's when ``n`` / ``N`` go live and the
+        # first Esc clears (rather than dismisses). ``_scroll_pre`` is the
+        # top visible line captured at ``/``-press: the search anchor and
+        # the position Esc restores.
+        self._matches: "list[_Match]" = []
+        self._match_idx: int = 0
+        self._committed: bool = False
+        self._scroll_pre: int = 0
 
     def compose(self) -> ComposeResult:
         # Outer container - dock the header at top, hint at bottom, with
-        # the scrollable body in between.
+        # the scrollable body in between. The SearchBar shares the bottom
+        # dock slot with the hint (only one is visible at a time).
         with VerticalScroll(id="viewer-scroll"):
             yield Label(f"Loading: {self._path}", classes="header")
             yield Static("", classes="body", id="viewer-body")
-            yield Label(
-                "Esc / Q to close   -   arrow keys / PgUp PgDn / Home End to scroll",
-                classes="hint",
-            )
+            yield Label(_HINT_DEFAULT, classes="hint", id="viewer-hint")
+            yield SearchBar(id="viewer-search")
 
     async def on_mount(self) -> None:
         # Run the file load off the event loop. Even a 5 MB read
@@ -146,6 +248,12 @@ class ViewerScreen(ModalScreen[None]):
         result = await asyncio.to_thread(_load_file_sync, self._path)
         self._loaded = result
         await self._render_load_result(result)
+        # Focus the scroll container so arrow / PgUp scrolling and the
+        # screen bindings (/, n, N, Esc, q) all reach the viewer.
+        try:
+            self.query_one("#viewer-scroll", VerticalScroll).focus()
+        except Exception:  # noqa: BLE001 - torn down before mount finished
+            pass
 
     async def _render_load_result(self, result: _LoadResult) -> None:
         """Populate the body and update the header with the load result."""
@@ -166,10 +274,212 @@ class ViewerScreen(ModalScreen[None]):
         header.update(
             f"{self._path}  -  {size_str}  -  {result.encoding}"
         )
-        body.update(result.text)
+        # Render through the highlighter (with no matches yet) so there is
+        # a single rendering path, and so the body is a literal Rich
+        # ``Text`` - file content is shown verbatim rather than being
+        # parsed as console markup.
+        self._apply_highlights()
+
+    # ------------------------------------------------------------------
+    # Search availability
+    # ------------------------------------------------------------------
+
+    @property
+    def _searchable(self) -> bool:
+        """True once a successful (non-refusal) text load is present."""
+        return self._loaded is not None and not self._loaded.refusal
+
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
+
+    def _apply_highlights(self) -> None:
+        """Rebuild the body ``Text`` with the current match spans styled.
+
+        Cheap to call on every keystroke / step: it rebuilds one ``Text``
+        from the cached load and stylizes the (typically few) match spans.
+        With no matches it just re-renders the plain text - which is how
+        clearing a search restores the unhighlighted body.
+        """
+        if self._loaded is None or self._loaded.refusal:
+            return
+        try:
+            body = self.query_one("#viewer-body", Static)
+        except Exception:  # noqa: BLE001
+            return
+        text = Text(self._loaded.text)
+        for k, m in enumerate(self._matches):
+            style = _CURRENT_MATCH_STYLE if k == self._match_idx else _MATCH_STYLE
+            text.stylize(style, m.start, m.end)
+        body.update(text)
+
+    def _scroll_to_current(self) -> None:
+        """Scroll so the current match's line is in view (with context)."""
+        if not self._matches:
+            return
+        try:
+            scroll = self.query_one("#viewer-scroll", VerticalScroll)
+        except Exception:  # noqa: BLE001
+            return
+        line = self._matches[self._match_idx].line
+        scroll.scroll_to(y=max(0, line - _SCROLL_CONTEXT), animate=False)
+
+    def _set_hint(self, text: str) -> None:
+        try:
+            self.query_one("#viewer-hint", Label).update(text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # Activation
+    # ------------------------------------------------------------------
+
+    def action_search(self) -> None:
+        """``/``: open the incremental search bar (successful loads only)."""
+        if not self._searchable:
+            return
+        scroll = self.query_one("#viewer-scroll", VerticalScroll)
+        self._scroll_pre = int(scroll.scroll_y)
+        self._matches = []
+        self._match_idx = 0
+        self._committed = False
+        self._apply_highlights()  # clear any prior committed highlights
+        self.query_one("#viewer-hint", Label).display = False
+        self.query_one("#viewer-search", SearchBar).activate()
+
+    # ------------------------------------------------------------------
+    # SearchBar message handlers (each stopped so they don't bubble to
+    # the app's pane-search handlers on the screen behind the modal)
+    # ------------------------------------------------------------------
+
+    def on_search_bar_query_changed(
+        self, event: SearchBar.QueryChanged
+    ) -> None:
+        event.stop()
+        bar = self.query_one("#viewer-search", SearchBar)
+        if not event.query or self._loaded is None:
+            self._matches = []
+            self._match_idx = 0
+            self._apply_highlights()
+            bar.update_match_info(0, 0)
+            return
+        self._matches = find_matches(self._loaded.text, event.query)
+        if not self._matches:
+            self._match_idx = 0
+            self._apply_highlights()
+            bar.update_match_info(0, 0)
+            return
+        # Land on the first match at or after the line we were looking at
+        # when / was pressed, wrapping to the top (mirrors the pane anchor).
+        idx = next(
+            (k for k, m in enumerate(self._matches) if m.line >= self._scroll_pre),
+            0,
+        )
+        self._match_idx = idx
+        self._apply_highlights()
+        self._scroll_to_current()
+        bar.update_match_info(len(self._matches), idx + 1)
+
+    def on_search_bar_next_match(self, event: SearchBar.NextMatch) -> None:
+        event.stop()
+        self._step_match(1)
+
+    def on_search_bar_prev_match(self, event: SearchBar.PrevMatch) -> None:
+        event.stop()
+        self._step_match(-1)
+
+    def _step_match(self, direction: int) -> None:
+        """Step the current match by ``direction`` (wrap) and re-render."""
+        if not self._matches:
+            return
+        n = len(self._matches)
+        self._match_idx = (self._match_idx + direction) % n
+        self._apply_highlights()
+        self._scroll_to_current()
+        self.query_one("#viewer-search", SearchBar).update_match_info(
+            n, self._match_idx + 1
+        )
+
+    def on_search_bar_committed(self, event: SearchBar.Committed) -> None:
+        event.stop()
+        # Enter keeps the highlights and position; n / N stay live as long
+        # as there are matches to walk.
+        self._committed = bool(self._matches)
+        self._close_bar()
+        self._set_hint(_HINT_SEARCH if self._committed else _HINT_DEFAULT)
+
+    def on_search_bar_cancelled(self, event: SearchBar.Cancelled) -> None:
+        event.stop()
+        # Esc abandons the search: clear highlights, restore the scroll.
+        self._matches = []
+        self._match_idx = 0
+        self._committed = False
+        self._apply_highlights()
+        try:
+            self.query_one("#viewer-scroll", VerticalScroll).scroll_to(
+                y=self._scroll_pre, animate=False
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._close_bar()
+        self._set_hint(_HINT_DEFAULT)
+
+    def _close_bar(self) -> None:
+        """Hide the search bar, restore the hint, refocus the body."""
+        self.query_one("#viewer-search", SearchBar).deactivate()
+        self.query_one("#viewer-hint", Label).display = True
+        try:
+            self.query_one("#viewer-scroll", VerticalScroll).focus()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # Post-commit match stepping (n / N) - live only after Enter
+    # ------------------------------------------------------------------
+
+    def action_next_match(self) -> None:
+        """``n``: step to the next match of a committed search (else no-op)."""
+        if self._committed and self._matches:
+            self._step_committed(1)
+
+    def action_prev_match(self) -> None:
+        """``N``: step to the previous match of a committed search."""
+        if self._committed and self._matches:
+            self._step_committed(-1)
+
+    def _step_committed(self, direction: int) -> None:
+        n = len(self._matches)
+        self._match_idx = (self._match_idx + direction) % n
+        self._apply_highlights()
+        self._scroll_to_current()
+
+    # ------------------------------------------------------------------
+    # Close gestures
+    # ------------------------------------------------------------------
+
+    def action_escape(self) -> None:
+        """Esc - two-stage.
+
+        With a committed search, the first Esc clears the highlights and
+        returns to the plain view; otherwise Esc dismisses the viewer.
+        (While the search bar is *open*, the bar's own ``on_key`` eats Esc
+        and posts ``Cancelled`` instead, so this only runs when the bar is
+        closed.)
+        """
+        if self._committed:
+            self._clear_committed()
+            return
+        self.dismiss(None)
+
+    def _clear_committed(self) -> None:
+        self._committed = False
+        self._matches = []
+        self._match_idx = 0
+        self._apply_highlights()
+        self._set_hint(_HINT_DEFAULT)
 
     def action_dismiss_screen(self) -> None:
-        """Esc or Q - close the viewer."""
+        """Q - always quit the viewer, committed search or not."""
         self.dismiss(None)
 
 
