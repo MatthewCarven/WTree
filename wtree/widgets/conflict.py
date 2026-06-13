@@ -29,6 +29,11 @@ resolution dialog):
 * ``Enter`` commits - dismisses with ``(resolutions, custom_dsts)``.
 * ``Esc`` cancels the *entire* operation - dismisses with ``None``
   (distinct from skipping every row).
+* A live **selection summary** sits above the hint and always reflects the
+  current committed state - "Selected: all N -> OVERWRITE" when every row
+  shares one method (the ``S``/``O``/``R`` case), or a per-method breakdown
+  ("Selected: 5 skip, 2 overwrite") when mixed - so the user can see exactly
+  what Enter will do, and that their last keypress registered.
 
 Default per-row resolution is **Skip**: the safe, non-destructive
 choice, so a user who just presses Enter loses nothing.
@@ -117,6 +122,12 @@ class ConflictDialog(
         text-style: bold;
     }
 
+    ConflictDialog Label.summary {
+        margin-top: 1;
+        text-style: bold;
+        color: $warning;
+    }
+
     ConflictDialog Label.hint {
         margin-top: 1;
         color: $text-muted;
@@ -180,6 +191,7 @@ class ConflictDialog(
         self._custom: list[str | None] = [None] * len(self._items)
         self._cursor = 0
         self._row_labels: list[Label] = []
+        self._summary_label: Label | None = None
 
     # -- composition --------------------------------------------------
 
@@ -194,6 +206,11 @@ class ConflictDialog(
                     label = Label(self._row_text(i), classes="row")
                     self._row_labels.append(label)
                     yield label
+            summary = Label(
+                self._summary_text(), classes="summary", id="conflict-summary"
+            )
+            self._summary_label = summary
+            yield summary
             yield Label(self._hint_text(), classes="hint")
 
     def on_mount(self) -> None:
@@ -247,6 +264,35 @@ class ConflictDialog(
             "e edit name  -  Enter confirm  -  Esc cancel op"
         )
 
+    def _summary_text(self) -> str:
+        """Live one-line summary of what Enter will commit.
+
+        When every row shares one resolution (the common ``S``/``O``/``R``
+        set-all case) it collapses to "Selected: all N -> OVERWRITE"; when
+        mixed it lists each non-empty method with its count, in display
+        order. Recomputed from ``self._res`` on every change, so it doubles
+        as the keypress-landed confirmation.
+        """
+        n = len(self._items)
+        if n == 0:
+            return ""
+        order = (Resolution.SKIP, Resolution.OVERWRITE, Resolution.RENAME)
+        counts = {r: 0 for r in order}
+        for r in self._res:
+            counts[r] = counts.get(r, 0) + 1
+        nonzero = [r for r in order if counts[r] > 0]
+        if len(nonzero) == 1:
+            only = _RES_LABEL[nonzero[0]].upper()
+            if n == 1:
+                return f"Selected: {only}"
+            return f"Selected: all {n} -> {only}"
+        parts = [f"{counts[r]} {_RES_LABEL[r]}" for r in nonzero]
+        return "Selected: " + ", ".join(parts)
+
+    def _refresh_summary(self) -> None:
+        if self._summary_label is not None:
+            self._summary_label.update(self._summary_text())
+
     def _refresh_row(self, i: int) -> None:
         if 0 <= i < len(self._row_labels):
             self._row_labels[i].update(self._row_text(i))
@@ -287,12 +333,14 @@ class ConflictDialog(
             return
         self._res[self._cursor] = Resolution(which)
         self._refresh_row(self._cursor)
+        self._refresh_summary()
 
     def action_set_all(self, which: str) -> None:
         res = Resolution(which)
         for i in range(len(self._res)):
             self._res[i] = res
         self._refresh_all_rows()
+        self._refresh_summary()
 
     @work
     async def action_edit_name(self) -> None:
@@ -339,6 +387,7 @@ class ConflictDialog(
             self._custom[i] = leaf
             break
         self._refresh_row(i)
+        self._refresh_summary()
 
     def _edit_prefill(self, i: int) -> str:
         """The string to pre-fill the edit prompt with."""

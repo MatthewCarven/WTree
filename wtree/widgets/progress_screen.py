@@ -5,7 +5,7 @@ thresholds (see :data:`wtree.ops.queue.PROGRESS_MODAL_BYTES` /
 ``PROGRESS_MODAL_ITEMS`` / ``PROGRESS_MODAL_DELAY_SECONDS``). Tiny ops
 fall through to the StatusLine's existing ``Copy N/M`` indicator.
 
-Six-field readout grid (design.md 2026-05-25 Progress dialog):
+Seven-field readout grid (design.md 2026-05-25 Progress dialog):
 
 * **Percent**  - byte-percent of the whole plan (NOT items-done %).
 * **Elapsed**  - MM:SS / H:MM:SS since plan start.
@@ -16,6 +16,11 @@ Six-field readout grid (design.md 2026-05-25 Progress dialog):
                  number; peaks mid-op and returns to zero at end.
 * **Files**    - items_done / items_total (preserves the existing
                  N/M signal for sanity-checking against Percent).
+* **ETA**      - linear remaining-time estimate,
+                 ``elapsed / fraction_done * fraction_left``. Held
+                 as an em-dash until the sample is trustworthy
+                 (~10s elapsed, or >1s and >1 MiB moved); see
+                 :func:`_eta_seconds`.
 
 Zero guard (design.md): readouts whose formula touches elapsed OR
 bytes_done render an em-dash while either is zero. Catches:
@@ -64,6 +69,15 @@ _BAR_HALF = "▌"
 _BAR_EMPTY = "░"
 _EM_DASH = "—"
 
+# ETA gating + projection. A linear byte-rate projection is too noisy
+# to trust in the opening moments — one fast or slow chunk can imply a
+# wildly wrong total — so the remaining-time readout stays an em-dash
+# until the sample means something: either ~10s have elapsed, or we are
+# past 1s AND more than 1 MiB has actually moved.
+_ETA_MIN_ELAPSED = 10.0          # seconds — the "about ten seconds" gate
+_ETA_EARLY_ELAPSED = 1.0         # seconds — early-release time floor
+_ETA_EARLY_BYTES = 1024 * 1024   # 1 MiB — early-release byte floor
+
 
 class ProgressScreen(ModalScreen[None]):
     """Live progress dialog for one in-flight Plan.
@@ -88,8 +102,8 @@ class ProgressScreen(ModalScreen[None]):
     ProgressScreen > Vertical {
         background: $surface;
         border: thick $primary;
-        width: 60;
-        height: 13;
+        width: 66;
+        height: 16;
         padding: 0 1;
     }
 
@@ -292,6 +306,9 @@ class ProgressScreen(ModalScreen[None]):
         data_text = _format_bytes(bytes_done)
         files_text = f"{items_done} / {items_total}"
 
+        eta = _eta_seconds(elapsed, bytes_done, bytes_total)
+        eta_text = _EM_DASH if eta is None else _format_elapsed(eta)
+
         bar = _render_bar(fraction)
 
         t = Text()
@@ -311,7 +328,7 @@ class ProgressScreen(ModalScreen[None]):
 
         _row(t, "Elapsed", elapsed_text, "Data", data_text)
         _row(t, "Rate", rate_text, "Drag", drag_text)
-        t.append(f"  Files     {files_text}\n")
+        _row(t, "Files", files_text, "ETA", eta_text)
 
         return t
 
@@ -373,12 +390,43 @@ def _format_rate(bytes_per_second: float) -> str:
     return f"{size:.1f} PB/s"
 
 
+def _eta_seconds(
+    elapsed: float, bytes_done: int, bytes_total: int
+) -> Optional[float]:
+    """Remaining-time estimate in seconds, or ``None`` while it is too
+    early to mean anything.
+
+    Linear byte projection: ``elapsed / fraction_done * fraction_left``
+    — equivalently ``elapsed * bytes_left / bytes_done``. The percent
+    form (``elapsed / pct_complete * pct_remaining``) is identical: the
+    factors of 100 cancel, and the byte fraction is smoother than the
+    integer percent.
+
+    Returned only once the sample is trustworthy — either ``elapsed``
+    has reached :data:`_ETA_MIN_ELAPSED`, or ``elapsed`` is past
+    :data:`_ETA_EARLY_ELAPSED` *and* more than :data:`_ETA_EARLY_BYTES`
+    have moved. Also guards the maths: needs a positive ``elapsed``,
+    positive ``bytes_done``, and a known positive ``bytes_total``.
+    """
+    if bytes_total <= 0 or bytes_done <= 0 or elapsed <= 0.0:
+        return None
+    ready = (elapsed >= _ETA_MIN_ELAPSED) or (
+        elapsed > _ETA_EARLY_ELAPSED and bytes_done > _ETA_EARLY_BYTES
+    )
+    if not ready:
+        return None
+    fraction = min(1.0, bytes_done / bytes_total)
+    if fraction <= 0.0:
+        return None
+    return (elapsed / fraction) * (1.0 - fraction)
+
+
 def _row(t: Text, label_l: str, value_l: str, label_r: str, value_r: str) -> None:
     """Append a 2-column row to the body. Fixed columns keep the
     field labels lined up regardless of value length, matching the
     design.md mockup.
     """
-    t.append(f"  {label_l:<8}{value_l:<14}", style=None)
+    t.append(f"  {label_l:<8}{value_l:<18}", style=None)
     t.append(f"{label_r:<8}{value_r}\n", style=None)
 
 

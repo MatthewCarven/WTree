@@ -47,6 +47,7 @@ from wtree.widgets.progress_screen import (
     _EM_DASH,
     ProgressScreen,
     _current_item,
+    _eta_seconds,
     _format_bytes,
     _format_elapsed,
     _format_rate,
@@ -729,3 +730,83 @@ def test_percent_is_byte_weighted_not_item_weighted() -> None:
     body = _body_str(queue, plan)
     # The Percent label appears as e.g. "47%" - bytes-weighted, not "0%".
     assert "47%" in body
+
+
+
+# ---------------------------------------------------------------------------
+# ETA (remaining-time) projection + gating  (_eta_seconds)
+# ---------------------------------------------------------------------------
+
+
+_MIB = 1024 * 1024
+
+
+def test_eta_seconds_none_before_gate() -> None:
+    """Under 1s elapsed: too early, even with bytes flowing -> None."""
+    assert _eta_seconds(0.5, 5 * _MIB, 100 * _MIB) is None
+
+
+def test_eta_seconds_early_gate_needs_time_and_a_megabyte() -> None:
+    """Past 1s but <=1 MiB moved, and not yet 10s -> still None."""
+    # 2s elapsed, only 512 KiB moved: neither gate is satisfied.
+    assert _eta_seconds(2.0, 512 * 1024, 100 * _MIB) is None
+
+
+def test_eta_seconds_early_gate_releases() -> None:
+    """Past 1s AND past 1 MiB -> projects before the 10s mark."""
+    # 2s, 2 MiB of 10 MiB -> fraction 0.2 -> 2/0.2*0.8 = 8.0s left.
+    eta = _eta_seconds(2.0, 2 * _MIB, 10 * _MIB)
+    assert eta is not None and abs(eta - 8.0) < 1e-6
+
+
+def test_eta_seconds_ten_second_gate_releases_even_below_a_megabyte() -> None:
+    """~10s elapsed releases the readout regardless of bytes moved."""
+    # 10s, 200 of 1000 bytes (far under 1 MiB) -> 10/0.2*0.8 = 40.0s.
+    eta = _eta_seconds(10.0, 200, 1000)
+    assert eta is not None and abs(eta - 40.0) < 1e-6
+
+
+def test_eta_seconds_symmetric_at_halfway() -> None:
+    """At 50% done, remaining == elapsed (linear projection sanity)."""
+    eta = _eta_seconds(20.0, 500, 1000)
+    assert eta is not None and abs(eta - 20.0) < 1e-6
+
+
+def test_eta_seconds_guards_zero_inputs() -> None:
+    """Zero/absent elapsed, bytes_done, or bytes_total -> None (no div0)."""
+    assert _eta_seconds(0.0, 5 * _MIB, 100 * _MIB) is None       # no time yet
+    assert _eta_seconds(10.0, 0, 100 * _MIB) is None            # nothing moved
+    assert _eta_seconds(10.0, 5 * _MIB, 0) is None              # total unknown
+
+
+def _eta_plan() -> Plan:
+    item = PlanItem(
+        src_source_id="native", src_path="/a", dst_source_id="native",
+        dst_path="/b", kind=Kind.FILE, size=1000,
+    )
+    return Plan(kind=OperationKind.COPY, items=[item])
+
+
+def test_eta_renders_as_mmss_once_gated() -> None:
+    """Body shows the ETA label with an MM:SS value once the gate trips."""
+    plan = _eta_plan()
+    # 10s elapsed, 25% done -> 10/0.25*0.75 = 30s -> "00:30".
+    queue = _StubQueue(
+        bytes_done=250, bytes_total=1000,
+        items_done=0, items_total=1, elapsed=10.0, plan=plan,
+    )
+    body = _body_str(queue, plan)
+    assert "ETA" in body
+    assert "00:30" in body
+
+
+def test_eta_is_em_dash_before_gate() -> None:
+    """Body shows the ETA label as an em-dash while it's too early."""
+    plan = _eta_plan()
+    queue = _StubQueue(
+        bytes_done=200, bytes_total=1000,
+        items_done=0, items_total=1, elapsed=0.5, plan=plan,
+    )
+    body = _body_str(queue, plan)
+    assert "ETA" in body
+    assert _EM_DASH in body

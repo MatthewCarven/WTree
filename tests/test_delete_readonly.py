@@ -24,9 +24,7 @@ import pytest
 from wtree.ops.base import (
     ItemStatus,
     Kind,
-    OperationKind,
     PlanItem,
-    Resolution,
 )
 from wtree.ops.execute import (
     _clear_readonly_and_retry,

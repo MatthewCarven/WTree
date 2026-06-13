@@ -422,6 +422,63 @@ def test_dialog_row_text_shows_path_and_kind():
     assert "dir" in text  # existing kind label
 
 
+# -- live selection summary (so the user knows what Enter will commit) -----
+
+
+def _files(n: int) -> list[PlanItem]:
+    return [_item(f"/d/{i}", Kind.FILE, ConflictKind.FILE) for i in range(n)]
+
+
+def test_dialog_summary_default_is_all_skip():
+    assert ConflictDialog(_files(3))._summary_text() == "Selected: all 3 -> SKIP"
+
+
+def test_dialog_summary_collapses_when_all_same():
+    d = ConflictDialog(_files(3))
+    d.action_set_all("overwrite")
+    assert d._summary_text() == "Selected: all 3 -> OVERWRITE"
+
+
+def test_dialog_summary_breaks_down_when_mixed():
+    d = ConflictDialog(_files(3))         # all skip
+    d.action_set_current("overwrite")     # row 0 only
+    # display order is skip, overwrite, rename
+    assert d._summary_text() == "Selected: 2 skip, 1 overwrite"
+
+
+def test_dialog_summary_single_row_drops_all_wording():
+    d = ConflictDialog([_item("/d/a", Kind.FILE, ConflictKind.FILE)])
+    assert d._summary_text() == "Selected: SKIP"
+
+
+def test_dialog_summary_reflects_self_default_rename():
+    items = [
+        _item("/d/a", Kind.FILE, ConflictKind.FILE),   # -> skip
+        _item("/d/b", Kind.FILE, ConflictKind.SELF),   # -> rename
+    ]
+    assert ConflictDialog(items)._summary_text() == "Selected: 1 skip, 1 rename"
+
+
+async def test_dialog_summary_label_updates_live_on_keypress():
+    """The on-screen summary widget refreshes when a method key is pressed."""
+    from textual.app import App
+
+    dialog = ConflictDialog(_files(3))
+
+    class _Host(App):
+        async def on_mount(self) -> None:
+            await self.push_screen(dialog)
+
+    async with _Host().run_test() as pilot:
+        await pilot.pause()
+        lbl = dialog._summary_label
+        assert lbl is not None
+        assert "all 3 -> SKIP" in str(lbl.render())
+        await pilot.press("O")  # overwrite all
+        await pilot.pause()
+        assert "all 3 -> OVERWRITE" in str(lbl.render())
+
+
 # ---------------------------------------------------------------------------
 # End-to-end app wiring
 # ---------------------------------------------------------------------------
