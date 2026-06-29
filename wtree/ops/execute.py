@@ -616,9 +616,52 @@ async def _native_move(
         return ItemResult(item=item, status=ItemStatus.SUCCESS)
 
     if item.kind is Kind.DIR:
-        # Cross-fs DIR moves keep shutil.move (copytree + rmtree).
-        # Recursive walked-progress is parked - see design.md.
-        await asyncio.to_thread(shutil.move, src, dst)
+        # Cross-fs DIR move. shutil.move would do copytree + rmtree, but
+        # its internal rmtree has NO read-only retry: a read-only entry
+        # anywhere in the tree (git object/pack files, marked read-only
+        # by design) aborts the source cleanup mid-walk with WinError 5
+        # on Windows, leaving src half-removed while dst is already a
+        # complete copy - the same exposure that bit Delete on
+        # 2026-06-11. So split shutil.move apart: copytree here, then
+        # _rmtree_force for the read-only-tolerant source cleanup.
+        # Recursive walked-progress (a cancellable byte stream for the
+        # copy half) stays parked - see design.md.
+        if _is_within(dst, src):
+            # Refuse to copy a directory into its own subtree (shutil's
+            # _destinsrc guard) - copytree would recurse forever.
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"cannot move directory into itself: {dst}",
+            )
+        try:
+            # symlinks=True mirrors shutil.move: preserve links inside
+            # the tree rather than dereferencing them (copy2 default).
+            await asyncio.to_thread(
+                shutil.copytree, src, dst, symlinks=True
+            )
+        except Exception as exc:  # noqa: BLE001 - per-item isolation
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=f"copy dir: {type(exc).__name__}: {exc}",
+            )
+        try:
+            await asyncio.to_thread(_rmtree_force, src)
+        except OSError as exc:
+            # Copy landed but the source couldn't be removed even after
+            # the read-only retry (a lock, a mount quirk). The user now
+            # has the directory in BOTH places - surface the same clear
+            # partial-failure message shape as the FILE branch's
+            # "unlink source after copy".
+            return ItemResult(
+                item=item,
+                status=ItemStatus.FAILED,
+                message=(
+                    f"remove source after copy: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
         return ItemResult(item=item, status=ItemStatus.SUCCESS)
 
     # Unreachable - OTHER handled above. Defensive.
@@ -684,6 +727,23 @@ def _unlink_force(path: str) -> None:
         os.unlink(path)
     except PermissionError as exc:
         _clear_readonly_and_retry(os.unlink, path, exc)
+
+
+def _is_within(child: str, parent: str) -> bool:
+    """True if ``child`` is ``parent`` itself or nested under it.
+
+    The ``shutil._destinsrc`` guard, reused for the cross-fs DIR move:
+    refuse to ``copytree`` a directory into its own subtree (which would
+    recurse forever). Comparison goes through
+    :func:`~wtree.ops.base.canonical_path` (separator + dot collapse,
+    case fold on Windows) - the same judgement the self-target detection
+    uses - so a typed-``\\`` or different-case ``child`` is still caught.
+    No filesystem I/O: we compare the paths the plan carries, immune to
+    the ``/a-x``-sorts-between-``/a``-and-``/a/b`` lexicographic trap
+    because the test is a true path-segment prefix (``parent + "/"``).
+    """
+    c, p = canonical_path(child), canonical_path(parent)
+    return c == p or c.startswith(p + "/")
 
 
 # ---------------------------------------------------------------------------

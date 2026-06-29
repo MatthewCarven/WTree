@@ -173,6 +173,7 @@ def _help_content() -> Text:
     row("Ctrl+R", "Refresh source (re-scan both panes)")
     row("Ctrl+I", "Properties (cursor entry or tagged-set summary)")
     row("Ctrl+P", "Show progress dialog (re-open after minimize)")
+    row("Ctrl+O", "Last operation result (failed / skipped; a = all items)")
     row("Q   /  F10", "Quit")
     row("Esc", "Cancel the current dialog or modal")
     t.append("\n")

@@ -7,7 +7,9 @@ fall through to the StatusLine's existing ``Copy N/M`` indicator.
 
 Seven-field readout grid (design.md 2026-05-25 Progress dialog):
 
-* **Percent**  - byte-percent of the whole plan (NOT items-done %).
+* **Percent**  - byte+file hybrid: a cost-model blend of byte- and
+                 file-progress (was byte-only), so a copy dominated by
+                 tiny files no longer reads 0%; see :func:`_fit_cost_model`.
 * **Elapsed**  - MM:SS / H:MM:SS since plan start.
 * **Data**     - bytes_done scaled (KB / MB / GB).
 * **Rate**     - bytes_done / elapsed_seconds, scaled.
@@ -16,11 +18,11 @@ Seven-field readout grid (design.md 2026-05-25 Progress dialog):
                  number; peaks mid-op and returns to zero at end.
 * **Files**    - items_done / items_total (preserves the existing
                  N/M signal for sanity-checking against Percent).
-* **ETA**      - linear remaining-time estimate,
-                 ``elapsed / fraction_done * fraction_left``. Held
-                 as an em-dash until the sample is trustworthy
-                 (~10s elapsed, or >1s and >1 MiB moved); see
-                 :func:`_eta_seconds`.
+* **ETA**      - hybrid remaining-time estimate from the cost model
+                 (``a·bytes_left + c·files_left``), falling back to the
+                 byte-only / then file-only linear projection before the
+                 model fits. Em-dash until trustworthy; see
+                 :func:`_fit_cost_model` / :func:`_eta_seconds`.
 
 Zero guard (design.md): readouts whose formula touches elapsed OR
 bytes_done render an em-dash while either is zero. Catches:
@@ -47,6 +49,8 @@ design.md -> Progress dialog -> Concurrency assumptions.
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterable
 from typing import Optional
 
 from rich.text import Text
@@ -77,6 +81,21 @@ _EM_DASH = "—"
 _ETA_MIN_ELAPSED = 10.0          # seconds — the "about ten seconds" gate
 _ETA_EARLY_ELAPSED = 1.0         # seconds — early-release time floor
 _ETA_EARLY_BYTES = 1024 * 1024   # 1 MiB — early-release byte floor
+
+# Hybrid cost model (2026-06-28). The byte-only ETA / percent crater on
+# copies dominated by FILE COUNT: a run of thousands of tiny files moves
+# almost no bytes, so a byte-rate projection of the remaining bytes
+# explodes (a real 4.5h estimate ballooned to 32h mid-tiny-file-run). The
+# fix models elapsed time as a linear combination of bytes AND files moved:
+# ``elapsed ≈ a·byte_fraction + c·file_fraction`` (fractions in [0, 1] for
+# numerical conditioning), fit by least squares over a rolling window. ``a``
+# captures byte throughput (big-file cost), ``c`` the per-file overhead
+# (tiny-file cost); the ETA and the bar read off the same fit so they agree
+# and stay stable across regimes.
+_MODEL_MIN_SAMPLES = 4            # enough spread to separate the two costs
+_MODEL_SAMPLE_INTERVAL = 1.0      # seconds between recorded samples
+_MODEL_MAX_SAMPLES = 600          # rolling window cap (~10 min at 1 Hz)
+_MODEL_DET_EPS = 1e-9             # singular-matrix (collinear) guard
 
 
 class ProgressScreen(ModalScreen[None]):
@@ -142,6 +161,12 @@ class ProgressScreen(ModalScreen[None]):
         self._plan = queue.running
         self._timer: Optional[Timer] = None
         self._dismissing = False
+        # Rolling (elapsed, byte_fraction, file_fraction) samples feeding the
+        # hybrid cost model; the bar high-water mark keeps the bar monotone.
+        self._samples: deque[tuple[float, float, float]] = deque(
+            maxlen=_MODEL_MAX_SAMPLES
+        )
+        self._bar_hwm = 0.0
 
     # --- safe dismissal --------------------------------------------------
 
@@ -236,6 +261,7 @@ class ProgressScreen(ModalScreen[None]):
         if self._queue.running is not self._plan:
             self.safe_dismiss()
             return
+        self._record_sample()
         try:
             body = self.query_one("#progress-body", Static)
         except Exception:  # noqa: BLE001 - torn down between timer and call
@@ -243,6 +269,29 @@ class ProgressScreen(ModalScreen[None]):
         body.update(self._body_text())
         # Header may flip to Cancelling... once request_cancel fires.
         self._refresh_header()
+
+    def _record_sample(self) -> None:
+        """Append one throttled ``(elapsed, byte_fraction, file_fraction)``
+        sample for the hybrid cost model. Throttled to one per
+        :data:`_MODEL_SAMPLE_INTERVAL` so the window spans wall-clock time,
+        not redraw ticks; the ``deque`` maxlen bounds it.
+        """
+        bytes_prog = self._queue.bytes_progress
+        items_prog = self._queue.running_progress
+        elapsed = self._queue.elapsed_seconds
+        if bytes_prog is None or items_prog is None or elapsed <= 0.0:
+            return
+        bytes_done, bytes_total = bytes_prog
+        items_done, items_total = items_prog
+        if bytes_total <= 0 and items_total <= 0:
+            return
+        byte_frac = (bytes_done / bytes_total) if bytes_total > 0 else 0.0
+        file_frac = (items_done / items_total) if items_total > 0 else 0.0
+        if self._samples and (
+            elapsed - self._samples[-1][0]
+        ) < _MODEL_SAMPLE_INTERVAL:
+            return
+        self._samples.append((elapsed, byte_frac, file_frac))
 
     def _refresh_header(self) -> None:
         try:
@@ -278,16 +327,35 @@ class ProgressScreen(ModalScreen[None]):
         items_done = items_prog[0] if items_prog else 0
         items_total = items_prog[1] if items_prog else 0
 
-        # Percent: byte-weighted. Falls back to 0 when bytes_total is 0
-        # (e.g. a plan of empty files - the items count carries the
-        # signal). No divide-by-zero risk.
-        if bytes_total > 0:
-            fraction = min(1.0, bytes_done / bytes_total)
-        else:
-            fraction = 0.0
-        percent = int(fraction * 100)
+        # Per-dimension fractions. ``byte_fraction`` still drives Drag (the
+        # design defines Drag byte-only); the bar / Percent and the ETA use
+        # the hybrid cost model so a file-count-dominated copy doesn't read
+        # 0% / a wildly-inflated ETA during a run of tiny files.
+        byte_fraction = (
+            min(1.0, bytes_done / bytes_total) if bytes_total > 0 else 0.0
+        )
+        file_fraction = (
+            min(1.0, items_done / items_total) if items_total > 0 else 0.0
+        )
 
-        # Zero guard for time-derived readouts.
+        samples = getattr(self, "_samples", None)
+        model = _fit_cost_model(samples) if samples else None
+
+        # Display fraction (bar + Percent): cost-model blend when the fit is
+        # available, else the higher of the two raw fractions so the bar
+        # never sits at 0% while files are clearly progressing. Held to a
+        # monotonic high-water mark so a later model revision can't rewind it.
+        if model is not None:
+            display_fraction = _model_fraction(
+                model, byte_fraction, file_fraction
+            )
+        else:
+            display_fraction = max(byte_fraction, file_fraction)
+        display_fraction = max(getattr(self, "_bar_hwm", 0.0), display_fraction)
+        self._bar_hwm = display_fraction
+        percent = int(display_fraction * 100)
+
+        # Zero guard for time-derived readouts (Rate, Drag).
         zero_guard = (elapsed <= 0.0) or (bytes_done <= 0)
 
         if zero_guard:
@@ -295,21 +363,29 @@ class ProgressScreen(ModalScreen[None]):
             drag_text = _EM_DASH
         else:
             rate_text = _format_rate(bytes_done / elapsed)
-            # Drag: (1 - bytes_done/bytes_total) * elapsed, normalised
-            # to fraction-seconds. Matthew's quirky readout - a
-            # "patience tax" vibe number, peaks mid-op, returns to 0
-            # at completion. NOT a buffer / queue depth.
-            remaining_frac = 1.0 - fraction
-            drag_text = f"{remaining_frac * elapsed:.2f}"
+            # Drag: (1 - byte_fraction) * elapsed, normalised to
+            # fraction-seconds. Matthew's quirky readout - a "patience tax"
+            # vibe number, peaks mid-op, returns to 0 at completion. Stays
+            # byte-only by design (NOT a buffer / queue depth).
+            drag_text = f"{(1.0 - byte_fraction) * elapsed:.2f}"
 
         elapsed_text = _format_elapsed(elapsed)
         data_text = _format_bytes(bytes_done)
         files_text = f"{items_done} / {items_total}"
 
-        eta = _eta_seconds(elapsed, bytes_done, bytes_total)
+        # ETA: cost-model projection when the fit is available; otherwise the
+        # byte-only linear projection, and if that is still too early to
+        # release, a file-count linear projection (covers the all-tiny /
+        # empty-file regimes where bytes alone say nothing).
+        if model is not None and elapsed >= _ETA_EARLY_ELAPSED:
+            eta = _model_eta(model, byte_fraction, file_fraction)
+        else:
+            eta = _eta_seconds(elapsed, bytes_done, bytes_total)
+            if eta is None:
+                eta = _eta_seconds(elapsed, items_done, items_total)
         eta_text = _EM_DASH if eta is None else _format_elapsed(eta)
 
-        bar = _render_bar(fraction)
+        bar = _render_bar(display_fraction)
 
         t = Text()
         # Source line: show the current item's source path so the user
@@ -419,6 +495,72 @@ def _eta_seconds(
     if fraction <= 0.0:
         return None
     return (elapsed / fraction) * (1.0 - fraction)
+
+
+def _fit_cost_model(
+    samples: Iterable[tuple[float, float, float]] | None,
+) -> Optional[tuple[float, float]]:
+    """Least-squares fit of ``elapsed ≈ a·byte_fraction + c·file_fraction``.
+
+    ``samples`` are ``(elapsed_seconds, byte_fraction, file_fraction)``
+    triples with the fractions in [0, 1] (normalising by the known totals
+    keeps the normal matrix well-conditioned — raw byte counts squared would
+    swamp the file counts and lose precision). The two returned coefficients
+    are the *whole-job* seconds attributable to each dimension on its own:
+    ``a`` ≈ the byte-throughput cost, ``c`` ≈ the per-file overhead.
+
+    Returns ``None`` — telling the caller to fall back to the byte-only
+    projection — when the fit is unusable: fewer than
+    :data:`_MODEL_MIN_SAMPLES`; a singular / ill-conditioned matrix (bytes
+    and files grew collinearly because every file was ~the same size, so the
+    two costs can't be separated); or a negative coefficient (noise / overfit,
+    not physical).
+    """
+    if not samples:
+        return None
+    pts = list(samples)
+    if len(pts) < _MODEL_MIN_SAMPLES:
+        return None
+    sbb = sbf = sff = sbt = sft = 0.0
+    for t, b, f in pts:
+        sbb += b * b
+        sbf += b * f
+        sff += f * f
+        sbt += b * t
+        sft += f * t
+    det = sbb * sff - sbf * sbf
+    if det <= _MODEL_DET_EPS * (sbb * sff + 1.0):
+        return None
+    a = (sff * sbt - sbf * sft) / det
+    c = (sbb * sft - sbf * sbt) / det
+    if a < 0.0 or c < 0.0:
+        return None
+    return a, c
+
+
+def _model_eta(
+    model: tuple[float, float], byte_fraction: float, file_fraction: float
+) -> float:
+    """Remaining seconds from the cost model: the unfinished share of each
+    dimension, priced by its fitted coefficient."""
+    a, c = model
+    bf = max(0.0, min(1.0, byte_fraction))
+    ff = max(0.0, min(1.0, file_fraction))
+    return a * (1.0 - bf) + c * (1.0 - ff)
+
+
+def _model_fraction(
+    model: tuple[float, float], byte_fraction: float, file_fraction: float
+) -> float:
+    """Completed share of the modelled total work — a cost-weighted blend of
+    the two fractions. This is what the bar should show: the estimated
+    fraction of total *time* elapsed, consistent with :func:`_model_eta`."""
+    a, c = model
+    denom = a + c
+    if denom <= 0.0:
+        return max(byte_fraction, file_fraction)
+    blended = (a * byte_fraction + c * file_fraction) / denom
+    return max(0.0, min(1.0, blended))
 
 
 def _row(t: Text, label_l: str, value_l: str, label_r: str, value_r: str) -> None:

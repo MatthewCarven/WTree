@@ -45,38 +45,86 @@ MAX_LOG_BYTES = 1024 * 1024  # 1 MiB
 #: honest "... and N more" line - the failure SHAPE repeats anyway.
 MAX_DETAIL_LINES = 200
 
+#: Environment variable that widens the log to include SUCCESS items too
+#: (default: only non-SUCCESS items get detail lines, to keep logs
+#: skimmable). Read at write time, mirroring the ``WTREE_DEBUG`` precedent
+#: in ``crash.py`` - no config-persistence layer needed.
+VERBOSE_ENV = "WTREE_OPLOG_VERBOSE"
 
-def format_result(result: OperationResult, *, now: datetime | None = None) -> str:
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def verbose_enabled() -> bool:
+    """True when :data:`VERBOSE_ENV` is set to a truthy value."""
+    return os.environ.get(VERBOSE_ENV, "").strip().lower() in _TRUTHY
+
+
+def item_arrow(item) -> str:
+    """``src -> dst`` for a normal item; just ``src`` for a Delete sentinel
+    (whose ``dst_path`` mirrors ``src_path``)."""
+    return (
+        item.src_path
+        if item.dst_path == item.src_path
+        else f"{item.src_path} -> {item.dst_path}"
+    )
+
+
+def _item_line(r) -> str:
+    """One detail line: ``  STATUS  arrow[: message]``.
+
+    Non-success items with no message keep the explicit ``(no message)``
+    placeholder (an empty failure reason is notable). A SUCCESS item with
+    no message - the normal case - drops the suffix entirely so verbose
+    logs stay clean.
+    """
+    arrow = item_arrow(r.item)
+    if r.message:
+        suffix = f": {r.message}"
+    elif r.status is ItemStatus.SUCCESS:
+        suffix = ""
+    else:
+        suffix = ": (no message)"
+    return f"  {r.status.value.upper():7s} {arrow}{suffix}"
+
+
+def format_result(
+    result: OperationResult,
+    *,
+    now: datetime | None = None,
+    verbose: bool | None = None,
+) -> str:
     """Render ``result`` as the text block ``write_result`` appends.
 
     Pure function — no I/O — so tests can pin the format without a
     filesystem. One header line (UTC timestamp + the same ``summary()``
-    the toast shows), then one indented line per non-SUCCESS item:
+    the toast shows), then one indented detail line per item:
     ``STATUS  src -> dst: message``. Delete plans carry a sentinel dst
     mirror; for those the arrow collapses to just the source path.
+
+    By default only **non-SUCCESS** items get detail lines (skimmable
+    logs). When ``verbose`` is True - or, if ``verbose`` is None, when
+    :func:`verbose_enabled` reads a truthy :data:`VERBOSE_ENV` - SUCCESS
+    items get lines too. The :data:`MAX_DETAIL_LINES` cap applies to
+    whatever set is emitted.
     """
+    if verbose is None:
+        verbose = verbose_enabled()
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [f"[{stamp}] {result.summary()}"]
     detailed = 0
     skipped_overflow = 0
     for r in result.items:
-        if r.status is ItemStatus.SUCCESS:
+        if not verbose and r.status is ItemStatus.SUCCESS:
             continue
         if detailed >= MAX_DETAIL_LINES:
             skipped_overflow += 1
             continue
-        item = r.item
-        arrow = (
-            item.src_path
-            if item.dst_path == item.src_path
-            else f"{item.src_path} -> {item.dst_path}"
-        )
-        message = r.message or "(no message)"
-        lines.append(f"  {r.status.value.upper():7s} {arrow}: {message}")
+        lines.append(_item_line(r))
         detailed += 1
     if skipped_overflow:
+        noun = "item(s)" if verbose else "non-success item(s)"
         lines.append(
-            f"  ... and {skipped_overflow} more non-success item(s) "
+            f"  ... and {skipped_overflow} more {noun} "
             f"(detail capped at {MAX_DETAIL_LINES})"
         )
     return "\n".join(lines) + "\n"

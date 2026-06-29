@@ -48,6 +48,9 @@ from wtree.widgets.progress_screen import (
     ProgressScreen,
     _current_item,
     _eta_seconds,
+    _fit_cost_model,
+    _model_eta,
+    _model_fraction,
     _format_bytes,
     _format_elapsed,
     _format_rate,
@@ -711,25 +714,28 @@ def test_drag_formula_matches_design() -> None:
     assert "7.50" in body
 
 
-def test_percent_is_byte_weighted_not_item_weighted() -> None:
-    """Percent reports byte progress, not items-done/items-total."""
+def test_percent_hybrid_uses_higher_when_no_model() -> None:
+    """With no fitted model yet (single render, no history), Percent is the
+    HIGHER of byte- and file-fraction, so a tiny-file copy never reads 0%."""
     item = PlanItem(
         src_source_id="native", src_path="/a", dst_source_id="native",
         dst_path="/b", kind=Kind.FILE, size=1000,
     )
     plan = Plan(kind=OperationKind.COPY, items=[item])
-    # 47% of bytes done; 0 of 10 items done
-    queue = _StubQueue(
-        bytes_done=470,
-        bytes_total=1000,
-        items_done=0,
-        items_total=10,
-        elapsed=1.0,
-        plan=plan,
+    # Bytes ahead of files -> Percent tracks bytes (47%).
+    q1 = _StubQueue(
+        bytes_done=470, bytes_total=1000,
+        items_done=0, items_total=10, elapsed=1.0, plan=plan,
     )
-    body = _body_str(queue, plan)
-    # The Percent label appears as e.g. "47%" - bytes-weighted, not "0%".
-    assert "47%" in body
+    assert "47%" in _body_str(q1, plan)
+    # Files ahead of bytes (the field bug: 91k tiny files, almost no bytes)
+    # -> Percent tracks FILES (25%), not the byte-weighted 0%.
+    q2 = _StubQueue(
+        bytes_done=5, bytes_total=100_000,
+        items_done=25, items_total=100, elapsed=5.0, plan=plan,
+    )
+    body2 = _body_str(q2, plan)
+    assert "25%" in body2
 
 
 
@@ -810,3 +816,115 @@ def test_eta_is_em_dash_before_gate() -> None:
     body = _body_str(queue, plan)
     assert "ETA" in body
     assert _EM_DASH in body
+
+
+# ---------------------------------------------------------------------------
+# Hybrid cost model (file+byte) — 2026-06-28
+# ---------------------------------------------------------------------------
+
+
+# Well-conditioned regime curve: bytes lead early (big files), files lead
+# late (tiny files), so the two fractions vary INDEPENDENTLY and the fit
+# can separate the per-byte and per-file costs.
+_REGIME_PTS = [(0.30, 0.05), (0.45, 0.10), (0.50, 0.30), (0.52, 0.55), (0.55, 0.80)]
+
+
+def _regime_samples(a: float, c: float):
+    return [(a * bf + c * ff, bf, ff) for bf, ff in _REGIME_PTS]
+
+
+def test_fit_cost_model_recovers_known_coefficients() -> None:
+    """Noise-free samples from elapsed = a*bf + c*ff with independent byte and
+    file growth recover a and c."""
+    model = _fit_cost_model(_regime_samples(100.0, 200.0))
+    assert model is not None
+    a, c = model
+    assert abs(a - 100.0) < 1e-6
+    assert abs(c - 200.0) < 1e-6
+
+
+def test_fit_cost_model_none_too_few_samples() -> None:
+    assert _fit_cost_model([(1.0, 0.1, 0.05), (2.0, 0.2, 0.10)]) is None
+    assert _fit_cost_model(None) is None
+    assert _fit_cost_model([]) is None
+
+
+def test_fit_cost_model_none_when_collinear() -> None:
+    """Uniform file sizes -> byte_fraction == file_fraction every sample ->
+    the two costs can't be separated -> None (caller falls back)."""
+    samples = [(float(t), t / 100.0, t / 100.0) for t in range(1, 12)]
+    assert _fit_cost_model(samples) is None
+
+
+def test_fit_cost_model_none_on_negative_coefficient() -> None:
+    """Data only a NEGATIVE file-coefficient could explain is rejected as
+    unphysical."""
+    samples = []
+    for i in range(1, 11):
+        bf = i / 20.0
+        ff = (i ** 1.5) / 200.0
+        samples.append((2.0 * bf - 1.0 * ff, bf, ff))  # genuine c < 0
+    assert _fit_cost_model(samples) is None
+
+
+def test_model_eta_prices_remaining_of_each_dimension() -> None:
+    # a=10s (bytes), c=100s (files); 50% bytes, 10% files done.
+    # 10*(1-0.5) + 100*(1-0.1) = 5 + 90 = 95
+    assert abs(_model_eta((10.0, 100.0), 0.5, 0.1) - 95.0) < 1e-9
+
+
+def test_model_eta_clamps_fractions() -> None:
+    # 1.5 -> 1.0, -0.2 -> 0.0: 10*0 + 20*1 = 20
+    assert abs(_model_eta((10.0, 20.0), 1.5, -0.2) - 20.0) < 1e-9
+
+
+def test_model_fraction_blends_by_cost_weight() -> None:
+    # a=10, c=90 -> file dimension dominates: (10*0 + 90*0.5)/100 = 0.45
+    assert abs(_model_fraction((10.0, 90.0), 0.0, 0.5) - 0.45) < 1e-9
+
+
+def test_model_fraction_zero_denominator_falls_back_to_max() -> None:
+    assert abs(_model_fraction((0.0, 0.0), 0.2, 0.6) - 0.6) < 1e-9
+
+
+def test_body_uses_model_eta_when_samples_present() -> None:
+    """With a mixed-regime sample history on the screen, the body's ETA is
+    the cost-model projection, NOT the inflated byte-only number."""
+    from collections import deque
+
+    from wtree.widgets.progress_screen import _format_elapsed
+
+    plan = _eta_plan()
+    samples = _regime_samples(100.0, 200.0)
+    model = _fit_cost_model(samples)
+    assert model is not None
+    # Current point = last sample: 55% bytes, 80% files.
+    expected = _format_elapsed(_model_eta(model, 0.55, 0.80))  # 85s -> 01:25
+
+    queue = _StubQueue(
+        bytes_done=55, bytes_total=100,
+        items_done=80, items_total=100, elapsed=215.0, plan=plan,
+    )
+    screen = ProgressScreen.__new__(ProgressScreen)
+    screen._queue = queue
+    screen._plan = plan
+    screen._samples = deque(samples)
+    body = screen._body_text().plain
+    assert "ETA" in body
+    assert expected in body
+    # Byte-only here would be 215/0.55*0.45 ≈ 175.9s ("02:55"); the model
+    # (01:25) is materially smaller, so the byte-only value must NOT appear.
+    assert "02:55" not in body
+
+
+def test_body_falls_back_to_file_eta_when_bytes_say_nothing() -> None:
+    """All-empty-file copy (bytes_done 0): byte ETA is None, so the body
+    uses the file-count linear projection rather than an em-dash forever."""
+    plan = _eta_plan()
+    queue = _StubQueue(
+        bytes_done=0, bytes_total=0,
+        items_done=25, items_total=100, elapsed=10.0, plan=plan,
+    )
+    body = _body_str(queue, plan)
+    # 10s, 25/100 files -> 10/0.25*0.75 = 30s -> "00:30".
+    assert "00:30" in body

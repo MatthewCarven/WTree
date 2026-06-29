@@ -264,3 +264,64 @@ def test_format_no_overflow_line_under_cap() -> None:
         ItemResult(item=_item("/s/a", "/d/a"), status=ItemStatus.FAILED, message="x")
     )
     assert "more non-success" not in oplog.format_result(res, now=_NOW)
+
+
+# ---------------------------------------------------------------------------
+# Verbose mode (WTREE_OPLOG_VERBOSE) — 2026-06-28
+# ---------------------------------------------------------------------------
+
+
+def test_verbose_enabled_reads_env(monkeypatch) -> None:
+    monkeypatch.delenv(oplog.VERBOSE_ENV, raising=False)
+    assert oplog.verbose_enabled() is False
+    for truthy in ("1", "true", "YES", "On"):
+        monkeypatch.setenv(oplog.VERBOSE_ENV, truthy)
+        assert oplog.verbose_enabled() is True
+    for falsy in ("0", "", "off", "no"):
+        monkeypatch.setenv(oplog.VERBOSE_ENV, falsy)
+        assert oplog.verbose_enabled() is False
+
+
+def test_format_verbose_includes_success_lines() -> None:
+    res = _result(
+        ItemResult(item=_item("/s/a", "/d/a"), status=ItemStatus.SUCCESS),
+        ItemResult(
+            item=_item("/s/b", "/d/b"),
+            status=ItemStatus.FAILED,
+            message="nope",
+        ),
+    )
+    text = oplog.format_result(res, now=_NOW, verbose=True)
+    assert "SUCCESS /s/a -> /d/a" in text          # success line present
+    assert "FAILED  /s/b -> /d/b: nope" in text
+
+
+def test_format_verbose_success_has_no_placeholder() -> None:
+    """A SUCCESS item with no message drops the suffix (clean line);
+    a non-success item with no message keeps '(no message)'."""
+    res = _result(
+        ItemResult(item=_item("/s/a", "/d/a"), status=ItemStatus.SUCCESS),
+    )
+    text = oplog.format_result(res, now=_NOW, verbose=True)
+    assert "SUCCESS /s/a -> /d/a\n" in text
+    assert "(no message)" not in text
+
+
+def test_format_default_still_omits_success(monkeypatch) -> None:
+    monkeypatch.delenv(oplog.VERBOSE_ENV, raising=False)
+    res = _result(
+        ItemResult(item=_item("/s/a", "/d/a"), status=ItemStatus.SUCCESS),
+    )
+    text = oplog.format_result(res, now=_NOW)  # verbose defaults to env (off)
+    assert "SUCCESS" not in text
+
+
+def test_write_result_verbose_via_env(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(oplog.VERBOSE_ENV, "1")
+    target = tmp_path / "operations.log"
+    res = _result(
+        ItemResult(item=_item("/s/a", "/d/a"), status=ItemStatus.SUCCESS),
+    )
+    oplog.write_result(res, target)
+    body = target.read_text()
+    assert "SUCCESS /s/a -> /d/a" in body

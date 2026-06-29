@@ -108,6 +108,7 @@ MENUS: tuple[Menu, ...] = (
             MenuItem("Switch drive", "d", "Ctrl+D", "switch_drive"),
             MenuItem("Refresh source", "r", "Ctrl+R", "refresh_source"),
             MenuItem("Progress dialog", "p", "Ctrl+P", "show_progress"),
+            MenuItem("Last operation", "o", "Ctrl+O", "show_last_op"),
             MenuItem("Untag all", "u", "Ctrl+U", "untag_all"),
         ),
     ),

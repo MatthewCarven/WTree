@@ -101,6 +101,7 @@ from wtree.widgets.keybar import KeyBar
 from wtree.widgets.kind_chooser import KindChooserDialog
 from wtree.widgets.menu_bar import MENUS, MenuBar
 from wtree.widgets.menu_screen import MenuScreen
+from wtree.widgets.last_op import OperationResultScreen
 from wtree.widgets.progress_screen import ProgressScreen
 from wtree.widgets.prompt import PromptDialog
 from wtree.widgets.scan_screen import (
@@ -195,6 +196,7 @@ class WTreeApp(App):
         ("ctrl+r", "refresh_source", "Refresh source"),
         ("ctrl+i", "properties", "Properties"),
         ("ctrl+p", "show_progress", "Show progress"),
+        ("ctrl+o", "show_last_op", "Last operation"),
         ("f9", "menu_bar", "Menu"),
         ("alt+f", "open_menu(0)", "File menu"),
         ("alt+c", "open_menu(1)", "Commands menu"),
@@ -1771,6 +1773,23 @@ class WTreeApp(App):
             if isinstance(screen, ProgressScreen):
                 return
         self.push_screen(ProgressScreen(queue))
+
+    def action_show_last_op(self) -> None:
+        """Ctrl+O - open the read-only viewer for the most recent operation.
+
+        ``last_result`` holds the last completed :class:`OperationResult`
+        (set in :meth:`_on_plan_complete`); the viewer renders it without any
+        disk I/O. Nothing run yet -> flash a nudge (same idiom as Ctrl+P on an
+        idle queue). No-op if a viewer is already on the stack so spamming
+        Ctrl+O doesn't double-stack.
+        """
+        if self.last_result is None:
+            self.flash("No completed operation yet")
+            return
+        for screen in self.screen_stack:
+            if isinstance(screen, OperationResultScreen):
+                return
+        self.push_screen(OperationResultScreen(self.last_result))
 
     def action_help(self) -> None:
         """F1 / ``?`` / Help menu - open the About + keymap modal.

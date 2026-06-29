@@ -20,8 +20,9 @@ Coverage:
   result is FAILED with clear "unlink source after copy" message.
 * **Cross-fs SYMLINK**: target read + recreated at dst + source
   unlinked. No callback fires.
-* **Cross-fs DIR**: keeps ``shutil.move`` (no chunked path); plain
-  success, dst exists, source gone.
+* **Cross-fs DIR**: copytree + read-only-tolerant ``_rmtree_force``
+  (no chunked path); plain success, dst exists, source gone. The
+  read-only cleanup itself is covered in ``test_move_readonly``.
 * **apply_plan threading**: bytes_progress reaches ``_native_move``
   via ``apply_plan`` -> ``_apply_item`` -> MOVE branch.
 """
@@ -316,16 +317,16 @@ async def test_cross_fs_symlink_recreates_at_dst(
 
 
 # ---------------------------------------------------------------------------
-# Cross-fs DIR path (keeps shutil.move per scope decision)
+# Cross-fs DIR path (copytree + read-only-tolerant rmtree)
 # ---------------------------------------------------------------------------
 
 
-async def test_cross_fs_dir_keeps_shutil_move(
+async def test_cross_fs_dir_move_succeeds(
     tmp_path: Path,
     registry: dict[str, NativeSource],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """DIR cross-fs uses shutil.move (copytree + rmtree). No chunked path."""
+    """DIR cross-fs: copytree + read-only-tolerant rmtree. No chunked path."""
     src_dir = tmp_path / "sub"
     src_dir.mkdir()
     (src_dir / "a.txt").write_text("aaa")
@@ -356,8 +357,8 @@ async def test_cross_fs_dir_keeps_shutil_move(
     moved = dst_parent / "sub"
     assert (moved / "a.txt").read_text() == "aaa"
     assert (moved / "b.txt").read_text() == "bbb"
-    # NO bytes_progress fired - DIR path is shutil.move,
-    # no chunked hook. This is the documented gap.
+    # NO bytes_progress fired - the DIR path has no chunked hook
+    # (walked byte-progress for cross-fs dir moves stays parked).
     assert calls == []
 
 
