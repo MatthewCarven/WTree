@@ -41,6 +41,7 @@ from textual.coordinate import Coordinate
 from textual.message import Message
 from textual.widgets import DataTable
 
+from wtree.ops.base import to_posix
 from wtree.sources.base import Entry, EntrySource, Kind, ScanError
 from wtree.tagged_set import TaggedSet
 from wtree.widgets.scan_screen import SCAN_CHUNK_SIZE, ScanContext
@@ -224,6 +225,7 @@ class ContentsPane(DataTable):
             self._current_path = None
             return
 
+        path = to_posix(path)
         # Cursor preservation (design.md 2026-06-07): re-showing the SAME
         # path is a refresh (auto-refresh after ops, Ctrl+R, editor
         # return) - the cursor should stay put. Showing a DIFFERENT path
@@ -283,7 +285,7 @@ class ContentsPane(DataTable):
             self._row_paths.append("")
             self._row_kinds.append(None)
         for entry in entries:
-            full_path = os.path.join(path, entry.name)
+            full_path = to_posix(os.path.join(path, entry.name))
             tagged = self._tagged.contains(sid, full_path)
             marker = "*" if tagged else ""
             size = "<DIR>" if entry.kind is Kind.DIR else str(entry.size)

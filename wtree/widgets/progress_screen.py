@@ -61,6 +61,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Label, Static
 
+from wtree.ops.base import to_native
 from wtree.ops.queue import OperationQueue, PROGRESS_REDRAW_HZ
 
 
@@ -591,5 +592,5 @@ def _current_item(plan, items_done: int) -> Optional[str]:
     # Prefer dst_path for copies / moves (the user thinks of "where
     # it's going to"); src_path for deletes (no dst).
     if item.dst_path and item.dst_path != item.src_path:
-        return f"-> {item.dst_path}"
-    return item.src_path
+        return f"-> {to_native(item.dst_path)}"
+    return to_native(item.src_path)

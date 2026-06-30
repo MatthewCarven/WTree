@@ -178,3 +178,77 @@ def test_basename_drive_anchor_maps_to_empty(helper) -> None:
     assert helper("C:/") == ""
     assert helper("C:/x") == "x"
     assert helper("/foo/bar/") == "bar"
+
+
+# ---------------------------------------------------------------------------
+# Boundary-layer normalisation (2026-06-30, Session 3): paths born POSIX,
+# displayed native. POSIX-runnable via the explicit-sep helpers.
+# ---------------------------------------------------------------------------
+
+from wtree.ops.base import (  # noqa: E402
+    ItemResult,
+    ItemStatus,
+    OperationKind,
+    OperationResult,
+    Plan,
+    PlanItem,
+    to_native,
+    to_posix,
+)
+
+
+def test_to_posix_flips_backslashes() -> None:
+    assert to_posix("C:\\Users\\m\\proj") == "C:/Users/m/proj"
+    assert to_posix("C:/already/posix") == "C:/already/posix"
+
+
+def test_to_native_flips_on_windows_sep() -> None:
+    assert to_native("C:/Users/m/proj", sep="\\") == "C:\\Users\\m\\proj"
+
+
+def test_to_native_noop_on_posix_sep() -> None:
+    assert to_native("C:/Users/m/proj", sep="/") == "C:/Users/m/proj"
+
+
+def test_to_posix_to_native_round_trip_windows() -> None:
+    native = "C:\\Users\\m\\proj\\a.txt"
+    assert to_native(to_posix(native), sep="\\") == native
+
+
+def _pi(src: str, dst: str, kind: Kind = Kind.FILE) -> PlanItem:
+    return PlanItem(
+        src_source_id="native",
+        src_path=src,
+        dst_source_id="native",
+        dst_path=dst,
+        kind=kind,
+        size=0,
+    )
+
+
+def _result_for(kind: OperationKind, items: list[ItemResult]) -> OperationResult:
+    plan = Plan(kind=kind, items=[r.item for r in items])
+    return OperationResult(plan=plan, items=items)
+
+
+def test_touched_paths_stay_posix_so_they_match_tree_nodes() -> None:
+    """The bug this closes: tree node ``data`` is POSIX-flavoured (born
+    POSIX), but ``touched_paths`` used native ``os.path.dirname`` -> on
+    Windows the COPY destination parent came back backslashed and never
+    matched its tree node, so the destination folder didn't auto-refresh
+    after the copy. ``posixpath.dirname`` keeps the key POSIX, matching."""
+    res = _result_for(
+        OperationKind.COPY,
+        [ItemResult(item=_pi("C:/s/a.txt", "C:/d/sub/a.txt"), status=ItemStatus.SUCCESS)],
+    )
+    touched = res.touched_paths
+    assert "C:/d/sub" in touched
+    assert all("\\" not in p for p in touched)
+
+
+def test_touched_paths_move_reports_both_parents_posix() -> None:
+    res = _result_for(
+        OperationKind.MOVE,
+        [ItemResult(item=_pi("C:/s/x", "C:/d/x", kind=Kind.DIR), status=ItemStatus.SUCCESS)],
+    )
+    assert res.touched_paths == {"C:/s", "C:/d"}

@@ -53,6 +53,7 @@ from wtree.ops.base import (
     collapse_nested_tags,
     drive_anchor,
     resolve_relative_leaf,
+    to_native,
     to_posix,
 )
 from wtree.ops.conflicts import (
@@ -87,6 +88,7 @@ __all__ = [
     "collapse_nested_tags",
     "drive_anchor",
     "resolve_relative_leaf",
+    "to_native",
     "to_posix",
     "apply_plan",
     "plan_copy",

@@ -51,6 +51,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Label
 
 from wtree.ops.base import (
+    to_native,
     ConflictKind,
     PlanItem,
     Resolution,
@@ -248,7 +249,7 @@ class ConflictDialog(
         marker = ">" if i == self._cursor else " "
         res = _RES_LABEL[self._res[i]]
         existing = _EXISTING_LABEL.get(item.conflict, "?")
-        line = f"{marker} [{res:<9}]  {item.dst_path}  (existing: {existing})"
+        line = f"{marker} [{res:<9}]  {to_native(item.dst_path)}  (existing: {existing})"
         # Live preview: when this row will Rename, append the concrete target
         # (custom if edited, else the auto-suffix basename). Only RENAME rows
         # show it - Skip / Overwrite keep the bare line.

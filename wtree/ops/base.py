@@ -47,6 +47,19 @@ def to_posix(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def to_native(path: str, *, sep: str = os.sep) -> str:
+    """Flip POSIX forward slashes to the platform separator, for DISPLAY only.
+
+    The internal convention is POSIX-flavoured (:func:`to_posix`); user-facing
+    renders (the tree root label, dialog destination paths, the properties /
+    progress / conflict surfaces) flip back through here so a Windows user sees
+    the familiar ``C:\\Users\\...`` even though every stored path is
+    ``/``-separated. No-op when the platform separator already is ``/``. ``sep``
+    is a parameter purely so the Windows behaviour is unit-testable on POSIX.
+    """
+    return path.replace("/", sep) if sep == "\\" else path
+
+
 def canonical_path(
     path: str, *, case_insensitive: bool = _PATHS_CASE_INSENSITIVE
 ) -> str:
@@ -431,15 +444,15 @@ class OperationResult:
                 continue
             item = r.item
             if kind is OperationKind.COPY or kind is OperationKind.MAKE_NEW:
-                paths.add(os.path.dirname(item.dst_path))
+                paths.add(posixpath.dirname(item.dst_path))
             elif kind is OperationKind.DELETE:
-                paths.add(os.path.dirname(item.src_path))
+                paths.add(posixpath.dirname(item.src_path))
             elif kind is OperationKind.MOVE:
-                paths.add(os.path.dirname(item.src_path))
-                paths.add(os.path.dirname(item.dst_path))
+                paths.add(posixpath.dirname(item.src_path))
+                paths.add(posixpath.dirname(item.dst_path))
             elif kind is OperationKind.RENAME:
                 # Planner guarantees same-parent rename.
-                paths.add(os.path.dirname(item.src_path))
+                paths.add(posixpath.dirname(item.src_path))
         # Empty strings can sneak in for paths with no parent component
         # (theoretically only at the filesystem root, which has no
         # children to refresh anyway). Drop them so callers don't have

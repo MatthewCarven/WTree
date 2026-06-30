@@ -18,7 +18,7 @@ Sequenced plan for the open backlog below. Ordering respects dependencies (norma
 - **Verify:** viewer pilot tests + oplog verbose-mode units.
 - **Why here:** self-contained, good-momentum item; no dependencies.
 
-### Session 3 — Boundary-layer path normalisation (panes born POSIX-flavoured)
+### Session 3 — Boundary-layer path normalisation (panes born POSIX-flavoured) — DONE 2026-06-30
 - **Primary:** Normalise paths at the pane/boundary layer so the planner-level backslash fixes become belt-and-suspenders, mixed-separator display cleans up, and Windows `touched_paths`↔tree-node refresh matching stops depending on separator luck. [todo: Ops/queue-era backslash item's parked follow-up]
 - **Also:** spot-check UNC-path ascend on real Windows [Ascend-era]; decide symlink-at-root realpath-vs-literal and document [Ascend-era].
 - **Verify:** boundary-level pins added to `test_windows_paths.py` (still POSIX-runnable).
@@ -299,6 +299,8 @@ The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-
 - [x] **Sort/label polish in the chooser. DONE 2026-06-07** — `anchor_details` (ctypes volume label on Windows, `shutil.disk_usage` free-of-total, all best-effort) + `friendly_anchor_name` ~ fold (display-only); decoration loads async after the modal paints so a dead share can't freeze it. Drive-switching era closed.
 
 ## Normalisation-era follow-ups
+
+- [x] **Boundary-layer normalisation (panes born POSIX). DONE 2026-06-30 (Session 3).** Closed the follow-up parked in the 2026-06-11 backslash fix. Paths are now born POSIX-flavoured at every entry point: both panes' child joins (`to_posix(os.path.join(...))`), `TreePane` root/`re_root`/`reveal_path`, `WTreeApp._root_path` at all four assignment sites (ctor / ascend / L-prompt / switch-drive) + the find-tree walk, and `OperationResult.touched_paths` (now `posixpath.dirname`). **Fixes the concrete bug:** `refresh_paths` matches `node.data in touched_paths` by exact string, so on Windows the Copy/Move *destination* tree node (native-backslash `data`) never matched its `posixpath`-joined dst key and didn't auto-refresh. Display flips back to native via new `to_native(path, *, sep=os.sep)` at the tree root label, Properties, progress, conflict-dialog rows, and the Copy/Move + Delete dialog headers/bodies. OS calls unaffected (executor already flips dst to native; sources accept `/`). Destination picker + `drive_anchor` left native by design (picker shows native, round-trips via boundary `to_posix`). Planner `to_posix` calls are now belt-and-suspenders. 7 POSIX-runnable pins in `test_windows_paths.py`; verified green across the whole path/widget/e2e surface (~600+ tests run in chunks). **Decisions (Matthew): full born-POSIX scope; native display flip.**
 
 - [ ] **Cross-*source* path translation.** `to_posix` / `canonical_path` assume one filesystem's identity rules (single-convention, POSIX-flavoured). When a second source type lands (ArchiveSource, remote/SFTP), copying or moving *between* sources will need explicit per-source path translation at the boundary — a zip's `/`-internal paths vs native, a remote's POSIX paths vs a Windows native destination, etc. Deferred until a second source actually exists.
 

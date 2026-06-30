@@ -54,6 +54,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Label, Static
 
 from wtree._owner import lookup as _owner_lookup
+from wtree.ops.base import to_native
 from wtree.sources.base import ISO_DATE_FORMAT, Kind
 from wtree.tagged_set import Tag
 
@@ -193,9 +194,9 @@ class PropertiesScreen(ModalScreen[None]):
         if self._mode == "tagged" and self._tagged is not None:
             return f"Properties  -  {len(self._tagged.tags)} tagged item(s)"
         if self._mode == "file" and self._file is not None:
-            return f"Properties  -  {self._file.path}"
+            return f"Properties  -  {to_native(self._file.path)}"
         if self._mode == "dir" and self._dir is not None:
-            return f"Properties  -  {self._dir.path}"
+            return f"Properties  -  {to_native(self._dir.path)}"
         return "Properties"
 
     def _hint_text(self) -> str:
@@ -310,7 +311,7 @@ def _render_file(props: FileProps) -> Text:
     t = Text()
     t.append("File", style="bold underline")
     t.append("\n\n")
-    _row(t, "Path", props.path)
+    _row(t, "Path", to_native(props.path))
     _row(t, "Name", os.path.basename(props.path.rstrip(os.sep)) or props.path)
     _row(t, "Kind", props.kind.value)
 
@@ -367,7 +368,7 @@ def _render_dir_identity(props: DirProps) -> Text:
     t = Text()
     t.append("Directory", style="bold underline")
     t.append("\n\n")
-    _row(t, "Path", props.path)
+    _row(t, "Path", to_native(props.path))
     _row(
         t,
         "Name",

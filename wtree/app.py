@@ -80,6 +80,7 @@ from wtree.ops import (
     preview_renamed_dst,
     resolve_conflicts,
     select_range_for_rename,
+    to_native,
     to_posix,
 )
 from wtree.ops.base import drive_anchor
@@ -212,7 +213,7 @@ class WTreeApp(App):
     ) -> None:
         super().__init__()
         self._source = source if source is not None else NativeSource()
-        self._root_path = (
+        self._root_path = to_posix(
             os.path.abspath(root_path) if root_path is not None else os.getcwd()
         )
         self.tagged_set = TaggedSet()
@@ -663,7 +664,7 @@ class WTreeApp(App):
             try:
                 async for item in self._source.scan(current):
                     if isinstance(item, _Entry):
-                        child = os.path.join(current, item.name)
+                        child = to_posix(os.path.join(current, item.name))
                         yield child
                         if item.kind is Kind.DIR:
                             stack.append(child)
@@ -931,7 +932,7 @@ class WTreeApp(App):
         default_dest = contents.current_path or self._root_path
         title = (
             f"{verb} {len(tags)} tagged item(s) to:" if len(tags) > 1
-            else f"{verb} {tags[0].path} to:"
+            else f"{verb} {to_native(tags[0].path)} to:"
         )
         # Destination prompt with a browse affordance. Ctrl+B opens the
         # DirPickerScreen rooted at the current drive/share; the chosen dir is
@@ -1087,9 +1088,9 @@ class WTreeApp(App):
 
         title = (
             f"{verb} {len(tags)} tagged item(s)?" if len(tags) > 1
-            else f"{verb} {tags[0].path}?"
+            else f"{verb} {to_native(tags[0].path)}?"
         )
-        body = [t.path for t in tags]
+        body = [to_native(t.path) for t in tags]
         confirmed = await self.push_screen_wait(
             ConfirmDialog(title=title, body=body)
         )
@@ -1131,7 +1132,7 @@ class WTreeApp(App):
                 f"into their tagged parent(s)."
             )
 
-        body_paths = [t.path for t in tags[:3]]
+        body_paths = [to_native(t.path) for t in tags[:3]]
         body = ", ".join(body_paths)
         if len(tags) > 3:
             body += f", ... (+{len(tags) - 3} more)"
@@ -1202,7 +1203,7 @@ class WTreeApp(App):
         survive because they're stored as absolute paths.
         """
         old_root = self._root_path
-        new_root = os.path.dirname(old_root)
+        new_root = to_posix(os.path.dirname(old_root))
         if not new_root or new_root == old_root:
             self.flash(f"Already at the filesystem root ({old_root}).", severity="warning")
             return
@@ -1335,7 +1336,7 @@ class WTreeApp(App):
             candidate = os.path.normpath(
                 os.path.join(self._root_path, candidate)
             )
-        candidate = os.path.abspath(candidate)
+        candidate = to_posix(os.path.abspath(candidate))
 
         if not os.path.exists(candidate):
             self.flash(f"Log: path doesn't exist: {candidate}", severity="error")
@@ -1386,7 +1387,7 @@ class WTreeApp(App):
         if not os.path.isdir(picked):
             self.flash(f"Switch drive: not available: {picked}", severity="error")
             return
-        self._root_path = picked
+        self._root_path = to_posix(picked)
         tree = self.query_one(TreePane)
         await self._run_scan_with_dialog(
             picked,

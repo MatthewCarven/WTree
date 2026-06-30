@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import posixpath
 from collections.abc import Iterable, Iterator
 
 from rich.style import Style
@@ -57,6 +58,7 @@ from textual.message import Message
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
+from wtree.ops.base import to_native, to_posix
 from wtree.sources.base import EntrySource
 from wtree.tagged_set import TaggedSet
 from wtree.widgets.scan_screen import ScanContext, populate_dir_node
@@ -121,10 +123,10 @@ class TreePane(Tree[str]):
         *,
         id: str | None = None,  # noqa: A002 — Textual API uses ``id``
     ) -> None:
-        root_path = os.path.abspath(root_path)
+        root_path = to_posix(os.path.abspath(root_path))
         # ``Tree`` is parameterised by the data type; the root label is the
         # absolute path so the user can see where they are at a glance.
-        super().__init__(label=root_path, data=root_path, id=id)
+        super().__init__(label=to_native(root_path), data=root_path, id=id)
         self._source = source
         # The pane borrows a reference to the tagged set; ownership lives
         # on ``WTreeApp`` so it outlives any pane mount/unmount cycle.
@@ -452,6 +454,7 @@ class TreePane(Tree[str]):
         Factored on top of :meth:`_walk_to_node` so the walk-down
         logic is shared with the refresh-all flow.
         """
+        target = to_posix(target)
         node = await self._walk_to_node(target)
         if node is None:
             return False
@@ -490,7 +493,7 @@ class TreePane(Tree[str]):
                 current.expand()
             await self._populate(current)
             await asyncio.sleep(0)
-            next_path = os.path.join(current_path, part)
+            next_path = posixpath.join(current_path, part)
             child_found = None
             for child in current.children:
                 if child.data == next_path:
@@ -550,7 +553,7 @@ class TreePane(Tree[str]):
                 expanded_paths.append(node.data)
         # Sort shallowest-first by path-separator count so /a is
         # processed before /a/b.
-        expanded_paths.sort(key=lambda p: p.count(os.sep))
+        expanded_paths.sort(key=lambda p: p.count("/"))
 
         # Snapshot cursor's backing path.
         cursor_node = self.cursor_node
@@ -616,9 +619,9 @@ class TreePane(Tree[str]):
         :meth:`_populate` so a slow scan of the new root's children
         surfaces the scan dialog and can be cancelled with Esc.
         """
-        new_root_path = os.path.abspath(new_root_path)
+        new_root_path = to_posix(os.path.abspath(new_root_path))
         self.root.remove_children()
-        self.root.set_label(new_root_path)
+        self.root.set_label(to_native(new_root_path))
         self.root.data = new_root_path
         self._loaded.clear()
         await self._populate(self.root, ctx=ctx)
