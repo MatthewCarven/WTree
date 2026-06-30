@@ -53,6 +53,7 @@ Modal contract:
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import re
 from dataclasses import dataclass
@@ -72,7 +73,28 @@ from wtree.widgets.search_bar import SearchBar
 
 # Hard ceiling - reads above this size are refused. 10 MB is generous
 # for a text file; anything bigger probably wants the user's $PAGER.
-MAX_BYTES: int = 10 * 1024 * 1024
+MAX_BYTES: int = 4 * 1024 * 1024  # default per-page / initial read (4 MiB)
+
+#: Env override for the per-page read size. A file at or under this loads
+#: fully on open; a larger one loads the first page and "m" pulls the next.
+VIEW_MAX_BYTES_ENV = "WTREE_VIEW_MAX_BYTES"
+
+
+def _max_bytes() -> int:
+    """Per-page byte budget, from :data:`VIEW_MAX_BYTES_ENV` or the default.
+
+    A bad / non-positive value falls back to :data:`MAX_BYTES` rather than
+    breaking the viewer (config must never make a file unviewable).
+    """
+    raw = os.environ.get(VIEW_MAX_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return MAX_BYTES
 
 # How many bytes to peek at for the binary-detection heuristic.
 _PEEK_BYTES: int = 8 * 1024
@@ -104,7 +126,7 @@ _SCROLL_CONTEXT: int = 2
 
 _HINT_DEFAULT: str = (
     "Esc / Q close   -   arrows / PgUp PgDn / Home End scroll   -   "
-    "/ search   -   h highlight"
+    "/ search   -   h highlight   -   m more   -   x hex"
 )
 _HINT_SEARCH: str = (
     "n / N next / prev match   -   Esc clear search   -   Q close"
@@ -123,8 +145,12 @@ class _LoadResult:
     text: str = ""
     refusal: str = ""
     encoding: str = ""
-    byte_size: int = 0
+    byte_size: int = 0      # total file size
     lexer: str = ""
+    loaded_bytes: int = 0   # bytes actually read (<= byte_size)
+    truncated: bool = False # byte_size > loaded_bytes (more to load)
+    is_binary: bool = False # NUL bytes seen -> default to hex view
+    data: bytes = b""       # the loaded raw bytes (for hex mode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +271,46 @@ def gutter_width(n_lines: int) -> int:
     return len(str(max(1, n_lines)))
 
 
+_HEX_BYTES_PER_ROW = 16
+
+
+def hex_lines(data: bytes, *, base: int = 0) -> "list[Text]":
+    """Classic hex dump: ``OFFSET  HH HH ... HH  |ascii|``, 16 bytes/row.
+
+    Pure (testable). ``base`` is the byte offset of ``data[0]`` in the file
+    (0 for the first page). Non-printable bytes render as ``.`` in the ASCII
+    gutter. Returns one ``Text`` per row; the offset column is the row's own
+    gutter, so the body renders these WITHOUT the line-number gutter.
+    """
+    out: "list[Text]" = []
+    for i in range(0, len(data), _HEX_BYTES_PER_ROW):
+        chunk = data[i : i + _HEX_BYTES_PER_ROW]
+        hexpart = " ".join(f"{b:02x}" for b in chunk)
+        # Pad the hex column so the ASCII gutter lines up on short last rows.
+        hexpart = f"{hexpart:<{_HEX_BYTES_PER_ROW * 3 - 1}}"
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append(Text(f"{base + i:08x}  {hexpart}  |{ascii_part}|"))
+    return out
+
+
+def _stat_refusal(path: str, exc: OSError) -> str:
+    """Friendlier message for a failed ``os.stat`` on a symlink.
+
+    A dangling link (``ENOENT``) names the missing target; a symlink loop
+    (``ELOOP``) says so plainly. Everything else keeps the generic message.
+    """
+    if os.path.islink(path):
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = "?"
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            return f"Symlink loop: {path} does not resolve to a real file."
+        if isinstance(exc, FileNotFoundError):
+            return f"Symlink target missing: {target}"
+    return f"Could not stat file: {type(exc).__name__}: {exc}"
+
+
 def render_body(
     lines: "list[Text]",
     line_starts: "list[int]",
@@ -252,6 +318,7 @@ def render_body(
     match_idx: int,
     *,
     gutter_w: int,
+    gutter: bool = True,
 ) -> "Text":
     """Assemble the body ``Text`` - ``<gutter> <line>`` per row, with the
     search-match spans overlaid using line-relative columns (so the gutter
@@ -262,8 +329,9 @@ def render_body(
     body = Text()
     n = len(lines)
     for i, line_text in enumerate(lines):
-        body.append(f"{i + 1:>{gutter_w}}", style=_GUTTER_STYLE)
-        body.append(_GUTTER_SEP, style=_GUTTER_STYLE)
+        if gutter:
+            body.append(f"{i + 1:>{gutter_w}}", style=_GUTTER_STYLE)
+            body.append(_GUTTER_SEP, style=_GUTTER_STYLE)
         lt = line_text.copy()
         if i in by_line:
             base = line_starts[i] if i < len(line_starts) else 0
@@ -343,6 +411,8 @@ class ViewerScreen(ModalScreen[None]):
         Binding("n", "next_match", "Next match"),
         Binding("N", "prev_match", "Prev match"),
         Binding("h", "toggle_highlight", "Highlight"),
+        Binding("m", "load_more", "Load more"),
+        Binding("x", "toggle_hex", "Hex view"),
     ]
 
     def __init__(self, path: str) -> None:
@@ -367,6 +437,10 @@ class ViewerScreen(ModalScreen[None]):
         self._disp_lines: "list[Text]" = []
         self._line_starts: "list[int]" = []
         self._gutter_w: int = 1
+        # Paging + view-mode state (2026-06-30). ``_limit`` is the byte budget
+        # read so far; ``m`` grows it. ``_render_mode`` is "text" or "hex".
+        self._limit: int = MAX_BYTES
+        self._render_mode: str = "text"
 
     def compose(self) -> ComposeResult:
         # Outer container - dock the header at top, hint at bottom, with
@@ -379,17 +453,25 @@ class ViewerScreen(ModalScreen[None]):
             yield SearchBar(id="viewer-search")
 
     async def on_mount(self) -> None:
-        # Run the file load off the event loop. Even a 5 MB read
-        # blocks for a non-trivial slice on a slow disk.
-        result = await asyncio.to_thread(_load_file_sync, self._path)
-        self._loaded = result
-        await self._render_load_result(result)
+        self._limit = _max_bytes()
+        await self._load()
         # Focus the scroll container so arrow / PgUp scrolling and the
-        # screen bindings (/, n, N, Esc, q) all reach the viewer.
+        # screen bindings all reach the viewer.
         try:
             self.query_one("#viewer-scroll", VerticalScroll).focus()
         except Exception:  # noqa: BLE001 - torn down before mount finished
             pass
+
+    async def _load(self) -> None:
+        """(Re)load up to ``self._limit`` bytes off the event loop, then
+        render. A binary file defaults to the hex view."""
+        result = await asyncio.to_thread(
+            _load_file_sync, self._path, limit=self._limit
+        )
+        self._loaded = result
+        if not result.refusal:
+            self._render_mode = "hex" if result.is_binary else "text"
+        await self._render_load_result(result)
 
     async def _render_load_result(self, result: _LoadResult) -> None:
         """Populate the body and update the header with the load result."""
@@ -407,7 +489,7 @@ class ViewerScreen(ModalScreen[None]):
 
         # Successful load. Highlight by default only up to the size cap;
         # bigger files open plain and the user can force it with ``h``.
-        self._highlight_on = result.byte_size <= HIGHLIGHT_MAX_BYTES
+        self._highlight_on = result.loaded_bytes <= HIGHLIGHT_MAX_BYTES
         self._prepare_body()
         self._update_header()
         # Single rendering path (with no matches yet) - the body is a literal
@@ -420,8 +502,13 @@ class ViewerScreen(ModalScreen[None]):
 
     @property
     def _searchable(self) -> bool:
-        """True once a successful (non-refusal) text load is present."""
-        return self._loaded is not None and not self._loaded.refusal
+        """True once a successful text load is present AND we're in text mode
+        (search runs over the decoded text, not the hex dump)."""
+        return (
+            self._loaded is not None
+            and not self._loaded.refusal
+            and self._render_mode == "text"
+        )
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -441,15 +528,20 @@ class ViewerScreen(ModalScreen[None]):
             body = self.query_one("#viewer-body", Static)
         except Exception:  # noqa: BLE001
             return
-        body.update(
-            render_body(
-                self._disp_lines,
-                self._line_starts,
-                self._matches,
-                self._match_idx,
-                gutter_w=self._gutter_w,
+        if self._render_mode == "hex":
+            body.update(
+                render_body(self._disp_lines, [], [], 0, gutter_w=0, gutter=False)
             )
-        )
+        else:
+            body.update(
+                render_body(
+                    self._disp_lines,
+                    self._line_starts,
+                    self._matches,
+                    self._match_idx,
+                    gutter_w=self._gutter_w,
+                )
+            )
 
     def _prepare_body(self) -> None:
         """Recompute the cached per-line Texts + line-start offsets + gutter
@@ -457,6 +549,11 @@ class ViewerScreen(ModalScreen[None]):
         Pygments pass (the only costly part) only runs when highlighting is
         actually on and the file has a known lexer."""
         if self._loaded is None or self._loaded.refusal:
+            return
+        if self._render_mode == "hex":
+            self._disp_lines = hex_lines(self._loaded.data)
+            self._line_starts = []
+            self._gutter_w = 0
             return
         text = self._loaded.text
         self._line_starts = line_start_offsets(text)
@@ -478,14 +575,21 @@ class ViewerScreen(ModalScreen[None]):
                 f"{self._path}  -  {self._loaded.refusal.splitlines()[0]}"
             )
             return
-        lex = self._loaded.lexer or "plain"
-        if lex in ("text", "default"):
-            lex = "plain"
-        state = "" if (self._highlight_on and lex != "plain") else "  -  hl off"
-        header.update(
-            f"{self._path}  -  {_human_bytes(self._loaded.byte_size)}"
-            f"  -  {self._loaded.encoding}  -  {lex}{state}"
-        )
+        parts = [self._path, _human_bytes(self._loaded.byte_size)]
+        if self._loaded.truncated:
+            parts.append(
+                f"showing {_human_bytes(self._loaded.loaded_bytes)} (m=more)"
+            )
+        parts.append(self._loaded.encoding)
+        if self._render_mode == "hex":
+            parts.append("hex")
+        else:
+            lex = self._loaded.lexer or "plain"
+            if lex in ("text", "default"):
+                lex = "plain"
+            state = "" if (self._highlight_on and lex != "plain") else " (hl off)"
+            parts.append(f"{lex}{state}")
+        header.update("  -  ".join(parts))
 
     def action_toggle_highlight(self) -> None:
         """``h`` - toggle syntax highlighting (forces it on for a big file
@@ -497,6 +601,39 @@ class ViewerScreen(ModalScreen[None]):
         self._prepare_body()
         self._update_header()
         self._apply_highlights()
+
+    async def action_load_more(self) -> None:
+        """``m`` - pull the next page of a truncated file, keeping the view
+        where it is so the freshly-loaded content appears below."""
+        if self._loaded is None or self._loaded.refusal or not self._loaded.truncated:
+            return
+        try:
+            scroll = self.query_one("#viewer-scroll", VerticalScroll)
+            y = int(scroll.scroll_y)
+        except Exception:  # noqa: BLE001
+            y = 0
+        self._limit += _max_bytes()
+        await self._load()
+        try:
+            self.query_one("#viewer-scroll", VerticalScroll).scroll_to(
+                y=y, animate=False
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_toggle_hex(self) -> None:
+        """``x`` - flip between the decoded text view and a hex dump of the
+        loaded bytes. Clears any active search (it runs over text, not hex)."""
+        if self._loaded is None or self._loaded.refusal:
+            return
+        self._render_mode = "hex" if self._render_mode == "text" else "text"
+        self._matches = []
+        self._match_idx = 0
+        self._committed = False
+        self._prepare_body()
+        self._update_header()
+        self._apply_highlights()
+        self._set_hint(_HINT_DEFAULT)
 
     def _scroll_to_current(self) -> None:
         """Scroll so the current match's line is in view (with context)."""
@@ -673,75 +810,42 @@ class ViewerScreen(ModalScreen[None]):
 # ---------------------------------------------------------------------------
 
 
-def _load_file_sync(path: str) -> _LoadResult:
-    """Load ``path`` for viewing - returns text or a refusal reason.
+def _load_file_sync(path: str, *, limit: int) -> _LoadResult:
+    """Load up to ``limit`` bytes of ``path`` for viewing.
 
-    Heuristics in order:
-
-    1. ``os.stat`` failure -> refusal ("could not stat: ...").
-    2. Size > :data:`MAX_BYTES` -> refusal ("too large").
-    3. Peek first 8 KB for NUL bytes -> binary refusal.
-    4. Read full bytes; decode as UTF-8.
-    5. UnicodeDecodeError -> fall back to latin-1 (always succeeds; a
-       full 256-byte mapping has no invalid sequences).
-
-    The function never raises - every failure mode becomes a refusal
-    string that the viewer displays in place of file content.
+    No hard size refusal any more (2026-06-30): a file larger than ``limit``
+    loads its first ``limit`` bytes with ``truncated=True``, and the viewer's
+    "m" key pulls the next page by re-loading with a bigger ``limit``. Binary
+    files (NUL bytes, no text BOM) are NOT refused either - they load their
+    bytes and default to the hex view. The function never raises; failures
+    become a refusal string.
     """
     try:
         st = os.stat(path)
     except OSError as exc:
-        return _LoadResult(
-            refusal=f"Could not stat file: {type(exc).__name__}: {exc}"
-        )
+        return _LoadResult(refusal=_stat_refusal(path, exc))
 
     size = st.st_size
-    if size > MAX_BYTES:
-        return _LoadResult(
-            byte_size=size,
-            refusal=(
-                f"File is {_human_bytes(size)}, larger than the viewer's "
-                f"{_human_bytes(MAX_BYTES)} limit.\n\n"
-                "Use $PAGER (e.g. less, more) externally to view this file."
-            ),
-        )
-
-    # Peek for binary content. We open in binary mode so we can sniff
-    # bytes without decoding tripping up first.
+    loaded = min(size, limit)
     try:
         with open(path, "rb") as fh:
-            peek = fh.read(_PEEK_BYTES)
+            data = fh.read(loaded)
     except OSError as exc:
         return _LoadResult(
             byte_size=size,
             refusal=f"Could not read file: {type(exc).__name__}: {exc}",
         )
+    loaded = len(data)
+    truncated = size > loaded
 
+    peek = data[:_PEEK_BYTES]
     bom = _detect_bom(peek)
-    if bom is None and b"\x00" in peek:
-        return _LoadResult(
-            byte_size=size,
-            refusal=(
-                "This file looks binary (contains NUL bytes).\n\n"
-                "The built-in viewer is text-only; a hex view is "
-                "post-v0 work. Open externally if you need to inspect "
-                "the bytes."
-            ),
-        )
-
-    # Read the full bytes - the size check above guarantees this is bounded.
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        return _LoadResult(
-            byte_size=size,
-            refusal=f"Could not read file: {type(exc).__name__}: {exc}",
-        )
+    is_binary = bom is None and b"\x00" in peek
 
     # Decode. A recognised BOM picks the codec; otherwise UTF-8 with a
-    # latin-1 fallback (which has a total decoding, so the viewer never
-    # crashes on funny bytes).
+    # latin-1 fallback (total decoding, so the viewer never crashes). When the
+    # read was truncated mid-UTF-8 character, drop the trailing partial bytes
+    # rather than mislabelling the whole file latin-1.
     if bom == "utf-8-sig":
         text = data.decode("utf-8-sig")
         encoding = "utf-8 (BOM)"
@@ -756,17 +860,30 @@ def _load_file_sync(path: str) -> _LoadResult:
         encoding = "utf-8"
         try:
             text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            encoding = "latin-1 (fallback)"
-            text = data.decode("latin-1")
+        except UnicodeDecodeError as e:
+            if truncated and e.start >= len(data) - 3:
+                text = data[: e.start].decode("utf-8")  # split char at the page edge
+            else:
+                encoding = "latin-1 (fallback)"
+                text = data.decode("latin-1")
 
-    try:
-        lexer = Syntax.guess_lexer(path, code=text)
-    except Exception:  # noqa: BLE001 - never let lexer guessing break a load
+    if is_binary:
         lexer = "default"
+    else:
+        try:
+            lexer = Syntax.guess_lexer(path, code=text)
+        except Exception:  # noqa: BLE001 - never let lexer guessing break a load
+            lexer = "default"
 
     return _LoadResult(
-        text=text, encoding=encoding, byte_size=size, lexer=lexer
+        text=text,
+        encoding=encoding,
+        byte_size=size,
+        lexer=lexer,
+        loaded_bytes=loaded,
+        truncated=truncated,
+        is_binary=is_binary,
+        data=data,
     )
 
 

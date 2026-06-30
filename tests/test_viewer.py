@@ -17,6 +17,9 @@ from wtree.widgets.viewer import (
 
 
 # ---------------------------------------------------------------------------
+_BIG = 64 * 1024 * 1024  # generous per-page limit so small test files load fully
+
+
 # _load_file_sync - happy paths
 # ---------------------------------------------------------------------------
 
@@ -24,7 +27,7 @@ from wtree.widgets.viewer import (
 def test_load_utf8_text_file(tmp_path: Path) -> None:
     f = tmp_path / "hello.txt"
     f.write_text("hello world\nsecond line\n", encoding="utf-8")
-    result = _load_file_sync(str(f))
+    result = _load_file_sync(str(f), limit=_BIG)
     assert result.refusal == ""
     assert result.text == "hello world\nsecond line\n"
     assert result.encoding == "utf-8"
@@ -36,7 +39,7 @@ def test_load_unicode_content_decodes_clean(tmp_path: Path) -> None:
     """Emoji + accented chars decode as UTF-8 without falling back."""
     f = tmp_path / "unicode.txt"
     f.write_text("café résumé 🐍", encoding="utf-8")
-    result = _load_file_sync(str(f))
+    result = _load_file_sync(str(f), limit=_BIG)
     assert result.refusal == ""
     assert result.encoding == "utf-8"
     assert "café" in result.text and "🐍" in result.text
@@ -48,7 +51,7 @@ def test_load_falls_back_to_latin1_for_invalid_utf8(tmp_path: Path) -> None:
     f = tmp_path / "latin.txt"
     # 0xff is invalid as a UTF-8 start byte; in latin-1 it's ÿ.
     f.write_bytes(b"plain ASCII\nthen \xff weird\n")
-    result = _load_file_sync(str(f))
+    result = _load_file_sync(str(f), limit=_BIG)
     assert result.refusal == ""
     assert "fallback" in result.encoding
     assert "weird" in result.text
@@ -59,32 +62,42 @@ def test_load_falls_back_to_latin1_for_invalid_utf8(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_load_refuses_binary_with_nul_bytes(tmp_path: Path) -> None:
+def test_load_binary_is_not_refused_and_flagged(tmp_path: Path) -> None:
+    """Binary files used to be refused; now they load (no refusal), are
+    flagged ``is_binary`` (the viewer defaults them to the hex view), and
+    keep their raw bytes for that view."""
     f = tmp_path / "binary.bin"
     f.write_bytes(b"ELF\x00\x01\x02\x03some binary garbage")
-    result = _load_file_sync(str(f))
-    assert result.refusal
-    assert "binary" in result.refusal.lower()
-    assert result.text == ""
+    result = _load_file_sync(str(f), limit=_BIG)
+    assert result.refusal == ""
+    assert result.is_binary is True
+    assert result.data.startswith(b"ELF\x00")
 
 
-def test_load_refuses_oversize_file(tmp_path: Path, monkeypatch) -> None:
-    """We can't easily allocate a 10 MB temp file in a test; lower
-    MAX_BYTES via monkeypatch to a tiny threshold and use a small file."""
+def test_load_oversize_truncates_not_refuses(tmp_path: Path) -> None:
+    """A file larger than the per-page limit is NOT refused any more - it
+    loads the first ``limit`` bytes with ``truncated=True`` (the viewer's
+    ``m`` key pulls the rest)."""
     f = tmp_path / "big.txt"
     f.write_text("x" * 100, encoding="utf-8")
-    # Patch the module constant in place.
-    import wtree.widgets.viewer as viewer_mod
-    monkeypatch.setattr(viewer_mod, "MAX_BYTES", 50)
-    result = _load_file_sync(str(f))
-    assert result.refusal
-    assert "larger than" in result.refusal.lower()
-    # byte_size is reported even on refusal.
+    result = _load_file_sync(str(f), limit=40)
+    assert result.refusal == ""
+    assert result.truncated is True
+    assert result.loaded_bytes == 40
     assert result.byte_size == 100
+    assert len(result.text) == 40
+
+
+def test_load_full_when_under_limit(tmp_path: Path) -> None:
+    f = tmp_path / "small.txt"
+    f.write_text("x" * 30, encoding="utf-8")
+    result = _load_file_sync(str(f), limit=40)
+    assert result.truncated is False
+    assert result.loaded_bytes == 30
 
 
 def test_load_refuses_missing_file(tmp_path: Path) -> None:
-    result = _load_file_sync(str(tmp_path / "no-such-file"))
+    result = _load_file_sync(str(tmp_path / "no-such-file"), limit=_BIG)
     assert result.refusal
     assert "could not stat" in result.refusal.lower()
 
@@ -103,7 +116,7 @@ def test_load_refuses_unreadable_file(tmp_path: Path, monkeypatch) -> None:
 
     import builtins
     monkeypatch.setattr(builtins, "open", explosive_open)
-    result = _load_file_sync(str(f))
+    result = _load_file_sync(str(f), limit=_BIG)
     assert result.refusal
     assert "could not read" in result.refusal.lower()
 
@@ -136,8 +149,9 @@ async def test_viewer_screen_displays_file_contents(tmp_path: Path) -> None:
         assert "line two" in rendered
 
 
-async def test_viewer_screen_renders_binary_refusal(tmp_path: Path) -> None:
-    """Pushing a viewer at a binary file shows the refusal text in the body."""
+async def test_viewer_screen_binary_defaults_to_hex(tmp_path: Path) -> None:
+    """A binary file opens directly in the hex view (offset + bytes + ascii),
+    not a refusal."""
     f = tmp_path / "blob.bin"
     f.write_bytes(b"hello\x00world\x00")
 
@@ -149,10 +163,13 @@ async def test_viewer_screen_renders_binary_refusal(tmp_path: Path) -> None:
         await pilot.pause()
         await pilot.pause()
 
+        screen = app.screen
+        assert screen._render_mode == "hex"
         from textual.widgets import Static
-        body = app.screen.query_one("#viewer-body", Static)
-        rendered = str(body.render())
-        assert "binary" in rendered.lower()
+        rendered = str(app.screen.query_one("#viewer-body", Static).render())
+        # An offset column + the ascii gutter for "hello.world."
+        assert "00000000" in rendered
+        assert "hello.world." in rendered
 
 
 async def test_viewer_screen_esc_dismisses(tmp_path: Path) -> None:
@@ -206,7 +223,7 @@ def test_detect_bom() -> None:
 def test_load_utf8_bom_is_stripped(tmp_path: Path) -> None:
     f = tmp_path / "bom.txt"
     f.write_bytes(b"\xef\xbb\xbfhello\n")
-    r = _load_file_sync(str(f))
+    r = _load_file_sync(str(f), limit=_BIG)
     assert r.refusal == ""
     assert r.text == "hello\n"          # BOM stripped by utf-8-sig
     assert "BOM" in r.encoding
@@ -217,7 +234,7 @@ def test_load_utf16_not_refused_as_binary(tmp_path: Path) -> None:
     binary heuristic so it decodes as text instead of being refused."""
     f = tmp_path / "u16.txt"
     f.write_bytes("hello\nworld\n".encode("utf-16"))  # BOM + interleaved NULs
-    r = _load_file_sync(str(f))
+    r = _load_file_sync(str(f), limit=_BIG)
     assert r.refusal == ""
     assert r.text == "hello\nworld\n"
     assert "utf-16" in r.encoding
@@ -226,13 +243,13 @@ def test_load_utf16_not_refused_as_binary(tmp_path: Path) -> None:
 def test_load_guesses_python_lexer(tmp_path: Path) -> None:
     f = tmp_path / "code.py"
     f.write_text("def f():\n    return 1\n", encoding="utf-8")
-    assert _load_file_sync(str(f)).lexer == "python"
+    assert _load_file_sync(str(f), limit=_BIG).lexer == "python"
 
 
 def test_load_txt_is_plain_lexer(tmp_path: Path) -> None:
     f = tmp_path / "notes.txt"
     f.write_text("just text\n", encoding="utf-8")
-    assert _load_file_sync(str(f)).lexer in ("text", "default")
+    assert _load_file_sync(str(f), limit=_BIG).lexer in ("text", "default")
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +358,100 @@ async def test_big_file_defaults_highlight_off(tmp_path: Path, monkeypatch) -> N
         await pilot.pause()
         await pilot.pause()
         assert app.screen._highlight_on is False   # auto-capped
+
+
+# ---------------------------------------------------------------------------
+# Paging / hex / config / symlink (2026-06-30, Session 6)
+# ---------------------------------------------------------------------------
+
+import os as _os  # noqa: E402
+
+import pytest as _pytest  # noqa: E402
+
+
+def test_max_bytes_env_override(monkeypatch) -> None:
+    import wtree.widgets.viewer as v
+
+    monkeypatch.setenv(v.VIEW_MAX_BYTES_ENV, "2048")
+    assert v._max_bytes() == 2048
+    monkeypatch.setenv(v.VIEW_MAX_BYTES_ENV, "nonsense")
+    assert v._max_bytes() == v.MAX_BYTES        # bad value -> default
+    monkeypatch.setenv(v.VIEW_MAX_BYTES_ENV, "0")
+    assert v._max_bytes() == v.MAX_BYTES        # non-positive -> default
+    monkeypatch.delenv(v.VIEW_MAX_BYTES_ENV, raising=False)
+    assert v._max_bytes() == v.MAX_BYTES
+
+
+def test_hex_lines_single_row() -> None:
+    from wtree.widgets.viewer import hex_lines
+
+    rows = hex_lines(b"AB\x00\xff", base=0)
+    assert len(rows) == 1
+    plain = rows[0].plain
+    assert plain.startswith("00000000  41 42 00 ff")
+    assert plain.endswith("|AB..|")
+
+
+def test_hex_lines_rows_and_base_offset() -> None:
+    from wtree.widgets.viewer import hex_lines
+
+    rows = hex_lines(bytes(range(20)), base=16)
+    assert len(rows) == 2
+    assert rows[0].plain.startswith("00000010")   # base offset honoured
+    assert rows[1].plain.startswith("00000020")   # + 16 bytes
+
+
+async def test_load_more_pages_in(tmp_path: Path, monkeypatch) -> None:
+    import wtree.widgets.viewer as v
+
+    monkeypatch.setenv(v.VIEW_MAX_BYTES_ENV, "40")
+    f = tmp_path / "big.txt"
+    f.write_text("x" * 100, encoding="utf-8")
+    from wtree.app import WTreeApp
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ViewerScreen(str(f)))
+        await pilot.pause()
+        await pilot.pause()
+        screen = app.screen
+        assert screen._loaded.truncated and screen._loaded.loaded_bytes == 40
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.pause()
+        assert screen._loaded.loaded_bytes == 80
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.pause()
+        assert screen._loaded.loaded_bytes == 100
+        assert screen._loaded.truncated is False
+
+
+async def test_toggle_hex_key(tmp_path: Path) -> None:
+    f = tmp_path / "a.txt"
+    f.write_text("hello\nworld\n", encoding="utf-8")
+    from wtree.app import WTreeApp
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ViewerScreen(str(f)))
+        await pilot.pause()
+        await pilot.pause()
+        screen = app.screen
+        assert screen._render_mode == "text"
+        await pilot.press("x")
+        await pilot.pause()
+        assert screen._render_mode == "hex"
+        await pilot.press("x")
+        await pilot.pause()
+        assert screen._render_mode == "text"
+
+
+@_pytest.mark.skipif(_os.name == "nt", reason="symlink perms on Windows CI")
+def test_dangling_symlink_message(tmp_path: Path) -> None:
+    link = tmp_path / "link"
+    _os.symlink(tmp_path / "gone", link)
+    result = _load_file_sync(str(link), limit=_BIG)
+    assert "target missing" in result.refusal

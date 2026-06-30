@@ -35,7 +35,7 @@ Sequenced plan for the open backlog below. Ordering respects dependencies (norma
 - **Verify:** viewer tests + a load-timing sanity check on a large source file.
 - **Why here:** the meatiest single item; fully isolated to the viewer.
 
-### Session 6 — Viewer overhaul, part 2: huge-file paging + hex mode + config ceiling
+### Session 6 — Viewer overhaul, part 2: huge-file paging + hex mode + config ceiling — DONE 2026-06-30
 - **Primary:** Streamed / paged read for huge files (load first N lines, lazy-load on scroll), retiring the 10 MB hard refusal. [todo: View-era — "Streamed / paged read"]
 - **Also:** Hex mode for binaries (16 bytes/row + ASCII gutter, opt-in over today's polite refusal) [View-era]; configurable `MAX_BYTES` (seeds the first runtime-config surface) [View-era]; friendlier symlink-loop / dangling-target message [View-era].
 - **Verify:** paging + hex-mode tests.
@@ -195,11 +195,11 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 - [x] **In-viewer incremental search** (`/`). DONE 2026-06-10 — the pager hosts its own `SearchBar`; new `viewer.find_matches` (absolute `(line, start, end)` spans via `re.finditer(IGNORECASE)`); incremental jump to the first match at-or-after the on-screen line (wrap); Down/Ctrl+G/Up step while the bar is open; **Enter commits** (highlights + position stay, `n`/`N` step pager-style); **two-stage Esc** (open = restore scroll; committed = first clears, second / `q` dismiss); `/` no-op on refusal bodies; body now a literal Rich `Text`. 22 new tests in `tests/test_viewer_search.py`; 799 → 821 green. See worklog 2026-06-10 + design.md decision row.
 - [x] **Syntax highlighting. DONE 2026-06-30 (Session 5).** Kept the `Static` body + the existing `/`-search machinery; highlight via Rich `Syntax` (`.highlight()` → per-line Texts), which is **dependency-free** (Pygments ships with Rich). Auto-caps at `HIGHLIGHT_MAX_BYTES = 512 KB` (default plain above it) with an `h` toggle. Decision (AskUserQuestion): Rich Syntax over Textual `TextArea` (which would have meant rebuilding the search).
 - [x] **Line-number gutter. DONE 2026-06-30 (Session 5).** Right-aligned dim line numbers + `│` separator, built per line in `render_body`; the search-match overlay uses line-relative columns so the gutter width never enters the offset maths.
-- [ ] **Streamed / paged read for huge files.** v0 refuses anything over 10 MB; a friendlier behaviour would be "load the first N lines, lazy-load on scroll". Needs Textual's `LazyList` or equivalent.
-- [ ] **Hex mode for binary files.** Today's binary detection refuses with a polite message; an opt-in hex dump (16 bytes per row, ASCII gutter) would be more useful than the refusal.
+- [x] **Paged read for huge files. DONE 2026-06-30 (Session 6).** Retired the hard 10 MB refusal: `_load_file_sync(path, *, limit)` loads the first page (`MAX_BYTES`, default 4 MiB) and sets `truncated`; the `m` key grows the limit and reloads (re-decode-from-0 keeps it simple + dodges UTF-8 page-boundary splits). Chose head+load-more over lazy-on-scroll (AskUserQuestion). The header shows `showing N of M (m=more)`.
+- [x] **Hex mode for binary files. DONE 2026-06-30 (Session 6).** Binary files (NUL, no BOM) are no longer refused — they load and default to a hex view; `x` toggles text↔hex on any file. `hex_lines()` renders `OFFSET  HH..  |ascii|` 16 bytes/row; `render_body` gained a `gutter=` flag so hex skips the line-number gutter.
 - [x] **Detect BOM. DONE 2026-06-30 (Session 5).** `_load_file_sync` checks for a BOM *before* the NUL binary heuristic: `utf-8-sig` (strips the BOM) and `utf-16` LE/BE (decodes instead of being refused as binary — UTF-16 is full of NULs). Shebang-based hinting not pursued (extension-based `Syntax.guess_lexer` covers the highlighting need).
-- [ ] **Configurable size ceiling.** `MAX_BYTES` is a module-level constant; should be a runtime setting once a config layer exists.
-- [ ] **Symlink loop / dangling target.** `os.stat` follows the symlink; a dangling link surfaces as "could not stat". Worth a friendlier message ("symlink target missing: ...").
+- [x] **Configurable size ceiling. DONE 2026-06-30 (Session 6).** `MAX_BYTES` (now the per-page default, 4 MiB) is overridable via the `WTREE_VIEW_MAX_BYTES` env var (`_max_bytes()`, bad/non-positive falls back to the default). Env chosen over a config file (AskUserQuestion), matching the WTREE_DEBUG / WTREE_OPLOG_VERBOSE precedent.
+- [x] **Symlink loop / dangling target message. DONE 2026-06-30 (Session 6).** `_stat_refusal()` reports `symlink target missing: <target>` (ENOENT on a link) or `symlink loop: ...` (ELOOP) instead of a bare `could not stat`.
 
 ## Edit-era follow-ups
 
