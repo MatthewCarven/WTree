@@ -728,12 +728,10 @@ class WTreeApp(App):
             )
             return
 
-        contents = self.query_one(ContentsPane)
-        cursor = contents.cursor_entry()
-        if cursor is None:
-            self.flash("Rename: nothing under the cursor.", severity="warning")
-            return
-        path, kind = cursor
+        target = self._resolve_rename_target()
+        if target is None:
+            return  # resolver flashed the reason
+        path, kind = target
         tag = Tag(source_id=self._source.source_id, path=path)
         current_basename = posixpath.basename(path.rstrip("/"))
         # Pre-select the basename stem so typing replaces the name
@@ -1147,6 +1145,38 @@ class WTreeApp(App):
         )
         self._update_subtitle()
         self._refresh_status()
+
+    def _resolve_rename_target(self) -> tuple[str, Kind] | None:
+        """Single-entry Rename target from the FOCUSED pane.
+
+        Brings Rename in line with the 2026-06-11 Selection rule the other
+        ops follow: with the *tree* pane focused, ``R`` renames the directory
+        node under the tree cursor (always ``Kind.DIR``); with the *contents*
+        pane focused, the cursor entry as before. The logged **root** node is
+        refused - renaming the directory the tree is rooted at would orphan
+        the root path - with a nudge to ascend or log its parent first. An
+        error-placeholder node (``data is None``) and an empty contents
+        cursor both flash "nothing under the cursor" and return ``None``.
+        """
+        if isinstance(self.focused, TreePane):
+            node = self.focused.cursor_node
+            if node is None or node.data is None:
+                self.flash("Rename: nothing under the cursor.", severity="warning")
+                return None
+            if node.parent is None:
+                self.flash(
+                    "Rename: can't rename the logged root - ascend "
+                    "(Backspace) or log its parent first.",
+                    severity="warning",
+                )
+                return None
+            return node.data, Kind.DIR
+        contents = self.query_one(ContentsPane)
+        cursor = contents.cursor_entry()
+        if cursor is None:
+            self.flash("Rename: nothing under the cursor.", severity="warning")
+            return None
+        return cursor
 
     def _resolve_selection_tags(self) -> list[Tag]:
         """Apply the design's Selection rule (NOT used by Rename).

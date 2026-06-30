@@ -656,14 +656,23 @@ class TreePane(Tree[str]):
     # ------------------------------------------------------------------
 
     def action_focus_parent(self) -> None:
-        """Move the cursor to the parent of the current node.
+        """Backspace - move the cursor to the parent node, or ascend at root.
 
-        No-op at the tree root or on a detached cursor. ``cursor_line`` is
-        a Textual reactive — assigning it fires ``NodeHighlighted``, which
-        keeps the contents pane in sync without a special-case path here.
+        On a non-root node: move the cursor to its parent (``cursor_line`` is
+        a Textual reactive - assigning it fires ``NodeHighlighted``, which
+        keeps the contents pane in sync without a special-case path here).
+
+        On the **root** node there is no parent within the tree, so Backspace
+        ascends instead - posting :class:`AscendRequested` so the app re-roots
+        at the parent directory, exactly like Left-on-root (2026-06-30: the
+        two gestures now agree at the root rather than Backspace no-opping).
+        Detached cursor (no node) is still a no-op.
         """
         node = self.cursor_node
-        if node is None or node.parent is None:
+        if node is None:
+            return
+        if node.parent is None:
+            self.post_message(self.AscendRequested())
             return
         self.cursor_line = node.parent.line
 

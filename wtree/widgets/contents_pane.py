@@ -404,10 +404,25 @@ class ContentsPane(DataTable):
             return
         full_path = self._row_paths[row]
         if not full_path:
-            return  # Error row.
+            return  # Error row (silent - it's not a navigable target).
         if self._row_kinds[row] is not Kind.DIR:
-            return  # File / symlink — design says only dirs drill in.
-        await self._tree().focus_dir_under_cursor(full_path)
+            # Right-arrow drills into directories only; a file / symlink row
+            # has nowhere to descend. Nudge instead of a silent no-op.
+            self._nudge("Right-arrow opens directories - press V to view a file.")
+            return
+        ok = await self._tree().focus_dir_under_cursor(full_path)
+        if not ok:
+            self._nudge("Couldn't drill in - directory isn't in the tree.")
+
+    def _nudge(self, message: str) -> None:
+        """Flash a status nudge through the app, if it supports it.
+
+        Guarded so ContentsPane stays usable under a bare test host whose
+        ``App`` has no ``flash`` (the WTreeApp convenience wrapper).
+        """
+        flash = getattr(self.app, "flash", None)
+        if callable(flash):
+            flash(message, severity="info")
 
     # ------------------------------------------------------------------
     # SearchTarget protocol (used by incremental search ``/``)

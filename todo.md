@@ -24,7 +24,7 @@ Sequenced plan for the open backlog below. Ordering respects dependencies (norma
 - **Verify:** boundary-level pins added to `test_windows_paths.py` (still POSIX-runnable).
 - **Why before Session 4:** both this and rename-from-tree touch tree-pane path handling; normalising first de-risks the rename work.
 
-### Session 4 — Tree-pane action parity
+### Session 4 — Tree-pane action parity — DONE 2026-06-30
 - **Primary:** Rename from the tree pane — `action_rename` still reads the contents pane directly; give it the focused-pane treatment the other ops already got (2026-06-11 selection rule). Design look first (single-entry basename op from a dir node). [todo: Navigation-era / 2026-06-11 parked "rename-from-tree"]
 - **Also:** Backspace-on-tree = ascend (disambiguate cursor-on-root → ascend vs otherwise → cursor-to-parent) [Ascend-era]; revisit tree-pane tagging Backspace [Navigation-era]; status-line nudge for "→ on a file row is a no-op" and for `focus_dir_under_cursor` silent-not-found [Navigation-era].
 - **Verify:** `test_selection_focus.py`-style tests for rename-from-tree + the Backspace disambiguation.
@@ -122,8 +122,8 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 ## Navigation-era follow-ups
 
 - [ ] `ContentsPane._tree()` does `self.app.query_one(TreePane)` — needs explicit ref if dual-pane mode lands.
-- [ ] Tree-pane tagging → revisit Backspace there.
-- [ ] No status-line feedback yet for "→ on a file row is a no-op" — now that StatusLine exists, wire this.
+- [x] **Tree-pane tagging → revisit Backspace there. DONE 2026-06-30 (Session 4).** No conflict: Space tags, Backspace is navigation. Backspace now has clear semantics at every node — root → ascend (posts `AscendRequested`), otherwise cursor-to-parent — so the gesture is unambiguous alongside tree tagging.
+- [x] **Status-line feedback for "→ on a file row is a no-op". DONE 2026-06-30 (Session 4).** `ContentsPane.action_enter_dir` now flashes "Right-arrow opens directories - press V to view a file." on a file/symlink row, and "Couldn't drill in - directory isn't in the tree." when `focus_dir_under_cursor` returns False, via a guarded `ContentsPane._nudge` (inert under a bare test host).
 - [x] **`focus_dir_under_cursor` line-indexer race. DONE 2026-05-27.** Bug Matthew reported: from a few levels deep in the tree, tab to contents pane, Right descends into a child folder fine the *first* time, but the *second* Right (on a child of the newly-descended folder) jumped the tree cursor back to the logged folder instead of going deeper. Root cause: `focus_dir_under_cursor` called `node.expand()` + `await self._populate(node)` then immediately read `child.line` — but Textual's line indexer rebuilds lazily on next render, so freshly-added children report `line == -1`. Assigning `cursor_line = -1` deselects, falling back to row 0 = the tree root. First Right worked because the logged root is auto-expanded+populated at mount (no expand needed). Second Right needed to expand the just-cursored-onto child for the first time → bug. **Fix**: one-line `await asyncio.sleep(0)` after `_populate(node)`, mirroring the identical yield in `focus_child_of_root` (whose docstring already calls out the trap; missed when `focus_dir_under_cursor` was added). 1 new regression test in `tests/test_drillin_regression.py` exercising the two-level descent and asserting both intermediate states. 544 → **545 / 545** green.
 - [ ] `focus_dir_under_cursor` still returns False silently if child isn't found — separate concern, status-line nudge would help.
 
@@ -224,7 +224,7 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 
 ## Ascend-era follow-ups
 
-- [ ] **Backspace on the tree pane = ascend.** Parallel binding for the Left-on-root gesture, mirroring the contents pane's Backspace ("go to parent dir"). Matthew flagged this as wanted in the 2026-05-22 design conversation but parked for now. Distinct from the existing `action_focus_parent` (cursor-to-parent inside the tree) — would need to disambiguate: if cursor on root, ascend; otherwise cursor-to-parent.
+- [x] **Backspace on the tree pane = ascend. DONE 2026-06-30 (Session 4).** `TreePane.action_focus_parent` now disambiguates: cursor on root → posts `AscendRequested` (re-root at parent, matching Left-on-root); any other node → cursor-to-parent (unchanged). The contents pane's Backspace delegates to the same method, so it ascends at the top too. 2 tests in `tests/test_tree_rename.py`.
 - [x] **Blank-Enter in the `L` "Log new source" prompt = ascend. DONE 2026-05-23 (sixth session).** Shared `_do_ascend` helper on WTreeApp; both the tree's Left-on-root gesture and `L`'s blank-Enter branch delegate to it. `on_tree_pane_ascend_requested` now just dispatches. Tagged set survives (absolute paths). See [[project-wtree]] for full landing notes.
 - [ ] **Preserve expansion state across ascend.** v0 wipes the tree and repopulates — any subtrees the user had expanded under the previous root are collapsed after re-root. A pricier "graft old tree state under the new root node" pass would keep the user's drilled-down context. Implementation sketch: snapshot `(path, is_expanded)` tuples by walking the old tree, then on re-root replay the expansions where paths still exist as children.
 - [x] **`StatusLine.flash(message, timeout=3.0)` API for ascend feedback. DONE 2026-05-22 (last).** Ascend's "Logged: NEW (ascended from OLD)" and "Already at filesystem root" both go through `app.flash()`. Currently the "Logged: X (ascended from Y)" message goes through `notify()` (toast). A status-line flash would be a less intrusive fit and matches the same follow-up flagged for Rename / Edit / Make-new rejections.
