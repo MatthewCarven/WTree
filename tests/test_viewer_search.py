@@ -111,12 +111,29 @@ async def _open_viewer(app: WTreeApp, path: Path, pilot) -> ViewerScreen:
 
 
 def _spans(screen: ViewerScreen):
+    """Only the search-MATCH spans. Since 2026-06-30 the body also carries a
+    'dim' line-number gutter (and, for source files, syntax-colour spans);
+    the match styles are the only ones with a yellow / cyan background, so we
+    filter on that. The viewer-search tests all use .txt files (lexer=plain),
+    so the gutter is the only other styling present."""
     body = screen.query_one("#viewer-body", Static)
-    return list(body.render().spans)
+    return [
+        s
+        for s in body.render().spans
+        if "yellow" in str(s.style) or "cyan" in str(s.style)
+    ]
 
 
 def _span_offsets(screen: ViewerScreen):
     return [(s.start, s.end) for s in _spans(screen)]
+
+
+def _match_texts(screen: ViewerScreen):
+    """The display substring under each match span - gutter-agnostic, so the
+    assertion survives the line-number prefix without hard-coding offsets."""
+    rendered = screen.query_one("#viewer-body", Static).render()
+    plain = rendered.plain
+    return [plain[s.start : s.end] for s in _spans(screen)]
 
 
 def _current_span_index(screen: ViewerScreen):
@@ -178,9 +195,12 @@ async def test_typing_highlights_and_counts(tmp_path: Path) -> None:
         assert bar.match_total == 3
         assert bar.match_idx == 1            # 1-based current
         assert screen._match_idx == 0        # anchor 0 -> first match
-        # Every match highlighted; the current one is distinct.
-        assert _span_offsets(screen) == [(m.start, m.end)
-                                         for m in find_matches(screen._loaded.text, "foo")]
+        # Every match highlighted (the gutter shifts absolute offsets, so we
+        # assert on the underlying text rather than hard-coded positions); the
+        # current one is distinct.
+        expected = find_matches(screen._loaded.text, "foo")
+        assert len(_spans(screen)) == len(expected)
+        assert _match_texts(screen) == ["foo"] * len(expected)
         assert _current_span_index(screen) == 0
 
 

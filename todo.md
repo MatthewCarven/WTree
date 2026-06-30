@@ -29,7 +29,7 @@ Sequenced plan for the open backlog below. Ordering respects dependencies (norma
 - **Also:** Backspace-on-tree = ascend (disambiguate cursor-on-root → ascend vs otherwise → cursor-to-parent) [Ascend-era]; revisit tree-pane tagging Backspace [Navigation-era]; status-line nudge for "→ on a file row is a no-op" and for `focus_dir_under_cursor` silent-not-found [Navigation-era].
 - **Verify:** `test_selection_focus.py`-style tests for rename-from-tree + the Backspace disambiguation.
 
-### Session 5 — Viewer overhaul, part 1: body-widget swap + syntax highlighting + gutter
+### Session 5 — Viewer overhaul, part 1: body-widget swap + syntax highlighting + gutter — DONE 2026-06-30
 - **Primary:** Swap the viewer body `Static` → Textual `TextArea` (read-only) or a Rich `Syntax` renderable, and add Pygments-based syntax highlighting. Carries a Pygments dependency + noticeable load latency on big files — the reason it's its own session. [todo: View-era — "Syntax highlighting"]
 - **Also:** Line-number gutter (trivial once the body widget is swapped) [View-era]; BOM / `utf-8-sig` detection before the latin-1 fallback [View-era].
 - **Verify:** viewer tests + a load-timing sanity check on a large source file.
@@ -192,11 +192,11 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 ## View-era follow-ups
 
 - [x] **In-viewer incremental search** (`/`). DONE 2026-06-10 — the pager hosts its own `SearchBar`; new `viewer.find_matches` (absolute `(line, start, end)` spans via `re.finditer(IGNORECASE)`); incremental jump to the first match at-or-after the on-screen line (wrap); Down/Ctrl+G/Up step while the bar is open; **Enter commits** (highlights + position stay, `n`/`N` step pager-style); **two-stage Esc** (open = restore scroll; committed = first clears, second / `q` dismiss); `/` no-op on refusal bodies; body now a literal Rich `Text`. 22 new tests in `tests/test_viewer_search.py`; 799 → 821 green. See worklog 2026-06-10 + design.md decision row.
-- [ ] **Syntax highlighting.** Would require switching the body widget from `Static` to Textual's `TextArea` (read-only mode) or a `Syntax` rich renderable. Adds a dependency on Pygments and noticeable load latency for big files. Worth a dedicated session.
-- [ ] **Line-number gutter.** Trivial visual win once `Static` is swapped for `TextArea`.
+- [x] **Syntax highlighting. DONE 2026-06-30 (Session 5).** Kept the `Static` body + the existing `/`-search machinery; highlight via Rich `Syntax` (`.highlight()` → per-line Texts), which is **dependency-free** (Pygments ships with Rich). Auto-caps at `HIGHLIGHT_MAX_BYTES = 512 KB` (default plain above it) with an `h` toggle. Decision (AskUserQuestion): Rich Syntax over Textual `TextArea` (which would have meant rebuilding the search).
+- [x] **Line-number gutter. DONE 2026-06-30 (Session 5).** Right-aligned dim line numbers + `│` separator, built per line in `render_body`; the search-match overlay uses line-relative columns so the gutter width never enters the offset maths.
 - [ ] **Streamed / paged read for huge files.** v0 refuses anything over 10 MB; a friendlier behaviour would be "load the first N lines, lazy-load on scroll". Needs Textual's `LazyList` or equivalent.
 - [ ] **Hex mode for binary files.** Today's binary detection refuses with a polite message; an opt-in hex dump (16 bytes per row, ASCII gutter) would be more useful than the refusal.
-- [ ] **Detect ``BOM`` / shebang encoding hints.** UTF-8 with BOM decodes fine via `utf-8-sig`; we could try that before falling back to latin-1.
+- [x] **Detect BOM. DONE 2026-06-30 (Session 5).** `_load_file_sync` checks for a BOM *before* the NUL binary heuristic: `utf-8-sig` (strips the BOM) and `utf-16` LE/BE (decodes instead of being refused as binary — UTF-16 is full of NULs). Shebang-based hinting not pursued (extension-based `Syntax.guess_lexer` covers the highlighting need).
 - [ ] **Configurable size ceiling.** `MAX_BYTES` is a module-level constant; should be a runtime setting once a config layer exists.
 - [ ] **Symlink loop / dangling target.** `os.stat` follows the symlink; a dangling link surfaces as "could not stat". Worth a friendlier message ("symlink target missing: ...").
 

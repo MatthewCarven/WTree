@@ -58,6 +58,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from rich.syntax import Syntax
 from rich.text import Text
 
 from textual.app import ComposeResult
@@ -76,6 +77,20 @@ MAX_BYTES: int = 10 * 1024 * 1024
 # How many bytes to peek at for the binary-detection heuristic.
 _PEEK_BYTES: int = 8 * 1024
 
+# Syntax highlighting (2026-06-30). Pygments ships with Rich, so this adds no
+# new dependency. Files at or below HIGHLIGHT_MAX_BYTES highlight on open;
+# larger files default to plain (the `h` key forces highlighting either way).
+HIGHLIGHT_MAX_BYTES: int = 512 * 1024
+_SYNTAX_THEME: str = "ansi_dark"   # 16-colour, respects the terminal palette
+_GUTTER_STYLE: str = "dim"
+_GUTTER_SEP: str = " \u2502 "       # " | " between the line number and content
+
+# Byte-order marks recognised as text *before* the NUL binary heuristic
+# (UTF-16 is mostly NULs for ASCII and would otherwise be refused as binary).
+_BOM_UTF8 = b"\xef\xbb\xbf"
+_BOM_UTF16_LE = b"\xff\xfe"
+_BOM_UTF16_BE = b"\xfe\xff"
+
 # Search-highlight styles. Provisional palette - a future theme pass can
 # swap these. Every match shares ``_MATCH_STYLE``; the current match (the
 # one ``n`` / ``N`` is sitting on) gets ``_CURRENT_MATCH_STYLE`` so it
@@ -88,7 +103,8 @@ _CURRENT_MATCH_STYLE: str = "black on cyan"
 _SCROLL_CONTEXT: int = 2
 
 _HINT_DEFAULT: str = (
-    "Esc / Q close   -   arrows / PgUp PgDn / Home End scroll   -   / search"
+    "Esc / Q close   -   arrows / PgUp PgDn / Home End scroll   -   "
+    "/ search   -   h highlight"
 )
 _HINT_SEARCH: str = (
     "n / N next / prev match   -   Esc clear search   -   Q close"
@@ -108,6 +124,7 @@ class _LoadResult:
     refusal: str = ""
     encoding: str = ""
     byte_size: int = 0
+    lexer: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +170,116 @@ def find_matches(text: str, query: str) -> "list[_Match]":
         scanned = i
         out.append(_Match(line=line, start=i, end=m.end()))
     return out
+
+
+def _detect_bom(peek: bytes) -> Optional[str]:
+    """Codec implied by a leading byte-order mark, or ``None``.
+
+    Checked before the NUL binary heuristic (a UTF-16 file is mostly NUL
+    bytes for ASCII and would otherwise be refused as binary). The UTF-8 BOM
+    maps to ``utf-8-sig`` (which strips it); a UTF-16 BOM maps to ``utf-16``
+    (whose decoder reads the BOM to choose LE / BE).
+    """
+    if peek.startswith(_BOM_UTF8):
+        return "utf-8-sig"
+    if peek.startswith(_BOM_UTF16_LE) or peek.startswith(_BOM_UTF16_BE):
+        return "utf-16"
+    return None
+
+
+def line_start_offsets(text: str) -> "list[int]":
+    """Absolute character offset where each ``text.split('\n')`` line begins.
+    Maps an absolute match offset to a line-relative column for the overlay."""
+    offsets: "list[int]" = []
+    pos = 0
+    for line in text.split("\n"):
+        offsets.append(pos)
+        pos += len(line) + 1  # + 1 for the newline split consumed
+    return offsets
+
+
+def highlight_lines(text: str, lexer: str, *, enabled: bool) -> "list[Text]":
+    """Per-line Rich ``Text`` for the body, syntax-highlighted when enabled.
+
+    ``text.split('\n')`` is the line model everything else uses (matches,
+    gutter, scroll-to-line). When ``enabled`` and ``lexer`` is a real lexer
+    (not the plain ``text`` / ``default`` fallback), the whole document is
+    highlighted once via Rich's ``Syntax`` (Pygments) and split back into line
+    ``Text`` objects with styles intact; otherwise each line is plain. Any
+    mismatch between the highlighted and plain splits (a trailing-newline
+    artifact, a line whose plain text drifted) falls back to plain for that
+    line so the gutter / match / scroll maths stay exact.
+    """
+    plain_lines = text.split("\n")
+    if not enabled or lexer in ("", "text", "default"):
+        return [Text(line) for line in plain_lines]
+    try:
+        highlighted = Syntax(text, lexer, theme=_SYNTAX_THEME).highlight(text)
+    except Exception:  # noqa: BLE001 - highlighting must never break the view
+        return [Text(line) for line in plain_lines]
+    # Pygments commonly appends a trailing newline; trim it so the styled
+    # Text lines up character-for-character with the source. If the content
+    # drifted any other way, fall back to plain so the per-line slice (and the
+    # match overlay that rides on it) can't desync.
+    if highlighted.plain == text + "\n":
+        highlighted = highlighted[: len(text)]
+    if highlighted.plain != text:
+        return [Text(line) for line in plain_lines]
+    # ``Text.split`` is O(lines + spans); per-line slicing would be
+    # O(lines x spans) - catastrophic on big files. Rich drops the trailing
+    # empty segment that ``str.split`` keeps, so pad to reconcile, then a
+    # per-line plain-equality guard catches any residual drift.
+    hl_lines = list(highlighted.split("\n"))
+    if len(hl_lines) < len(plain_lines):
+        hl_lines += [Text("")] * (len(plain_lines) - len(hl_lines))
+    if len(hl_lines) != len(plain_lines):
+        return [Text(line) for line in plain_lines]
+    return [
+        hl if hl.plain == pl else Text(pl)
+        for pl, hl in zip(plain_lines, hl_lines)
+    ]
+
+
+def gutter_width(n_lines: int) -> int:
+    """Column width for the line-number gutter (digits of the last line)."""
+    return len(str(max(1, n_lines)))
+
+
+def render_body(
+    lines: "list[Text]",
+    line_starts: "list[int]",
+    matches: "list[_Match]",
+    match_idx: int,
+    *,
+    gutter_w: int,
+) -> "Text":
+    """Assemble the body ``Text`` - ``<gutter> <line>`` per row, with the
+    search-match spans overlaid using line-relative columns (so the gutter
+    width never enters the offset maths)."""
+    by_line: "dict[int, list[tuple[int, _Match]]]" = {}
+    for k, m in enumerate(matches):
+        by_line.setdefault(m.line, []).append((k, m))
+    body = Text()
+    n = len(lines)
+    for i, line_text in enumerate(lines):
+        body.append(f"{i + 1:>{gutter_w}}", style=_GUTTER_STYLE)
+        body.append(_GUTTER_SEP, style=_GUTTER_STYLE)
+        lt = line_text.copy()
+        if i in by_line:
+            base = line_starts[i] if i < len(line_starts) else 0
+            length = len(lt.plain)
+            for k, m in by_line[i]:
+                col_s = max(0, m.start - base)
+                col_e = min(length, m.end - base)
+                if col_e > col_s:
+                    style = (
+                        _CURRENT_MATCH_STYLE if k == match_idx else _MATCH_STYLE
+                    )
+                    lt.stylize(style, col_s, col_e)
+        body.append(lt)
+        if i < n - 1:
+            body.append("\n")
+    return body
 
 
 class ViewerScreen(ModalScreen[None]):
@@ -215,6 +342,7 @@ class ViewerScreen(ModalScreen[None]):
         Binding("slash", "search", "Search"),
         Binding("n", "next_match", "Next match"),
         Binding("N", "prev_match", "Prev match"),
+        Binding("h", "toggle_highlight", "Highlight"),
     ]
 
     def __init__(self, path: str) -> None:
@@ -231,6 +359,14 @@ class ViewerScreen(ModalScreen[None]):
         self._match_idx: int = 0
         self._committed: bool = False
         self._scroll_pre: int = 0
+        # Body-render cache (2026-06-30). ``_disp_lines`` are the per-line
+        # Texts (syntax-highlighted or plain), recomputed only when the file
+        # loads or highlighting is toggled; the cheap per-keystroke match
+        # overlay + gutter is rebuilt from them in ``_apply_highlights``.
+        self._highlight_on: bool = True
+        self._disp_lines: "list[Text]" = []
+        self._line_starts: "list[int]" = []
+        self._gutter_w: int = 1
 
     def compose(self) -> ComposeResult:
         # Outer container - dock the header at top, hint at bottom, with
@@ -269,15 +405,13 @@ class ViewerScreen(ModalScreen[None]):
             body.add_class("refusal")
             return
 
-        # Successful load.
-        size_str = _human_bytes(result.byte_size)
-        header.update(
-            f"{self._path}  -  {size_str}  -  {result.encoding}"
-        )
-        # Render through the highlighter (with no matches yet) so there is
-        # a single rendering path, and so the body is a literal Rich
-        # ``Text`` - file content is shown verbatim rather than being
-        # parsed as console markup.
+        # Successful load. Highlight by default only up to the size cap;
+        # bigger files open plain and the user can force it with ``h``.
+        self._highlight_on = result.byte_size <= HIGHLIGHT_MAX_BYTES
+        self._prepare_body()
+        self._update_header()
+        # Single rendering path (with no matches yet) - the body is a literal
+        # Rich ``Text`` so file content shows verbatim, never parsed as markup.
         self._apply_highlights()
 
     # ------------------------------------------------------------------
@@ -307,11 +441,62 @@ class ViewerScreen(ModalScreen[None]):
             body = self.query_one("#viewer-body", Static)
         except Exception:  # noqa: BLE001
             return
-        text = Text(self._loaded.text)
-        for k, m in enumerate(self._matches):
-            style = _CURRENT_MATCH_STYLE if k == self._match_idx else _MATCH_STYLE
-            text.stylize(style, m.start, m.end)
-        body.update(text)
+        body.update(
+            render_body(
+                self._disp_lines,
+                self._line_starts,
+                self._matches,
+                self._match_idx,
+                gutter_w=self._gutter_w,
+            )
+        )
+
+    def _prepare_body(self) -> None:
+        """Recompute the cached per-line Texts + line-start offsets + gutter
+        width. Cheap to call on load and on each highlight toggle; the
+        Pygments pass (the only costly part) only runs when highlighting is
+        actually on and the file has a known lexer."""
+        if self._loaded is None or self._loaded.refusal:
+            return
+        text = self._loaded.text
+        self._line_starts = line_start_offsets(text)
+        self._disp_lines = highlight_lines(
+            text, self._loaded.lexer, enabled=self._highlight_on
+        )
+        self._gutter_w = gutter_width(len(self._disp_lines))
+
+    def _update_header(self) -> None:
+        """Header line: path, size, encoding, lexer + highlight state."""
+        if self._loaded is None:
+            return
+        try:
+            header = self.query_one(".header", Label)
+        except Exception:  # noqa: BLE001
+            return
+        if self._loaded.refusal:
+            header.update(
+                f"{self._path}  -  {self._loaded.refusal.splitlines()[0]}"
+            )
+            return
+        lex = self._loaded.lexer or "plain"
+        if lex in ("text", "default"):
+            lex = "plain"
+        state = "" if (self._highlight_on and lex != "plain") else "  -  hl off"
+        header.update(
+            f"{self._path}  -  {_human_bytes(self._loaded.byte_size)}"
+            f"  -  {self._loaded.encoding}  -  {lex}{state}"
+        )
+
+    def action_toggle_highlight(self) -> None:
+        """``h`` - toggle syntax highlighting (forces it on for a big file
+        that opened plain, or off if the colours are distracting). The gutter
+        and search highlights are unaffected."""
+        if not self._searchable:
+            return
+        self._highlight_on = not self._highlight_on
+        self._prepare_body()
+        self._update_header()
+        self._apply_highlights()
 
     def _scroll_to_current(self) -> None:
         """Scroll so the current match's line is in view (with context)."""
@@ -532,7 +717,8 @@ def _load_file_sync(path: str) -> _LoadResult:
             refusal=f"Could not read file: {type(exc).__name__}: {exc}",
         )
 
-    if b"\x00" in peek:
+    bom = _detect_bom(peek)
+    if bom is None and b"\x00" in peek:
         return _LoadResult(
             byte_size=size,
             refusal=(
@@ -553,15 +739,35 @@ def _load_file_sync(path: str) -> _LoadResult:
             refusal=f"Could not read file: {type(exc).__name__}: {exc}",
         )
 
-    # Try UTF-8 first; fall back to latin-1 which has a total decoding.
-    encoding = "utf-8"
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        encoding = "latin-1 (fallback)"
-        text = data.decode("latin-1")
+    # Decode. A recognised BOM picks the codec; otherwise UTF-8 with a
+    # latin-1 fallback (which has a total decoding, so the viewer never
+    # crashes on funny bytes).
+    if bom == "utf-8-sig":
+        text = data.decode("utf-8-sig")
+        encoding = "utf-8 (BOM)"
+    elif bom == "utf-16":
+        try:
+            text = data.decode("utf-16")
+            encoding = "utf-16 (BOM)"
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+            encoding = "latin-1 (fallback)"
+    else:
+        encoding = "utf-8"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            encoding = "latin-1 (fallback)"
+            text = data.decode("latin-1")
 
-    return _LoadResult(text=text, encoding=encoding, byte_size=size)
+    try:
+        lexer = Syntax.guess_lexer(path, code=text)
+    except Exception:  # noqa: BLE001 - never let lexer guessing break a load
+        lexer = "default"
+
+    return _LoadResult(
+        text=text, encoding=encoding, byte_size=size, lexer=lexer
+    )
 
 
 # ---------------------------------------------------------------------------

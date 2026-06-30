@@ -187,3 +187,157 @@ async def test_viewer_screen_q_dismisses(tmp_path: Path) -> None:
         await pilot.press("q")
         await pilot.pause()
         assert not isinstance(app.screen, ViewerScreen)
+
+
+# ---------------------------------------------------------------------------
+# BOM detection + lexer guess (2026-06-30, Session 5)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_bom() -> None:
+    from wtree.widgets.viewer import _detect_bom
+
+    assert _detect_bom(b"\xef\xbb\xbfhello") == "utf-8-sig"
+    assert _detect_bom(b"\xff\xfeh\x00") == "utf-16"
+    assert _detect_bom(b"\xfe\xff\x00h") == "utf-16"
+    assert _detect_bom(b"plain text") is None
+
+
+def test_load_utf8_bom_is_stripped(tmp_path: Path) -> None:
+    f = tmp_path / "bom.txt"
+    f.write_bytes(b"\xef\xbb\xbfhello\n")
+    r = _load_file_sync(str(f))
+    assert r.refusal == ""
+    assert r.text == "hello\n"          # BOM stripped by utf-8-sig
+    assert "BOM" in r.encoding
+
+
+def test_load_utf16_not_refused_as_binary(tmp_path: Path) -> None:
+    """A UTF-16 file is full of NUL bytes; the BOM check must run before the
+    binary heuristic so it decodes as text instead of being refused."""
+    f = tmp_path / "u16.txt"
+    f.write_bytes("hello\nworld\n".encode("utf-16"))  # BOM + interleaved NULs
+    r = _load_file_sync(str(f))
+    assert r.refusal == ""
+    assert r.text == "hello\nworld\n"
+    assert "utf-16" in r.encoding
+
+
+def test_load_guesses_python_lexer(tmp_path: Path) -> None:
+    f = tmp_path / "code.py"
+    f.write_text("def f():\n    return 1\n", encoding="utf-8")
+    assert _load_file_sync(str(f)).lexer == "python"
+
+
+def test_load_txt_is_plain_lexer(tmp_path: Path) -> None:
+    f = tmp_path / "notes.txt"
+    f.write_text("just text\n", encoding="utf-8")
+    assert _load_file_sync(str(f)).lexer in ("text", "default")
+
+
+# ---------------------------------------------------------------------------
+# Highlighting / gutter / render_body pure helpers
+# ---------------------------------------------------------------------------
+
+
+def test_highlight_lines_python_has_syntax_spans() -> None:
+    from wtree.widgets.viewer import highlight_lines
+
+    lines = highlight_lines("def f():\n    return 1\n", "python", enabled=True)
+    assert len(lines) == 3            # split incl. trailing empty line
+    assert lines[0].plain == "def f():"
+    assert lines[2].plain == ""
+    assert any(len(line.spans) for line in lines)   # some token colouring
+
+
+def test_highlight_lines_disabled_is_plain() -> None:
+    from wtree.widgets.viewer import highlight_lines
+
+    lines = highlight_lines("def f():\n    return 1\n", "python", enabled=False)
+    assert all(line.spans == [] for line in lines)
+
+
+def test_highlight_lines_plain_lexer_is_plain() -> None:
+    from wtree.widgets.viewer import highlight_lines
+
+    lines = highlight_lines("hello\nworld\n", "text", enabled=True)
+    assert all(line.spans == [] for line in lines)
+
+
+def test_gutter_width() -> None:
+    from wtree.widgets.viewer import gutter_width
+
+    assert gutter_width(0) == 1
+    assert gutter_width(9) == 1
+    assert gutter_width(10) == 2
+    assert gutter_width(100) == 3
+
+
+def test_render_body_has_gutter_and_overlays_match() -> None:
+    from wtree.widgets.viewer import (
+        find_matches,
+        gutter_width,
+        highlight_lines,
+        line_start_offsets,
+        render_body,
+    )
+
+    text = "alpha\nbeta gamma\n"
+    lines = highlight_lines(text, "text", enabled=False)
+    matches = find_matches(text, "gamma")
+    body = render_body(
+        lines, line_start_offsets(text), matches, 0,
+        gutter_w=gutter_width(len(lines)),
+    )
+    plain = body.plain
+    assert "1 \u2502 alpha" in plain
+    assert "2 \u2502 beta gamma" in plain
+    match_spans = [
+        sp for sp in body.spans
+        if "yellow" in str(sp.style) or "cyan" in str(sp.style)
+    ]
+    assert match_spans
+    assert plain[match_spans[0].start : match_spans[0].end] == "gamma"
+
+
+# ---------------------------------------------------------------------------
+# Highlight toggle + big-file auto-cap (pilot)
+# ---------------------------------------------------------------------------
+
+
+async def test_highlight_toggle_key(tmp_path: Path) -> None:
+    f = tmp_path / "code.py"
+    f.write_text("def f():\n    return 1\n", encoding="utf-8")
+    from wtree.app import WTreeApp
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ViewerScreen(str(f)))
+        await pilot.pause()
+        await pilot.pause()
+        screen = app.screen
+        assert screen._highlight_on is True
+        await pilot.press("h")
+        await pilot.pause()
+        assert screen._highlight_on is False
+        await pilot.press("h")
+        await pilot.pause()
+        assert screen._highlight_on is True
+
+
+async def test_big_file_defaults_highlight_off(tmp_path: Path, monkeypatch) -> None:
+    import wtree.widgets.viewer as vmod
+
+    monkeypatch.setattr(vmod, "HIGHLIGHT_MAX_BYTES", 8)  # tiny cap
+    f = tmp_path / "code.py"
+    f.write_text("def f():\n    return 1\n", encoding="utf-8")  # > 8 bytes
+    from wtree.app import WTreeApp
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(ViewerScreen(str(f)))
+        await pilot.pause()
+        await pilot.pause()
+        assert app.screen._highlight_on is False   # auto-capped
