@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from wtree.editor import launch_editor_blocking, resolve_editor
+from wtree.editor import EditorDisabled, launch_editor_blocking, resolve_editor
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +38,24 @@ def test_editor_used_when_visual_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_editor() == ["ed"]
 
 
-def test_empty_visual_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Whitespace-only $VISUAL is ignored - we fall through to $EDITOR."""
+def test_empty_visual_is_disabled_not_fallthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly-set-but-empty $VISUAL means 'no editor' (2026-06-30):
+    we raise rather than dropping to $EDITOR or the platform default. It's
+    the highest-precedence var the user touched, so we honour the opt-out."""
     monkeypatch.setenv("VISUAL", "   ")
     monkeypatch.setenv("EDITOR", "ed")
-    assert resolve_editor() == ["ed"]
+    with pytest.raises(EditorDisabled):
+        resolve_editor()
+
+
+def test_empty_editor_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """$EDITOR set but empty (VISUAL unset) -> disabled, not the default."""
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("EDITOR", "")
+    with pytest.raises(EditorDisabled):
+        resolve_editor()
 
 
 def test_command_with_args_is_shlex_split(monkeypatch: pytest.MonkeyPatch) -> None:

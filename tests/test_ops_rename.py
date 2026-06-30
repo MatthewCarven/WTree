@@ -356,3 +356,21 @@ async def test_action_rename_warns_when_no_cursor() -> None:
             isinstance(s, PromptDialog) for s in app.screen_stack
         )
     assert app.last_plan is None
+
+
+async def test_plan_rename_rejects_reserved_windows_name(tmp_path, monkeypatch):
+    """A reserved Windows device name is rejected at plan time with a clear
+    InvalidName (forced on for this POSIX host via the helper's flag). The
+    check fires after the source-exists check, so the source must be real."""
+    import wtree.ops.rename as rn
+
+    orig = rn.is_reserved_name
+    monkeypatch.setattr(rn, "is_reserved_name", lambda n, **k: orig(n, windows=True))
+    f = tmp_path / "file.txt"
+    f.write_text("x")
+    plan = await plan_rename(
+        Tag("native", str(f)), "CON.txt", {"native": NativeSource()}
+    )
+    assert plan.items == []
+    assert plan.errors and plan.errors[0].cause == "InvalidName"
+    assert "reserved" in plan.errors[0].message.lower()

@@ -146,3 +146,47 @@ async def test_e2e_subtitle_returns_to_baseline_when_idle(tmp_path: Path) -> Non
     assert "running" not in final
     assert "queued" not in final
     assert (dst / "x.txt").read_text() == "x"
+
+
+# ---------------------------------------------------------------------------
+# Validation-on-Enter for Copy/Move destinations (2026-06-30, Session 7)
+# ---------------------------------------------------------------------------
+
+import os as _os  # noqa: E402
+
+import pytest as _pytest  # noqa: E402
+
+from wtree.app import WTreeApp as _App  # noqa: E402
+
+_needs_perms = _pytest.mark.skipif(
+    hasattr(_os, "geteuid") and _os.geteuid() == 0, reason="root ignores mode bits"
+)
+
+
+def test_destination_ok_for_existing_dir(tmp_path):
+    assert _App._destination_error(str(tmp_path)) is None
+
+
+def test_destination_ok_for_new_subdir(tmp_path):
+    # The executor makedirs missing leaf dirs, so a not-yet-existing dest is
+    # fine as long as its nearest existing ancestor is a writable directory.
+    assert _App._destination_error(str(tmp_path / "new1" / "new2")) is None
+
+
+def test_destination_rejects_file(tmp_path):
+    f = tmp_path / "afile"
+    f.write_text("x")
+    err = _App._destination_error(str(f))
+    assert err and "not a directory" in err
+
+
+@_needs_perms
+def test_destination_rejects_readonly_parent(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    _os.chmod(ro, 0o500)
+    try:
+        err = _App._destination_error(str(ro / "sub"))
+        assert err and "not writable" in err
+    finally:
+        _os.chmod(ro, 0o700)

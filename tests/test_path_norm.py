@@ -254,3 +254,38 @@ def test_drive_anchor_posix_path():
 
 def test_drive_anchor_posix_root_itself():
     assert drive_anchor("/") == "/"
+
+
+# ---------------------------------------------------------------------------
+# Windows reserved device names (2026-06-30, Session 7)
+# ---------------------------------------------------------------------------
+
+from wtree.ops.base import is_reserved_name  # noqa: E402
+import wtree.ops.base as _base_mod  # noqa: E402
+
+
+def test_is_reserved_name_windows():
+    for n in ("CON", "con", "NUL", "Com1", "LPT9", "CON.txt", "nul.log", "AUX"):
+        assert is_reserved_name(n, windows=True), n
+    for n in ("console", "context.py", "com0", "lpt", "readme.md", "con1.txt"):
+        assert not is_reserved_name(n, windows=True), n
+
+
+def test_is_reserved_name_noop_on_posix():
+    assert is_reserved_name("CON", windows=False) is False
+    assert is_reserved_name("NUL.txt", windows=False) is False
+
+
+def test_resolve_relative_leaf_rejects_reserved(monkeypatch):
+    # Force the Windows behaviour on a POSIX host (capture the original so the
+    # patched module-global call inside resolve_relative_leaf doesn't recurse).
+    orig = _base_mod.is_reserved_name
+    monkeypatch.setattr(
+        _base_mod, "is_reserved_name", lambda n, **k: orig(n, windows=True)
+    )
+    leaf, err = resolve_relative_leaf("/parent", "CON.txt")
+    assert leaf is None and "reserved" in err
+    leaf, err = resolve_relative_leaf("/parent", "sub/NUL")
+    assert leaf is None and "NUL" in err
+    leaf, err = resolve_relative_leaf("/parent", "console.txt")
+    assert err is None and leaf == "/parent/console.txt"

@@ -40,6 +40,13 @@ from collections.abc import Sequence
 # friendlier than ``vi`` for users who never agreed to learn modal
 # editing; if it isn't installed we fall back to ``vi`` which is part
 # of POSIX and effectively always available.
+class EditorDisabled(Exception):
+    """Raised by :func:`resolve_editor` when ``$VISUAL`` / ``$EDITOR`` is set
+    but empty - the user explicitly opted out of an editor, and we must NOT
+    drop them into the platform default. The action layer catches it and
+    surfaces the message."""
+
+
 _WINDOWS_DEFAULT: tuple[str, ...] = ("notepad",)
 _UNIX_PREFERRED: tuple[str, ...] = ("nano",)
 _UNIX_FALLBACK: tuple[str, ...] = ("vi",)
@@ -61,9 +68,17 @@ def resolve_editor() -> list[str]:
     """
     posix = os.name != "nt"
     for env_var in ("VISUAL", "EDITOR"):
-        raw = os.environ.get(env_var, "").strip()
+        if env_var not in os.environ:
+            continue  # unset -> fall through to the next / the default
+        raw = os.environ[env_var].strip()
         if raw:
             return shlex.split(raw, posix=posix)
+        # Present but empty: the user cleared the highest-precedence editor
+        # var they set. Treat it as "no editor", NOT the platform default.
+        raise EditorDisabled(
+            f"${env_var} is set but empty - no editor configured "
+            "(unset it to use the platform default)"
+        )
 
     if os.name == "nt":
         return list(_WINDOWS_DEFAULT)

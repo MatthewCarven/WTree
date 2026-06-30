@@ -78,6 +78,29 @@ def canonical_path(
     return p.lower() if case_insensitive else p
 
 
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def is_reserved_name(name: str, *, windows: bool = os.name == "nt") -> bool:
+    """True if ``name``'s basename is a Windows reserved device name.
+
+    Windows forbids CON / PRN / AUX / NUL / COM1-9 / LPT1-9, case-insensitively
+    and regardless of extension (``CON.txt`` is reserved too). The OS error is
+    cryptic; a plan-time check turns it into a clear ``InvalidName``. POSIX has
+    no such reservation, so the check is a no-op there - ``windows`` is a
+    parameter purely so the behaviour is unit-testable on a POSIX host (mirrors
+    :func:`canonical_path`).
+    """
+    if not windows:
+        return False
+    stem = name.split(".", 1)[0].strip().upper()
+    return stem in _WINDOWS_RESERVED_NAMES
+
+
 def resolve_relative_leaf(
     parent_path: str, typed: str
 ) -> tuple[str | None, str | None]:
@@ -85,22 +108,16 @@ def resolve_relative_leaf(
 
     Returns ``(leaf, None)`` on success or ``(None, error)`` on rejection.
     Lenient on separators - ``sub/leaf`` implies intermediate directories the
-    caller's executor will create. Rejects absolute paths, ``..`` escapes, and
-    names that collapse to nothing. Shared by the Make-new planner and the
-    :class:`~wtree.widgets.conflict.ConflictDialog` custom-rename editor so
+    caller's executor will create. Rejects absolute paths, ``..`` escapes,
+    reserved Windows device names, and names that collapse to nothing. Shared
+    by the Make-new planner and the conflict-dialog custom-rename editor so
     both validate a typed relative target identically. POSIX-flavoured
     throughout (see :func:`to_posix`).
-
-    Three parent shapes: ``""`` -> leaf is the bare segments; ``"/"`` -> leaf
-    is ``"/" + segments``; otherwise ``parent (trailing-slash-trimmed) + "/" +
-    segments``.
     """
     cleaned = to_posix(typed.strip()).rstrip("/")
     if not cleaned:
         return None, "name is empty"
-    # Absolute is rejected - the target lands under ``parent_path``, not at a
-    # typed root. Catches POSIX-absolute ("/x"), Windows-drive ("C:/x" after
-    # the backslash flip) and UNC ("//srv/x", caught by the leading "/").
+    # Absolute is rejected - the target lands under ``parent_path``.
     if cleaned.startswith("/") or (len(cleaned) >= 2 and cleaned[1] == ":"):
         return None, f"name {cleaned!r} is absolute; use a relative name"
     segments = [s for s in cleaned.split("/") if s and s != "."]
@@ -108,6 +125,12 @@ def resolve_relative_leaf(
         return None, "name resolves to no path components"
     if any(seg == ".." for seg in segments):
         return None, f"name {cleaned!r} contains a '..' segment"
+    reserved = next((s for s in segments if is_reserved_name(s)), None)
+    if reserved is not None:
+        return None, (
+            f"name {cleaned!r} uses a reserved Windows device name "
+            f"({reserved})"
+        )
     name_rel = "/".join(segments)
     parent_posix = to_posix(parent_path)
     if parent_posix == "":

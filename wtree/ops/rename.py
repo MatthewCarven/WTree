@@ -32,6 +32,7 @@ import posixpath
 from collections.abc import Mapping
 
 from wtree.ops.base import (
+    is_reserved_name,
     to_posix,
     OperationKind,
     Plan,
@@ -157,6 +158,24 @@ async def plan_rename(
                         f"new name {name!r} contains a path separator; "
                         "rename is basename-only - use Move (M / F6) "
                         "for cross-directory operations"
+                    ),
+                    cause="InvalidName",
+                )
+            ],
+        )
+
+    # Reject Windows reserved device names (CON, NUL, COM1, ...) - the OS
+    # would give a cryptic error; a plan-time check is clearer. No-op on POSIX.
+    if is_reserved_name(name):
+        return Plan(
+            kind=OperationKind.RENAME,
+            errors=[
+                PlanError(
+                    source_id=tag.source_id,
+                    path=tag.path,
+                    message=(
+                        f"new name {name!r} is a reserved Windows device "
+                        "name (CON, NUL, COM1, ...); choose another"
                     ),
                     cause="InvalidName",
                 )

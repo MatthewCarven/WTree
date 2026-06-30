@@ -41,7 +41,7 @@ Sequenced plan for the open backlog below. Ordering respects dependencies (norma
 - **Verify:** paging + hex-mode tests.
 - **Depends on:** Session 5's body-widget swap.
 
-### Session 7 — Daily-driver papercuts + ergonomics
+### Session 7 — Daily-driver papercuts + ergonomics — Input-safety group DONE 2026-06-30
 A batch of high-frequency small wins (scope to taste — this is the loose one):
 - **Input safety:** validation-on-Enter for Copy/Move (pre-check parent dir exists/writable) [Modal-era]; Windows reserved-names planner check (`CON`/`NUL`/`LPT1`…) with a clear `InvalidName` [Rename-era]; don't fall back to `vi` when `$EDITOR` is explicitly empty [Edit-era].
 - **Make-new / cursor:** pre-position cursor on the new entry + initial name suggestion (`New Folder` / `untitled.txt`) [Make-new-era].
@@ -152,7 +152,7 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 
 ## Modal-era follow-ups
 
-- [ ] **Validation on Enter** — pre-check parent dir exists/writable (Copy/Move).
+- [x] **Validation on Enter (Copy/Move). DONE 2026-06-30 (Session 7).** `WTreeApp._destination_error(dest)` walks to the nearest existing ancestor and flashes a clear error on Enter (unreachable / not-a-directory / not-writable / dest-is-a-file) instead of a mid-op failure. Allows makedirs-creatable leaf dirs (not over-strict).
 - [ ] **Focus restoration** on dismiss — spot-check.
 - [ ] **Path completion** inside `PromptDialog`.
 - [ ] **History / MRU destinations** — Up-arrow to cycle.
@@ -188,7 +188,7 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 - [x] **Smart cursor placement in the rename modal. DONE 2026-05-25 (third session).** New pure helper `wtree/ops/rename.py::select_range_for_rename(name, kind) -> (start, end)` mirrors Finder / Windows Explorer behaviour: dirs select all; files with no dot, leading-dot-only dotfiles, and trailing-dot names all select all; otherwise select `[0, rfind('.'))` so `report.txt` → `report` and `foo.tar.gz` → `foo.tar` (only last `.X` treated as the extension). `PromptDialog` grew a `select_initial: tuple[int, int] | None = None` kwarg; `on_mount` clamps to `[0, len(initial)]` and assigns `inp.selection = Selection(start, end)` — does **not** then write `cursor_position`, because `cursor_position.setter` calls `selection = Selection.cursor(value)` and would clobber the range. Default behaviour (no `select_initial`) keeps the long-standing "Save As" cursor-at-end UX for every non-Rename caller. `action_rename` opts in via the helper. 26 new tests in `tests/test_rename_smart_cursor.py` (pure helper x12 incl. SYMLINK/OTHER, PromptDialog selection-on-mount x4, action-layer stem/dotfile/no-ext/dir x4, full e2e stem-replace x1, plus the existing rename suite still passing). **454 → 480 / 480 green.**
 - [ ] **Batch rename — design.md parking lot.** Multiple tagged entries, glob/regex/numbering rules. Once the planner generalises, the action layer's "single-entry only" guard goes away.
 - [ ] **Case-only renames on case-insensitive filesystems** (macOS HFS+ default, Windows NTFS by default). `report.txt` -> `Report.txt` may need an intermediate step (`os.rename` to a temp name then to the target) on those systems. Not tested today; document as known-soft-spot.
-- [ ] **Reserved names on Windows.** `CON`, `NUL`, `PRN`, `LPT1`, etc. would silently fail at the OS layer. Add a planner-level check so the user sees an `InvalidName` error with a clear message instead of a cryptic Windows error.
+- [x] **Reserved names on Windows. DONE 2026-06-30 (Session 7).** `is_reserved_name(name, *, windows=os.name=='nt')` in `ops/base.py` (CON/PRN/AUX/NUL/COM1-9/LPT1-9, case-insensitive, extension-agnostic; `windows=` flag for POSIX-testability) wired into `plan_rename` + `resolve_relative_leaf` (Make-new + conflict custom-rename); rejects with `InvalidName`. No-op on POSIX so genuine `CON` files on Linux stay valid.
 
 ## View-era follow-ups
 
@@ -206,7 +206,7 @@ None blocking. If anything surfaces during implementation that contradicts `desi
 - [x] **Status-line nudge instead of notify toast for the "editor not found" / "non-zero exit" / "spawn errored" cases. DONE 2026-05-22 (last).** All three routed through `app.flash()`. Same shape as the Rename-era follow-up; route through a future `StatusLine.flash(message, timeout)` API rather than the intrusive notify-toast layer.
 - [ ] **Focus restoration after the editor returns.** `action_edit` does `show_path(current_path)` to refresh the pane but doesn't explicitly re-focus the pane that had focus before. Spot-check whether Textual restores focus implicitly through `app.suspend()`; if not, capture `self.focused` before suspend and restore after.
 - [ ] **Tagged-set Edit semantics.** v0 silently ignores the tagged set (mirrors View). Design.md Selection rule says it should apply. Revisit post-v0 once `$EDITOR` policy is configurable — likely allow batch invocation for editors that handle multiple file args sensibly (vim tabs, emacs frames) and reject for the rest.
-- [ ] **Don't fall back to `vi` if the user explicitly cleared `$EDITOR`.** Today `EDITOR=""` falls through to the platform default. Some users set `EDITOR=""` deliberately to mean "I'd rather see an error than be dropped into a stranger editor". Add a sentinel: explicit empty env -> error.
+- [x] **Don't fall back to `vi` on explicitly-empty `$EDITOR`/`$VISUAL`. DONE 2026-06-30 (Session 7).** `resolve_editor` raises `EditorDisabled` when the highest-precedence editor var the user *set* is empty (vs. unset → platform default); `action_edit` catches it and flashes "no editor configured (unset it to use the platform default)".
 - [ ] **`$VISUAL`/`$EDITOR` change detection.** Resolved once per action call from `os.environ`. If the user changes `$EDITOR` from a `!` shell-out mid-session, we honour it on the next press. That's correct today but worth a test once `!` lands.
 - [ ] **Honor `$PAGER`-style overrides for sub-actions.** Right now `View` mentions `$PAGER` in its size-limit refusal but doesn't actually invoke it. Once Edit's shell-out machinery is reusable, wire View's "too big" refusal to a "press something to invoke `$PAGER`" path that re-uses `_launch_editor_blocking` shape.
 - [ ] **Windows `notepad.exe` blocking semantics.** Default notepad opens and returns the subprocess exit code only when the user closes the window. Confirm this matches user expectation; if not, document `notepad++` / `code --wait` as recommended.

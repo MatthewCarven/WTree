@@ -62,7 +62,11 @@ from wtree.crash import (
     write_crash_log,
 )
 from wtree.error_handler import ErrorReport
-from wtree.editor import launch_editor_blocking, resolve_editor
+from wtree.editor import (
+    EditorDisabled,
+    launch_editor_blocking,
+    resolve_editor,
+)
 from wtree.ops import (
     ConflictKind,
     ItemResult,
@@ -814,7 +818,11 @@ class WTreeApp(App):
             self.flash(f"Edit: cannot edit a {kind.value}.", severity="warning")
             return
 
-        argv = resolve_editor()
+        try:
+            argv = resolve_editor()
+        except EditorDisabled as exc:
+            self.flash(f"Edit: {exc}", severity="warning")
+            return
         try:
             rc = await asyncio.to_thread(
                 self._launch_editor_blocking, argv, path
@@ -908,6 +916,33 @@ class WTreeApp(App):
             plan, [synthetic_tag], "Make-new", destination_path=None
         )
 
+    @staticmethod
+    def _destination_error(dest: str) -> str | None:
+        """Pre-flight a typed Copy/Move destination (POSIX-flavoured).
+
+        Walks to the nearest EXISTING ancestor (the executor makedirs any
+        missing leaf dirs, so a not-yet-existing destination is fine as long
+        as its nearest existing ancestor is a writable directory). Returns a
+        user-facing error, or None when the destination looks usable. Catches
+        the common mistakes - typo'd root, a file where a dir was meant, a
+        read-only parent - on Enter, not mid-op.
+        """
+        if os.path.lexists(dest) and not os.path.isdir(dest):
+            return f"destination exists and is not a directory: {to_native(dest)}"
+        probe = dest
+        while probe and not os.path.exists(probe):
+            parent = posixpath.dirname(probe.rstrip("/"))
+            if parent == probe or not parent:
+                break
+            probe = parent
+        if not probe or not os.path.exists(probe):
+            return f"destination path is unreachable: {to_native(dest)}"
+        if not os.path.isdir(probe):
+            return f"not a directory: {to_native(probe)}"
+        if not os.access(probe, os.W_OK):
+            return f"destination is not writable: {to_native(probe)}"
+        return None
+
     async def _plan_modal_enqueue(
         self,
         *,
@@ -976,6 +1011,12 @@ class WTreeApp(App):
         destination = Tag(
             source_id=self._source.source_id, path=to_posix(typed)
         )
+        # Validation on Enter: catch an unreachable / non-writable / not-a-dir
+        # destination now with a clear flash, rather than a mid-op failure.
+        dest_err = self._destination_error(destination.path)
+        if dest_err is not None:
+            self.flash(f"{verb}: {dest_err}", severity="error")
+            return
         # Build the plan under the scan-dialog gate: walking + conflict-
         # annotating a large tagged set is O(entries) of I/O, so for big
         # sets it shows a cancellable 'Planning' dialog instead of
