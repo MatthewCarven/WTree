@@ -46,9 +46,10 @@ from collections.abc import Awaitable, Callable, Sequence
 
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from rich.text import Text
+from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Label
+from textual.widgets import Label, Static
 
 from wtree.ops.base import (
     to_native,
@@ -58,6 +59,13 @@ from wtree.ops.base import (
     resolve_relative_leaf,
 )
 from wtree.widgets.prompt import PromptDialog
+
+# Viewport height for the windowed body. The dialog never mounts one widget
+# per conflict (a 356k-conflict copy did exactly that = ~7 GB of Textual
+# Labels); a single Static shows this many rows around the cursor and is
+# rebuilt as the cursor moves, so memory is O(visible) at any conflict count.
+_VISIBLE_ROWS = 18
+_CURSOR_STYLE = "reverse"
 
 
 # Display order / labels for the three user-choosable resolutions.
@@ -108,19 +116,15 @@ class ConflictDialog(
         text-style: bold;
     }
 
-    ConflictDialog #conflict-rows {
+    ConflictDialog Static.rows {
         height: auto;
         max-height: 18;
-    }
-
-    ConflictDialog Label.row {
         width: 100%;
     }
 
-    ConflictDialog Label.row-cursor {
-        background: $accent;
-        color: $text;
-        text-style: bold;
+    ConflictDialog Label.position {
+        color: $text-muted;
+        text-style: italic;
     }
 
     ConflictDialog Label.summary {
@@ -139,6 +143,10 @@ class ConflictDialog(
     BINDINGS = [
         ("up", "cursor_up", "Up"),
         ("down", "cursor_down", "Down"),
+        ("pageup", "page_up", "Page up"),
+        ("pagedown", "page_down", "Page down"),
+        ("home", "cursor_home", "First"),
+        ("end", "cursor_end", "Last"),
         ("s", "set_current('skip')", "Skip"),
         ("o", "set_current('overwrite')", "Overwrite"),
         ("r", "set_current('rename')", "Rename"),
@@ -191,7 +199,9 @@ class ConflictDialog(
         # dst_path), or None = use the auto `` (n)`` suffix.
         self._custom: list[str | None] = [None] * len(self._items)
         self._cursor = 0
-        self._row_labels: list[Label] = []
+        self._top = 0  # index of the first row in the current viewport
+        self._body: Static | None = None
+        self._position_label: Label | None = None
         self._summary_label: Label | None = None
 
     # -- composition --------------------------------------------------
@@ -202,11 +212,14 @@ class ConflictDialog(
             yield Label(
                 f"{n} conflict(s) - choose what to do", classes="title"
             )
-            with VerticalScroll(id="conflict-rows"):
-                for i in range(n):
-                    label = Label(self._row_text(i), classes="row")
-                    self._row_labels.append(label)
-                    yield label
+            body = Static(self._window_text(), classes="rows", id="conflict-body")
+            self._body = body
+            yield body
+            position = Label(
+                self._position_text(), classes="position", id="conflict-position"
+            )
+            self._position_label = position
+            yield position
             summary = Label(
                 self._summary_text(), classes="summary", id="conflict-summary"
             )
@@ -215,7 +228,7 @@ class ConflictDialog(
             yield Label(self._hint_text(), classes="hint")
 
     def on_mount(self) -> None:
-        self._restyle_rows()
+        self._refresh_body()
 
     # -- rendering ----------------------------------------------------
 
@@ -294,53 +307,86 @@ class ConflictDialog(
         if self._summary_label is not None:
             self._summary_label.update(self._summary_text())
 
-    def _refresh_row(self, i: int) -> None:
-        if 0 <= i < len(self._row_labels):
-            self._row_labels[i].update(self._row_text(i))
+    def _position_text(self) -> str:
+        n = len(self._items)
+        return f"row {self._cursor + 1} of {n}" if n else ""
 
-    def _refresh_all_rows(self) -> None:
-        for i in range(len(self._row_labels)):
-            self._refresh_row(i)
+    def _window_text(self) -> Text:
+        """The viewport: ``_VISIBLE_ROWS`` rows around the cursor as one Text.
 
-    def _restyle_rows(self) -> None:
-        """Apply the cursor highlight class to the current row only."""
-        for i, label in enumerate(self._row_labels):
-            label.set_class(i == self._cursor, "row-cursor")
+        The cursor row is styled (and already carries a ``>`` marker from
+        :meth:`_row_text`). O(visible) - never touches the other rows, so a
+        356k-conflict set costs the same as a handful.
+        """
+        t = Text()
+        n = len(self._items)
+        if n == 0:
+            return t
+        top = self._top
+        bottom = min(n, top + _VISIBLE_ROWS)
+        for i in range(top, bottom):
+            line = self._row_text(i)
+            t.append(line, style=_CURSOR_STYLE if i == self._cursor else "")
+            if i < bottom - 1:
+                t.append("\n")
+        return t
+
+    def _ensure_cursor_visible(self) -> None:
+        """Slide the viewport so the cursor row is inside it."""
+        if self._cursor < self._top:
+            self._top = self._cursor
+        elif self._cursor >= self._top + _VISIBLE_ROWS:
+            self._top = self._cursor - _VISIBLE_ROWS + 1
+        if self._top < 0:
+            self._top = 0
+
+    def _refresh_body(self) -> None:
+        if self._body is not None:
+            self._body.update(self._window_text())
+        if self._position_label is not None:
+            self._position_label.update(self._position_text())
 
     # -- actions ------------------------------------------------------
 
-    def action_cursor_up(self) -> None:
+    def _move_cursor(self, target: int) -> None:
         if not self._items:
             return
-        prev = self._cursor
-        self._cursor = (self._cursor - 1) % len(self._items)
-        self._refresh_row(prev)
-        self._refresh_row(self._cursor)
-        self._restyle_rows()
-        self._scroll_to_cursor()
+        self._cursor = target % len(self._items)
+        self._ensure_cursor_visible()
+        self._refresh_body()
+
+    def action_cursor_up(self) -> None:
+        self._move_cursor(self._cursor - 1)
 
     def action_cursor_down(self) -> None:
-        if not self._items:
-            return
-        prev = self._cursor
-        self._cursor = (self._cursor + 1) % len(self._items)
-        self._refresh_row(prev)
-        self._refresh_row(self._cursor)
-        self._restyle_rows()
-        self._scroll_to_cursor()
+        self._move_cursor(self._cursor + 1)
+
+    def action_page_up(self) -> None:
+        if self._items:
+            self._move_cursor(max(0, self._cursor - _VISIBLE_ROWS))
+
+    def action_page_down(self) -> None:
+        if self._items:
+            self._move_cursor(min(len(self._items) - 1, self._cursor + _VISIBLE_ROWS))
+
+    def action_cursor_home(self) -> None:
+        if self._items:
+            self._move_cursor(0)
+
+    def action_cursor_end(self) -> None:
+        if self._items:
+            self._move_cursor(len(self._items) - 1)
 
     def action_set_current(self, which: str) -> None:
         if not self._items:
             return
         self._res[self._cursor] = Resolution(which)
-        self._refresh_row(self._cursor)
+        self._refresh_body()
         self._refresh_summary()
 
     def action_set_all(self, which: str) -> None:
-        res = Resolution(which)
-        for i in range(len(self._res)):
-            self._res[i] = res
-        self._refresh_all_rows()
+        self._res = [Resolution(which)] * len(self._res)
+        self._refresh_body()
         self._refresh_summary()
 
     @work
@@ -387,7 +433,7 @@ class ConflictDialog(
                 continue
             self._custom[i] = leaf
             break
-        self._refresh_row(i)
+        self._refresh_body()
         self._refresh_summary()
 
     def _edit_prefill(self, i: int) -> str:
@@ -406,8 +452,3 @@ class ConflictDialog(
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    # -- helpers ------------------------------------------------------
-
-    def _scroll_to_cursor(self) -> None:
-        if 0 <= self._cursor < len(self._row_labels):
-            self._row_labels[self._cursor].scroll_visible()

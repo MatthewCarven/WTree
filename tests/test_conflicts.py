@@ -816,3 +816,78 @@ async def test_e2e_conflict_edit_relative_subpath(tmp_path):
         await app.op_queue.wait_until_idle()
 
     assert (d / "sub" / "b.txt").read_text() == "new"
+
+
+# ---------------------------------------------------------------------------
+# Windowed rendering / memory regression (2026-06-30)
+# ---------------------------------------------------------------------------
+
+from wtree.ops.base import ConflictKind as _CK  # noqa: E402
+from wtree.ops.base import Kind as _Kind  # noqa: E402
+from wtree.ops.base import PlanItem as _PI  # noqa: E402
+from wtree.widgets.conflict import ConflictDialog as _CD  # noqa: E402
+from wtree.widgets.conflict import _VISIBLE_ROWS  # noqa: E402
+
+
+def _conflict_items(n):
+    return [
+        _PI(
+            src_source_id="native", src_path=f"/s/f{i}",
+            dst_source_id="native", dst_path=f"/d/f{i}",
+            kind=_Kind.FILE, size=0, conflict=_CK.FILE,
+        )
+        for i in range(n)
+    ]
+
+
+def test_window_text_caps_at_visible_rows():
+    d = _CD(_conflict_items(100))
+    assert d._window_text().plain.count("\n") + 1 <= _VISIBLE_ROWS
+
+
+def test_window_follows_cursor_down():
+    d = _CD(_conflict_items(100))
+    d._cursor = _VISIBLE_ROWS + 5
+    d._ensure_cursor_visible()
+    assert d._top <= d._cursor < d._top + _VISIBLE_ROWS
+    assert d._top == d._cursor - _VISIBLE_ROWS + 1
+
+
+def test_window_top_clamps_to_zero_at_start():
+    d = _CD(_conflict_items(100))
+    d._cursor = 99
+    d._ensure_cursor_visible()
+    assert d._top > 0
+    d._cursor = 0
+    d._ensure_cursor_visible()
+    assert d._top == 0
+
+
+def test_position_text_reports_cursor_and_total():
+    d = _CD(_conflict_items(356))
+    assert d._position_text() == "row 1 of 356"
+    d._cursor = 41
+    assert d._position_text() == "row 42 of 356"
+
+
+async def test_large_conflict_set_does_not_explode_widgets(tmp_path):
+    """The memory regression pin: a huge conflict set must NOT mount one
+    widget per row (it did - ~7 GB at 356k). The dialog mounts a small,
+    constant number of widgets regardless of conflict count."""
+    from textual.widgets import Label, Static
+
+    from wtree.app import WTreeApp
+
+    app = WTreeApp(root_path=str(tmp_path))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.push_screen(_CD(_conflict_items(50000)))
+        await pilot.pause()
+        screen = app.screen
+        # title + position + summary + hint = 4 Labels (Label subclasses
+        # Static, so don't count Statics); exactly one Static body. The point:
+        # a constant handful of widgets, NOT one per the 50k conflicts.
+        assert len(screen.query(Label)) <= 6
+        assert len(screen.query("#conflict-body")) == 1
+        await pilot.press("escape")
+        await pilot.pause()

@@ -55,6 +55,7 @@ _log = logging.getLogger(__name__)
 # dialog's update rate) is only as granular as how often the per-chunk
 # callback is called - bigger chunks mean faster bulk throughput on
 # fast hardware but coarser progress steps.
+MAX_COMPLETED: int = 50  # cap on retained completed OperationResults
 COPY_CHUNK_SIZE = 256 * 1024
 
 # Maximum progress repaints per second (coalesces per-chunk callbacks).
@@ -131,6 +132,8 @@ class OperationQueue:
         self._bytes_done_current: int = 0  # in-flight item progress
         self._started_at: float | None = None  # monotonic seconds at start
         self._cancel_requested: bool = False
+        # Bounded so a daily-driver session of many big ops doesn't retain
+        # every OperationResult forever (each holds one ItemResult per item).
         self._completed: list[OperationResult] = []
         self._worker: Optional[asyncio.Task[None]] = None
 
@@ -357,6 +360,8 @@ class OperationQueue:
                         ],
                     )
                 self._completed.append(result)
+                if len(self._completed) > MAX_COMPLETED:
+                    del self._completed[:-MAX_COMPLETED]
                 # Clear running BEFORE the callback so listeners see the
                 # post-plan state - queue depth has dropped by one and
                 # ``running`` is None. Matches the natural reading of

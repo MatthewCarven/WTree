@@ -220,3 +220,22 @@ async def test_queue_callback_exceptions_are_isolated(
         assert (tmp_path / "dst2" / "b.txt").read_text() == "y"
     finally:
         await queue.stop()
+
+
+async def test_completed_list_is_capped(
+    tmp_path: Path, registry: dict[str, NativeSource], monkeypatch
+) -> None:
+    """``_completed`` is bounded so a long session of big ops doesn't retain
+    every OperationResult (each holds one ItemResult per item) forever."""
+    import wtree.ops.queue as qmod
+
+    monkeypatch.setattr(qmod, "MAX_COMPLETED", 3)
+    queue = OperationQueue(registry=registry)
+    queue.start()
+    try:
+        for i in range(6):
+            queue.enqueue(await _make_file_plan(tmp_path, f"f{i}.txt", "x", registry))
+        await queue.wait_until_idle()
+        assert len(queue.completed) == 3   # only the most recent kept
+    finally:
+        await queue.stop()
