@@ -1,0 +1,17 @@
+# Line-ending policy: the repo stores LF; working trees get what the
+# platform wants. Stops the recurring whole-file CRLF churn on Windows.
+* text=auto
+
+# Windows batch files: cmd.exe wants CRLF (LF can break labels/goto).
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Shell scripts must stay LF even when checked out on Windows.
+*.sh text eol=lf
+
+# Never touch these if they ever land in the tree.
+*.png binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.whl binary

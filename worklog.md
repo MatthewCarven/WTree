@@ -5851,3 +5851,15 @@ Picked the project back up after five weeks idle. **Everything is committed:** H
 **Takeaway for future verification runs:** `pip install pyflakes` and run the permission-bit files as a non-root user, or the suite reports green while two real gates sit skipped.
 
 **Still open** (unchanged): Session 7's other groups — make-new ergonomics (cursor on the new entry + name suggestion), search polish (remembered query for global Ctrl+G, substring highlighting, empty-query restore), infra nits (KeyBar `_WIRED` from BINDINGS, `os.stat` cache on the status line); the parked `last_result` / `last_plan` slimming; then the Overflow bucket. Plus three Windows field-checks never confirmed: dest tree node auto-refresh after Copy/Move (Session 3), UNC-path ascend, and symlink-at-root realpath-vs-literal.
+
+## 2026-08-04 (cont.) - line-ending policy imposed; build.cmd was corrupt
+
+Matthew's call: stop asking, just fix the CRLF churn. Three related repo-hygiene changes.
+
+**`.gitattributes` (new).** `* text=auto` so the repo stores LF and each working tree gets whatever its platform wants - the perpetual whole-file `Claude.md` diff is now invisible to git. Verified rather than assumed: rewrote `Claude.md` entirely to CRLF in a scratch clone and both `git status` and `git diff` came back empty (the *first* status after an out-of-band rewrite can show one stale `M` from the index stat cache; it settles on the next run). Pinned `*.cmd`/`*.bat` to `text eol=crlf` (cmd.exe can break on LF in labels/goto) and `*.sh` to `eol=lf`, plus binary pins for image/archive types that don't exist yet but would be silently mangled if they ever landed. Renormalisation sweep (`git add --renormalize .`) touched nothing else, confirming the tree was already all-LF.
+
+**`build.cmd` was byte-corrupt** - found while inventorying which files the attributes would touch. It held the command *twice*: once as plain ASCII + LF, then again as UTF-16LE + CRLF (`p\0i\0p\0 \0...`), 70 bytes for what should be 24. That is the PowerShell `>>` signature - PowerShell's append redirect writes UTF-16LE - so it predates this session and was committed that way; `cmd.exe` would run line 1 then hit NUL garbage. Rewritten as the single intended line.
+
+**`pyflakes>=3` added to the dev extra.** This is the root cause of the inert lint gate found earlier today: `test_lint.py` `importorskip`s pyflakes, so anyone installing `.[dev]` got a silent skip rather than a lint run. Now `build.cmd` installs it and the gate actually fires.
+
+Committed together. Note the commit again needed the `GIT_INDEX_FILE` + `commit-tree` + direct-ref-write route: the leftover `.git/HEAD.lock` from this session's first commit blocks even `git update-ref`, since updating `refs/heads/master` locks HEAD too. **Matthew: delete `.git/index.lock` and `.git/HEAD.lock` Windows-side, then push - three commits are queued (`cb6cf33`, `eaca8e0`, and this one).**
