@@ -874,7 +874,7 @@ async def test_large_conflict_set_does_not_explode_widgets(tmp_path):
     """The memory regression pin: a huge conflict set must NOT mount one
     widget per row (it did - ~7 GB at 356k). The dialog mounts a small,
     constant number of widgets regardless of conflict count."""
-    from textual.widgets import Label, Static
+    from textual.widgets import Label
 
     from wtree.app import WTreeApp
 
