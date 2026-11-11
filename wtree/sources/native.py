@@ -22,6 +22,20 @@ from wtree.sources.base import (
 )
 
 
+def _safe_mtime(timestamp: float) -> datetime | None:
+    """``datetime.fromtimestamp`` that degrades to ``None``.
+
+    Out-of-range timestamps raise - ``OSError`` on Windows for anything
+    before 1970 (a zeroed FILETIME), ``ValueError`` / ``OverflowError``
+    for far-future garbage. One such file must not break the listing of
+    its whole directory; ``Entry.mtime`` is already optional.
+    """
+    try:
+        return datetime.fromtimestamp(timestamp)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 class NativeSource(EntrySource):
     """Enumerate the local filesystem via :func:`os.scandir`.
 
@@ -100,7 +114,7 @@ class NativeSource(EntrySource):
             name=os.path.basename(path.rstrip(os.sep)) or path,
             kind=kind,
             size=st.st_size,
-            mtime=datetime.fromtimestamp(st.st_mtime),
+            mtime=_safe_mtime(st.st_mtime),
             permissions=stat_module.filemode(mode),
             owner=None,  # see capability — cross-platform owner lookup deferred
             link_target=link_target,
@@ -145,7 +159,7 @@ class NativeSource(EntrySource):
             name=raw.name,
             kind=kind,
             size=st.st_size,
-            mtime=datetime.fromtimestamp(st.st_mtime),
+            mtime=_safe_mtime(st.st_mtime),
             permissions=stat_module.filemode(st.st_mode),
             owner=None,  # see capability — deferred for cross-platform reasons
             link_target=link_target,

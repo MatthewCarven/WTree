@@ -22,6 +22,7 @@ from wtree.ops.base import (
     Plan,
     PlanError,
     PlanItem,
+    to_posix,
 )
 from wtree.sources.base import EntrySource, ScanError
 from wtree.tagged_set import Tag
@@ -106,6 +107,14 @@ async def plan_delete(
 
 
 def _basename(path: str) -> str:
-    """POSIX-style basename, trailing-slash-aware (matches plan_move)."""
-    stripped = path.rstrip("/")
+    """POSIX-style basename, trailing-slash-aware (matches plan_move).
+
+    Separator-normalised and drive-anchor aware so the "refuse to delete
+    the source root" guard also fires for Windows roots: ``C:\\``,
+    ``C:/`` and bare ``C:`` all map to ``""`` (2026-11-12 - previously
+    only ``/`` did, so a tagged drive root planned an ``rmtree``).
+    """
+    stripped = to_posix(path).rstrip("/")
+    if stripped.endswith(":"):
+        return ""
     return posixpath.basename(stripped)

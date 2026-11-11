@@ -24,7 +24,7 @@ away. The split is "did the user just press a key and want a reply" =
 flash, "did something complete on its own time" = toast.
 
 Pane auto-refresh (2026-05-22): ``_on_plan_complete`` schedules
-``asyncio.create_task(self._refresh_panes_after_op())`` to re-show
+``asyncio.create_task(self._refresh_panes_after_op(result))`` to re-show
 the contents pane's current path so on-disk changes are visible
 without the user pressing anything. Tree-pane auto-refresh is parked.
 
@@ -87,7 +87,7 @@ from wtree.ops import (
     to_native,
     to_posix,
 )
-from wtree.ops.base import drive_anchor
+from wtree.ops.base import canonical_path, drive_anchor
 from wtree.ops.queue import (
     PROGRESS_MODAL_BYTES,
     PROGRESS_MODAL_DELAY_SECONDS,
@@ -912,8 +912,15 @@ class WTreeApp(App):
             source_id=self._source.source_id,
             path=plan.items[0].dst_path,
         )
+        # consume_tags=False: Make-new ignores the tagged set (design.md
+        # Selection rule), so it must not clear it either - "make the
+        # destination folder, then copy my tags into it" has to work.
         self._finalise_plan(
-            plan, [synthetic_tag], "Make-new", destination_path=None
+            plan,
+            [synthetic_tag],
+            "Make-new",
+            destination_path=None,
+            consume_tags=False,
         )
 
     @staticmethod
@@ -1073,8 +1080,12 @@ class WTreeApp(App):
             return plan
         # Precompute each conflict's RENAME target so the dialog can show a
         # live preview when a row is set to Rename (SELF rows default to it).
+        # ``taken`` = every destination the plan already claims, so two
+        # same-named items don't both preview (and land on) "name (1)".
+        taken = {canonical_path(i.dst_path) for i in plan.items}
         previews = [
-            await preview_renamed_dst(i, self.sources) for i in conflicts
+            await preview_renamed_dst(i, self.sources, taken)
+            for i in conflicts
         ]
         choices = await self.push_screen_wait(
             ConflictDialog(
@@ -1147,8 +1158,13 @@ class WTreeApp(App):
         verb: str,
         *,
         destination_path: str | None,
+        consume_tags: bool = True,
     ) -> None:
-        """Common tail: record last_plan, enqueue, clear tagged set, notify."""
+        """Common tail: record last_plan, enqueue, clear tagged set, notify.
+
+        ``consume_tags=False`` leaves the tagged set alone - for ops that
+        don't act on it (Make-new).
+        """
         assert self.op_queue is not None
         self.last_plan = plan
 
@@ -1157,7 +1173,7 @@ class WTreeApp(App):
             return
 
         self.op_queue.enqueue(plan)
-        if self.tagged_set:
+        if consume_tags and self.tagged_set:
             self.tagged_set.clear()
             self._refresh_tag_visuals()
 
@@ -2050,9 +2066,11 @@ class WTreeApp(App):
         self._update_subtitle()
         self._refresh_status()
         # Schedule pane auto-refresh outside this sync callback.
-        asyncio.create_task(self._refresh_panes_after_op())
+        asyncio.create_task(self._refresh_panes_after_op(result))
 
-    async def _refresh_panes_after_op(self) -> None:
+    async def _refresh_panes_after_op(
+        self, result: OperationResult | None = None
+    ) -> None:
         """Refresh both panes' on-disk view after a Plan completes.
 
         Two steps:
@@ -2079,10 +2097,15 @@ class WTreeApp(App):
                 await contents.show_path(contents.current_path)
         except Exception:  # noqa: BLE001 - don't propagate to queue worker
             pass
+        # Refresh for the plan that actually completed. Reading
+        # ``self.last_result`` here raced: two queued plans finishing
+        # back to back left the first one's directories un-refreshed.
+        if result is None:
+            result = self.last_result
         try:
-            if self.last_result is not None:
+            if result is not None:
                 tree = self.query_one(TreePane)
-                await tree.refresh_paths(self.last_result.touched_paths)
+                await tree.refresh_paths(result.touched_paths)
         except Exception:  # noqa: BLE001 - don't propagate to queue worker
             pass
 

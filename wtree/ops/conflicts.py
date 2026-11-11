@@ -154,9 +154,37 @@ async def annotate_conflicts(
         return plan
 
     new_items: list[PlanItem] = []
+    # Destinations already claimed by an earlier item of THIS plan, keyed
+    # by (dst source, canonical dst path) -> that item's kind. Two tagged
+    # entries with the same basename from different directories map to
+    # one dst_path; nothing exists there at plan time, so the disk stat
+    # alone left both NONE and the second silently replaced the first
+    # (Copy) or hard-failed (Move). Flag the later one so it goes through
+    # the dialog like any other collision (2026-11-12).
+    claimed: dict[tuple[str, str], Kind] = {}
     seen = 0
     for item in plan.items:
-        new_items.append(await _annotate_item(plan.kind, item, registry))
+        annotated = await _annotate_item(plan.kind, item, registry)
+        if plan.kind in (OperationKind.COPY, OperationKind.MOVE) and not (
+            _same_location(item)
+        ):
+            key = (item.dst_source_id, canonical_path(item.dst_path))
+            earlier = claimed.get(key)
+            if (
+                earlier is not None
+                and annotated.conflict is ConflictKind.NONE
+                # Benign-merge rule holds inside a plan too: two same-named
+                # directories copied to one place merge; their leaf
+                # collisions are flagged individually.
+                and not (
+                    plan.kind is OperationKind.COPY
+                    and item.kind is Kind.DIR
+                    and earlier is Kind.DIR
+                )
+            ):
+                annotated = replace(annotated, conflict=_conflict_for(earlier))
+            claimed.setdefault(key, item.kind)
+        new_items.append(annotated)
         seen += 1
         if seen % PLAN_CHUNK_SIZE == 0:
             if on_progress is not None:
@@ -244,8 +272,15 @@ def _split(path: str) -> tuple[str, str]:
 async def _free_dst(
     item: PlanItem,
     registry: Mapping[str, EntrySource],
+    taken: set[str] | None = None,
 ) -> str:
-    """Find the first `` (n)``-suffixed destination that doesn't exist."""
+    """Find the first `` (n)``-suffixed destination that doesn't exist.
+
+    ``taken`` is an optional set of canonical destination paths already
+    spoken for by other items of the same plan (they don't exist on disk
+    yet, so the stat can't see them). A candidate in it is skipped, and
+    the returned destination is added to it.
+    """
     dst_src = registry.get(item.dst_source_id)
     parent, base = _split(item.dst_path)
     is_dir = item.kind is Kind.DIR
@@ -253,20 +288,24 @@ async def _free_dst(
     while n <= _MAX_SUFFIX:
         cand_name = suffixed_name(base, n, is_dir)
         cand = posixpath.join(parent, cand_name) if parent else cand_name
+        if taken is not None and canonical_path(cand) in taken:
+            n += 1
+            continue
         if dst_src is None:
-            return cand  # can't stat; best-effort first candidate
+            break  # can't stat; best-effort first candidate
         existing = await dst_src.entry_at(cand)
         if isinstance(existing, ScanError):
-            return cand
+            break
         n += 1
-    # Exhausted - return the last candidate; the executor's exclusive
-    # checks will surface any remaining collision as a failed item.
+    if taken is not None:
+        taken.add(canonical_path(cand))
     return cand
 
 
 async def preview_renamed_dst(
     item: PlanItem,
     registry: Mapping[str, EntrySource],
+    taken: set[str] | None = None,
 ) -> str:
     """The collision-free `` (n)``-suffixed destination a RENAME of ``item``
     would produce - identical to what :func:`resolve_conflicts` lands on for a
@@ -276,7 +315,7 @@ async def preview_renamed_dst(
     cascade), so the previewed name matches the committed result when the
     filesystem is unchanged between dialog-open and apply.
     """
-    return await _free_dst(item, registry)
+    return await _free_dst(item, registry, taken)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +327,12 @@ def _is_under(path: str, prefix: str) -> bool:
     """True if ``path`` equals ``prefix`` or sits beneath it."""
     if path == prefix:
         return True
+    prefix_sep = prefix if prefix.endswith("/") else prefix + "/"
+    return path.startswith(prefix_sep)
+
+
+def _is_strictly_under(path: str, prefix: str) -> bool:
+    """True if ``path`` sits beneath ``prefix`` (not equal to it)."""
     prefix_sep = prefix if prefix.endswith("/") else prefix + "/"
     return path.startswith(prefix_sep)
 
@@ -352,10 +397,27 @@ async def resolve_conflicts(
             id(it): c for it, c in zip(conflict_items, custom_dsts)
         }
 
+    # OVERWRITE on a SELF conflict (an entry copied onto itself) means
+    # "replace it with itself" - a no-op. It must be dropped *with its
+    # descendants*: the executor's self-destruct guard refuses the root,
+    # but the descendants (dst == src, resolution PROCEED) used to run,
+    # and a file copied onto itself is truncated to zero bytes
+    # (2026-11-12 data-loss fix). Treat it exactly like SKIP.
+    for it in conflict_items:
+        if (
+            it.conflict is ConflictKind.SELF
+            and res_by_id[id(it)] is Resolution.OVERWRITE
+        ):
+            res_by_id[id(it)] = Resolution.SKIP
+
     # First pass: gather skip prefixes (skipped directories) and compute
-    # collision-free destinations for renamed items.
+    # collision-free destinations for renamed items. Renames are keyed by
+    # item *identity*, not dst_path: with intra-plan duplicates two items
+    # share a dst_path and only the flagged one is being renamed.
     skip_prefixes: list[str] = []
-    rename_map: dict[str, str] = {}  # old dst_path -> new dst_path
+    renamed_by_id: dict[int, str] = {}
+    cascades: list[tuple[str, str]] = []  # (old dir dst, new dir dst)
+    taken = {canonical_path(i.dst_path) for i in plan.items}
     for it in conflict_items:
         r = res_by_id[id(it)]
         if r is Resolution.SKIP:
@@ -363,9 +425,10 @@ async def resolve_conflicts(
                 skip_prefixes.append(it.dst_path)
         elif r is Resolution.RENAME:
             custom = custom_by_id.get(id(it))
-            rename_map[it.dst_path] = (
-                custom if custom else await _free_dst(it, registry)
-            )
+            new = custom if custom else await _free_dst(it, registry, taken)
+            renamed_by_id[id(it)] = new
+            if it.kind is Kind.DIR:
+                cascades.append((it.dst_path, new))
 
     # Second pass: rebuild the items list.
     new_items: list[PlanItem] = []
@@ -373,16 +436,18 @@ async def resolve_conflicts(
         r = res_by_id.get(id(it), Resolution.PROCEED)
         if r is Resolution.SKIP:
             continue
-        if any(_is_under(it.dst_path, p) for p in skip_prefixes):
+        if any(_is_strictly_under(it.dst_path, p) for p in skip_prefixes):
             # Descendant of a skipped directory.
             continue
 
         new_dst = it.dst_path
-        for old, new in rename_map.items():
-            rewritten = _rewrite_prefix(new_dst, old, new)
-            if rewritten != new_dst:
-                new_dst = rewritten
-                break
+        if id(it) in renamed_by_id:
+            new_dst = renamed_by_id[id(it)]
+        else:
+            for old, new in cascades:
+                if _is_strictly_under(new_dst, old):
+                    new_dst = _rewrite_prefix(new_dst, old, new)
+                    break
 
         if r is Resolution.OVERWRITE:
             new_items.append(

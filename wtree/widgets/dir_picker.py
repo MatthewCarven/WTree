@@ -184,6 +184,11 @@ class _PickerTree(Tree[str]):
 
     async def _walk_to_node(self, target: str) -> TreeNode[str] | None:
         root_path = self.root.data
+        # The picker is native-separator end to end (abspath root, native
+        # child joins) but the app hands it a POSIX-flavoured reveal
+        # target; normalise so ``C:/Users/x`` matches a ``C:\\`` root
+        # (no-op on POSIX).
+        target = os.path.normpath(target)
         if root_path is None or not target.startswith(root_path):
             return None
         if os.path.normpath(target) == os.path.normpath(root_path):

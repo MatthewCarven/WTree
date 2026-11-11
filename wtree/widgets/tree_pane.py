@@ -263,7 +263,9 @@ class TreePane(Tree[str]):
         # SCAN_CHUNK_SIZE in scan_screen) so this and the destination
         # browser's picker tree can't drift. ``_loaded`` is the pane's own
         # set, mutated in place for idempotency.
-        await populate_dir_node(node, self._source, self._loaded, ctx=ctx)
+        await populate_dir_node(
+            node, self._source, self._loaded, ctx=ctx, posix_paths=True
+        )
 
     # ------------------------------------------------------------------
     # Tagged-node visual style (2026-05-23)

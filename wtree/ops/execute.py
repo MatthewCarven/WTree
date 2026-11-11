@@ -385,6 +385,16 @@ async def _native_copy(
 # ---------------------------------------------------------------------------
 
 
+def _same_file(a: str, b: str) -> bool:
+    """True if ``a`` and ``b`` are the same on-disk file. ``False`` when
+    either can't be stat'd (e.g. ``b`` doesn't exist yet - the normal
+    copy case)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _chunked_copy(
     item: PlanItem,
     src: str,
@@ -410,31 +420,48 @@ def _chunked_copy(
     # Import here to avoid a circular import (queue.py imports from us).
     from wtree.ops.queue import COPY_CHUNK_SIZE
 
+    # Same-file guard (2026-11-12). ``open(dst, "wb")`` truncates, so a
+    # copy whose dst resolves to its own src (self-target descendant, a
+    # symlinked/hard-linked alias, a case-variant path on a case-
+    # insensitive volume) would zero the source and then "succeed" at
+    # copying 0 bytes. ``shutil.copyfile`` refuses this the same way.
+    if _same_file(src, dst):
+        raise shutil.SameFileError(
+            f"{src!r} and {dst!r} are the same file"
+        )
+
     item_size = item.size
     bytes_done = 0
     cancelled = False
+    # Only clean up a destination THIS call created/truncated: if the
+    # failure was opening src (or dst itself), whatever sits at dst was
+    # not written by us and must not be unlinked.
+    dst_opened = False
     try:
-        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-            # Fire one initial callback at zero so subscribers learn the
-            # item's size up front (useful for per-item progress UI).
-            if not bytes_progress(item, 0, item_size):
-                cancelled = True
-            while not cancelled:
-                chunk = fsrc.read(COPY_CHUNK_SIZE)
-                if not chunk:
-                    break
-                fdst.write(chunk)
-                bytes_done += len(chunk)
-                if not bytes_progress(item, bytes_done, item_size):
+        with open(src, "rb") as fsrc:
+            with open(dst, "wb") as fdst:
+                dst_opened = True
+                # Fire one initial callback at zero so subscribers learn
+                # the item's size up front (per-item progress UI).
+                if not bytes_progress(item, 0, item_size):
                     cancelled = True
-                    break
+                while not cancelled:
+                    chunk = fsrc.read(COPY_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+                    bytes_done += len(chunk)
+                    if not bytes_progress(item, bytes_done, item_size):
+                        cancelled = True
+                        break
     except Exception:
         # Clean up the partial destination before propagating, so a
         # failed copy doesn't leave a truncated file behind.
-        try:
-            os.unlink(dst)
-        except OSError:
-            pass
+        if dst_opened:
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
         raise
 
     if cancelled:
@@ -694,14 +721,43 @@ def _clear_readonly_and_retry(func, path: str, exc: BaseException) -> None:
     """
     if not isinstance(exc, PermissionError):
         raise exc
+    # Only the removal calls can be retried by bare path. rmtree also
+    # reports failures of os.open / os.scandir / os.lstat here; calling
+    # those back with one argument raised a TypeError that masked the
+    # real PermissionError (2026-11-12).
+    if func not in _RETRYABLE_REMOVERS:
+        raise exc
+    _add_owner_write(path)
+    parent = os.path.dirname(path)
+    if parent:
+        _add_owner_write(parent)
     try:
-        os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
-        parent = os.path.dirname(path)
-        if parent:
-            os.chmod(parent, os.stat(parent).st_mode | stat.S_IWRITE)
         func(path)
     except OSError:
         raise exc
+
+
+_RETRYABLE_REMOVERS = (os.unlink, os.remove, os.rmdir)
+
+
+def _add_owner_write(path: str) -> None:
+    """Best-effort ``chmod u+w`` on ``path`` itself, never through a link.
+
+    ``lstat`` + skip symlinks: ``os.chmod`` follows links, so the old
+    unconditional chmod made a symlink's *target* (possibly outside the
+    tree being deleted) writable, and a dangling link raised before the
+    parent dir was fixed, failing the whole delete (2026-11-12).
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    if stat.S_ISLNK(st.st_mode):
+        return
+    try:
+        os.chmod(path, st.st_mode | stat.S_IWRITE)
+    except OSError:
+        pass
 
 
 def _rmtree_force(path: str) -> None:

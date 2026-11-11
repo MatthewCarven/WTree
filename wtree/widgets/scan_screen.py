@@ -273,8 +273,17 @@ async def populate_dir_node(
     *,
     ctx: ScanContext | None = None,
     include_files: bool = False,
+    posix_paths: bool = False,
 ) -> None:
     """Scan ``node.data`` and add directory children + error leaves (dir-only).
+
+    ``posix_paths=True`` stores each child's ``data`` POSIX-flavoured
+    (``to_posix`` of the native join). TreePane passes it: its root, its
+    ``_walk_to_node`` and every path the app compares against node data
+    are born-POSIX, but the native ``os.path.join`` here produced
+    ``C:/root\\child`` on Windows, so reveal / drill-in / post-op refresh
+    never matched a non-root node (2026-11-12). The destination picker
+    keeps native paths end to end and leaves this off.
 
     The shared body of :meth:`wtree.widgets.tree_pane.TreePane._populate` and
     the destination browser's ``_PickerTree._populate`` - factored here, next
@@ -333,9 +342,12 @@ async def populate_dir_node(
     for err in errors:
         node.add_leaf(f"⚠ {err.message}", data=None)
     for entry in directories:
+        child_path = os.path.join(path, entry.name)
+        if posix_paths:
+            child_path = child_path.replace("\\", "/")
         node.add(
             entry.name,
-            data=os.path.join(path, entry.name),
+            data=child_path,
             allow_expand=True,
         )
     if include_files:

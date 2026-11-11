@@ -622,8 +622,7 @@ async def test_action_make_new_tagged_set_silently_ignored(
 ) -> None:
     """Tags are silently ignored - Make-new is 'create here', not
     Selection-rule. After N + D + name + Enter, the tagged set is
-    still present (Make-new doesn't clear it; only enqueued plans do,
-    and even then only when there were tags to begin with)."""
+    still present (Make-new passes ``consume_tags=False``)."""
     app = WTreeApp(source=small_mock, root_path="/")
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -645,16 +644,10 @@ async def test_action_make_new_tagged_set_silently_ignored(
     # Plan landed.
     assert app.last_plan is not None
     assert app.last_plan.items[0].dst_path == "/newdir"
-    # Tag was NOT consumed - Make-new ignores the tagged set.
-    # (The standard _finalise_plan clears tags only when the set was
-    # actually consumed by the op. Make-new passes a synthetic tag list
-    # of [synthetic_tag], not the real tagged set, so the real set is
-    # left intact.)
-    # In the current implementation the tagged set IS still cleared by
-    # _finalise_plan's "if self.tagged_set: clear()" - tagged_set will
-    # be empty here. This documents that behaviour; if it changes, this
-    # test will catch it.
-    assert len(app.tagged_set) == 0
+    # Tag was NOT consumed - Make-new ignores the tagged set, per
+    # design.md's Selection rule. (Until 2026-11-12 _finalise_plan
+    # cleared it anyway and this assertion pinned the bug as == 0.)
+    assert len(app.tagged_set) == 1
 
 
 # ---------------------------------------------------------------------------

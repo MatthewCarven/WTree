@@ -309,6 +309,22 @@ The Copy/Move destination browser (`wtree/widgets/dir_picker.py`, built 2026-06-
 
 - [x] **Lint-sweep of pre-existing unused imports / locals. DONE 2026-06-07** — swept package (sources/base.py `field`, properties.py `field`+`Sequence`, execute.py `exc`) + 41 test-file nits (unused imports + 3 unused locals); `wtree/error_handler.py` excluded (vendored verbatim — fixes belong upstream). New `tests/test_lint.py` pyflakes gate (skips if pyflakes missing) keeps it clean. Original item: pyflakes (run 2026-06-04 during the `populate_dir_node` extraction) flags a handful of pre-existing nits, none introduced by recent work: `app.py` `Resolution`; `properties.py` `field` + `Sequence`; `copy.py` `walked_iter` (assigned, never used); `execute.py` `exc` (assigned, never used); `sources/base.py` `field`. Clear them in one pass, and consider wiring pyflakes/ruff into the dev workflow so they don't accrue.
 
+## Code-review findings (2026-11-12) - found, not fixed
+
+- **Overwrite removes the old destination *before* the new copy has succeeded.** `_native_copy` / `_native_move` / `_native_rename` call `_remove_existing_blocking` first; if the copy then fails or is cancelled mid-file, the original is gone and the partial is cleaned up - net loss of the file the user was replacing. Safer shape: copy to a temp name beside dst, then `os.replace`.
+- **`_native_move` falls back to copy+delete on *any* `OSError` from `os.rename`**, not just cross-device. A rename refused for another reason (Windows sharing violation on an open file inside the dir) goes on to `copytree` + `_rmtree_force`, which can leave the source half-removed. Restrict the fallback to `errno.EXDEV` (needs a Windows check that `ERROR_NOT_SAME_DEVICE` surfaces as EXDEV, and the cross-fs tests that fake a bare `OSError` need updating).
+- **Delete / Move of the logged tree root is allowed** (Rename refuses it). With the tree pane focused on the root row, D deletes the directory the tree is rooted at and leaves both panes pointing at a path that no longer exists. Either refuse like Rename, or ascend after the op.
+- **Copy/Move destination: relative paths resolve against the process cwd, not the pane's directory, and `~` isn't expanded** (the L prompt does both). Typing `backup` either errors as unreachable or lands wherever wtree was launched from.
+- **Typed destinations aren't canonicalised before `touched_paths` matching.** A trailing slash, `..`, or (Windows) different-case destination won't equal the tree node's `data`, so that node isn't auto-refreshed. Normalise in `_plan_modal_enqueue` or match via `canonical_path` in `refresh_paths`.
+- **Case-only rename on Windows fails** (`foo` -> `Foo`): `lexists(dst)` is true, so it reports "destination already exists". Already a known soft spot; listing it here so it isn't lost.
+- **Copying a directory symlink on Windows** calls `os.symlink(target, dst)` without `target_is_directory=True`, which creates a file symlink that doesn't resolve.
+- **Copy doesn't preserve directory mtime/permissions** (`makedirs` only; files get `copystat`).
+- **`asyncio.create_task(...)` results aren't retained** (`_maybe_push_progress_dialog`, `_on_plan_complete`). The loop only holds weak references, so a task can in principle be collected mid-flight. Keep them in a set with a done-callback discard.
+- **Conflict-dialog previews can differ from the result** when several same-named items are flagged and only some are set to Rename (the preview numbers them as if all were). Cosmetic.
+- **`plan_copy` with a bare-root tag walks the whole tree, then silently drops it** (no `UnrootedTag` error like Move/Delete).
+- **`anchor_details` passes `ctypes.sizeof(buf)` (bytes) where `GetVolumeInformationW` wants a character count** - overstates the buffer 2x. Harmless for 32-char labels; use `len(buf)`.
+- **Unreadable (mode 000) subdirectory still can't be deleted** - now reports the true `PermissionError` rather than a `TypeError`, but there is no chmod-and-descend retry for it.
+
 ## Backlog — parking lot
 
 See `design.md` parking lot section. Summary: inline editor, archive sources, remote/SFTP, SMB discovery, FS watching, bookmarks/history, batch rename, themes.

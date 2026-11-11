@@ -203,11 +203,12 @@ async def test_action_copy_uses_cursor_when_no_tags(small_mock: MockSource) -> N
         assert isinstance(app.screen, PromptDialog)
         await pilot.press("enter")
         await pilot.pause()
-        # Destination collides (copying/moving into the item's own dir);
-        # the conflict dialog appears - overwrite-all keeps every item.
+        # Destination is the item's own dir (self-target); the conflict
+        # dialog appears with the SELF default (Rename = duplicate in
+        # place). Overwrite-on-self is a no-op that drops the item - see
+        # test_self_copy_overwrite_* in test_review_fixes.py.
         from wtree.widgets.conflict import ConflictDialog
         assert isinstance(app.screen, ConflictDialog)
-        await pilot.press("O")
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()
@@ -215,7 +216,7 @@ async def test_action_copy_uses_cursor_when_no_tags(small_mock: MockSource) -> N
     assert app.last_plan.kind is OperationKind.COPY
     assert app.last_plan.file_count == 1
     assert app.last_plan.dir_count == 0
-    assert app.last_plan.items[0].dst_path == "/readme.txt"
+    assert app.last_plan.items[0].dst_path == "/readme (1).txt"
 
 
 async def test_action_copy_uses_tagged_set_when_present(small_mock: MockSource) -> None:
@@ -232,11 +233,12 @@ async def test_action_copy_uses_tagged_set_when_present(small_mock: MockSource) 
         await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
-        # Destination collides (copying/moving into the item's own dir);
-        # the conflict dialog appears - overwrite-all keeps every item.
+        # Destination is the item's own dir (self-target); the conflict
+        # dialog appears with the SELF default (Rename = duplicate in
+        # place). Overwrite-on-self is a no-op that drops the item - see
+        # test_self_copy_overwrite_* in test_review_fixes.py.
         from wtree.widgets.conflict import ConflictDialog
         assert isinstance(app.screen, ConflictDialog)
-        await pilot.press("O")
         await pilot.press("enter")
         await pilot.pause()
         await pilot.pause()

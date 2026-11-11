@@ -72,7 +72,18 @@ def resolve_editor() -> list[str]:
             continue  # unset -> fall through to the next / the default
         raw = os.environ[env_var].strip()
         if raw:
-            return shlex.split(raw, posix=posix)
+            argv = shlex.split(raw, posix=posix)
+            if not posix:
+                # Non-POSIX shlex keeps the quote characters in the
+                # token, so ``"C:\\Program Files\\x\\x.exe" -w`` yielded an
+                # argv[0] with literal quotes and the spawn failed.
+                argv = [
+                    a[1:-1]
+                    if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'"
+                    else a
+                    for a in argv
+                ]
+            return argv
         # Present but empty: the user cleared the highest-precedence editor
         # var they set. Treat it as "no editor", NOT the platform default.
         raise EditorDisabled(
